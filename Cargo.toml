@@ -1,0 +1,15 @@
+[package]
+name = "bistouri"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libbpf-rs = "0.26"
+tokio = { version = "1.52", features = ["full"] }
+anyhow = "1.0"
+libc = "0.2"
+
+[build-dependencies]
+libbpf-cargo = "0.26"
+# Checkout for kernel 6.19
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "5c36ac2080a8d3c1216470ce97e6502ed50272e5" }
