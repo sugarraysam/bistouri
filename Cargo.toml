@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 libbpf-rs = "0.26"
+perf-event = "0.4"
 tokio = { version = "1.52", features = ["full"] }
 anyhow = "1.0"
 libc = "0.2"

@@ -4,10 +4,10 @@
 #include "profiler.h"
 #include <bpf/bpf_helpers.h>
 
-SEC("tp/syscalls/sys_enter_write")
-int handle_tp(void *ctx)
+SEC("perf_event")
+int handle_perf(void *ctx)
 {
-    bpf_printk("Hello from BPF!\n");
+    bpf_printk("hello world\n");
     return 0;
 }
 
