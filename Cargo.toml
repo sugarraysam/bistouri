@@ -9,6 +9,7 @@ perf-event = "0.4"
 tokio = { version = "1.52", features = ["full"] }
 anyhow = "1.0"
 libc = "0.2"
+thiserror = "2.0.18"
 
 [build-dependencies]
 libbpf-cargo = "0.26"

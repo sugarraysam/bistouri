@@ -24,6 +24,7 @@ The goal of Bistouri is to capture stack traces from Linux processes dynamically
 
 ### 1. Rust Best Practices
 - Idiomatic Code: Use modern Rust idioms. Leverage the type system to enforce state transitions and invariants.
+- Clean Code: Let the code speak for itself by using descriptive names. Keep comments light; only use them where design choices are made or to explain tradeoffs.
 - Clippy Checks: All code must pass cargo clippy without warnings. Fix clippy lints as part of the development process.
 - Error Handling: Use thiserror for error handling. It is idiomatic for each module to express and declare the specific errors they own, rather than using a generic anyhow::Result everywhere. Propagate errors using ? when appropriate.
 - Async: Use tokio for any I/O bound operations. Avoid blocking the async runtime.
