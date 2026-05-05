@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::agent::error::{AgentError, Result};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::MapCore;
 use perf_event::{events::Software, Builder, Counter};
@@ -140,7 +140,8 @@ pub(crate) struct ProfilerAgent {
 
 impl ProfilerAgent {
     fn try_new(freq: u64) -> Result<Self> {
-        let ncpus = libbpf_rs::num_possible_cpus().context("Failed to get possible CPUs")?;
+        let ncpus = libbpf_rs::num_possible_cpus()
+            .map_err(|e| AgentError::Bpf("failed to get possible CPUs".into(), e))?;
         Ok(Self { freq, ncpus })
     }
 
@@ -150,9 +151,11 @@ impl ProfilerAgent {
 
         let open_skel = builder
             .open(&mut object)
-            .context("Failed to open BPF skeleton")?;
+            .map_err(|e| AgentError::Bpf("failed to open BPF skeleton".into(), e))?;
 
-        let skel = open_skel.load().context("Failed to load BPF skeleton")?;
+        let skel = open_skel
+            .load()
+            .map_err(|e| AgentError::Bpf("failed to load BPF skeleton".into(), e))?;
 
         // SAFETY: Erasing lifetime because `object` is Boxed and will outlive `skel` inside LoadedProfilerAgent.
         let skel: bpf::ProfilerSkel<'static> = unsafe { std::mem::transmute(skel) };
@@ -193,7 +196,7 @@ impl LoadedProfilerAgent {
                 }
                 0
             })
-            .context("Failed to add perf_events ringbuffer")?;
+            .map_err(|e| AgentError::Bpf("failed to add perf_events ringbuffer".into(), e))?;
 
         builder
             .add(&self.skel.maps.errors, |data| {
@@ -203,9 +206,11 @@ impl LoadedProfilerAgent {
                 }
                 0
             })
-            .context("Failed to add errors ringbuffer")?;
+            .map_err(|e| AgentError::Bpf("failed to add errors ringbuffer".into(), e))?;
 
-        let ring_buffer = builder.build().context("Failed to build ringbuffer")?;
+        let ring_buffer = builder
+            .build()
+            .map_err(|e| AgentError::Bpf("failed to build ringbuffer".into(), e))?;
         self.ring_buffer = Some(ring_buffer);
         Ok(())
     }
@@ -219,7 +224,9 @@ impl LoadedProfilerAgent {
                 .progs
                 .handle_perf
                 .attach_perf_event(fd)
-                .context(format!("Failed to attach perf event on CPU {}", cpu))?;
+                .map_err(|e| {
+                    AgentError::Bpf(format!("failed to attach perf event on CPU {}", cpu), e)
+                })?;
 
             self.links.push(link);
         }
@@ -233,7 +240,9 @@ impl LoadedProfilerAgent {
             .one_cpu(cpu as usize);
 
         builder.sample_frequency(freq);
-        builder.build().context("Failed to build perf event")
+        builder
+            .build()
+            .map_err(|e| AgentError::PerfEvent("failed to build perf event".into(), e))
     }
 
     /// Starts polling the ringbuffers on a blocking Tokio thread.
@@ -241,10 +250,9 @@ impl LoadedProfilerAgent {
     pub(crate) fn start_polling(
         &mut self,
     ) -> Result<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> {
-        let rb = self
-            .ring_buffer
-            .take()
-            .context("Ringbuffer not initialized or already polling")?;
+        let rb = self.ring_buffer.take().ok_or_else(|| {
+            AgentError::InvalidState("ringbuffer not initialized or already polling".into())
+        })?;
         let runner = RingBufferRunner(rb);
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -279,7 +287,7 @@ impl LoadedProfilerAgent {
                 &active.to_ne_bytes(),
                 libbpf_rs::MapFlags::ANY,
             )
-            .context("Failed to add tgid to filter map")?;
+            .map_err(|e| AgentError::Bpf("failed to add tgid to filter map".into(), e))?;
         Ok(())
     }
 
@@ -289,7 +297,7 @@ impl LoadedProfilerAgent {
             .maps
             .pid_filter_map
             .delete(&tgid.to_ne_bytes())
-            .context("Failed to remove tgid from filter map")?;
+            .map_err(|e| AgentError::Bpf("failed to remove tgid from filter map".into(), e))?;
         Ok(())
     }
 }

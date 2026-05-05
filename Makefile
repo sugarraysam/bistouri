@@ -37,7 +37,7 @@ test:
 # Run all CI checks locally
 ci:
 	cargo +nightly fmt --all
-	cargo +nightly clippy --fix --all-targets --all-features -- -D warnings
+	cargo +nightly clippy --fix --allow-dirty --all-targets --all-features -- -D warnings
 	cargo +nightly test --all-targets --all-features
 	cargo +nightly build --all-targets --all-features
 

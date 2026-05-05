@@ -1,7 +1,7 @@
 mod agent;
 
+use agent::error::{AgentError, Result};
 use agent::profiler::ProfilerAgentBuilder;
-use anyhow::Result;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -12,7 +12,9 @@ async fn main() -> Result<()> {
 
     println!("BPF profiler agent started. Press Ctrl-C to exit.");
 
-    tokio::signal::ctrl_c().await?;
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| AgentError::Io("Ctrl-C signal error".into(), e))?;
     println!("Received Ctrl-C, shutting down...");
 
     // Signal the polling thread to stop

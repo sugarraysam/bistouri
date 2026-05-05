@@ -38,6 +38,7 @@ The goal of Bistouri is to capture stack traces from Linux processes dynamically
 ### 3. Workflow & Building
 - EBPF compilation is integrated into cargo build via build.rs and libbpf-cargo.
 - Running the resulting binary requires root privileges (or appropriate capabilities like CAP_SYS_ADMIN, CAP_BPF, CAP_PERFMON) to load eBPF programs into the kernel.
+- Make Checks: All code modifications must pass the `make` command, which runs `cargo fmt`, `cargo clippy`, and other essential validation steps.
 
 ## Common Tasks for this Project
 - Wiring up Linux PSI event polling using poll() or epoll via libc or tokio.
