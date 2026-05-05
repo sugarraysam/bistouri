@@ -49,7 +49,7 @@ impl ProfilerAgent {
         let builder = bpf::ProfilerSkelBuilder::default();
 
         let open_skel = builder
-            .open(&mut *self.object)
+            .open(&mut self.object)
             .context("Failed to open BPF skeleton")?;
 
         let skel = open_skel.load().context("Failed to load BPF skeleton")?;
@@ -114,6 +114,7 @@ impl ProfilerAgentBuilder {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_freq(mut self, freq: u64) -> Self {
         self.freq = freq;
         self
