@@ -39,3 +39,6 @@ jobs:
 
     - name: Run tests
       run: cargo test --verbose --all-targets --all-features
+
+    - name: Build Docker image
+      run: DOCKER_BUILDKIT=1 docker build -t bistouri-agent:latest .

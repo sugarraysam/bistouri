@@ -1,0 +1,24 @@
+# Cargo build directory
+target/
+**/*.rs.bk
+
+# Git
+.git/
+.gitignore
+
+# Environment files
+.env
+.env.*
+
+# Docker
+Dockerfile
+.dockerignore
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Brain / App Data Directory (if run locally)
+.gemini/
