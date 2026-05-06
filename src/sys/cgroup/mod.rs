@@ -58,6 +58,48 @@ impl CgroupCache {
         }
     }
 
+    /// Resolves the cgroup path, falling back to reading /proc/<pid>/cgroup if not cached.
+    pub(crate) fn resolve_cgroup_fallback(&mut self, id: u64, pid: u32) -> Result<PathBuf> {
+        if let Some(path) = self.id_to_path.get(&id) {
+            return Ok(path.clone());
+        }
+
+        let (found_id, path) = self.resolve_cgroup_by_pid(pid)?;
+        if found_id == id {
+            Ok(path)
+        } else {
+            Err(CgroupError::Io(
+                "Cgroup ID mismatch".into(),
+                std::io::Error::new(std::io::ErrorKind::NotFound, "ID mismatch"),
+            ))
+        }
+    }
+
+    pub(crate) fn resolve_cgroup_by_pid(&mut self, pid: u32) -> Result<(u64, PathBuf)> {
+        let cgroup_file = format!("/proc/{}/cgroup", pid);
+        let contents = fs::read_to_string(&cgroup_file)
+            .map_err(|e| CgroupError::Io(format!("Failed to read {}", cgroup_file), e))?;
+
+        for line in contents.lines() {
+            if line.starts_with("0::") {
+                let rel_path = line.trim_start_matches("0::");
+                let rel_path = rel_path.trim_start_matches('/');
+                let full_path = self.mount_point.join(rel_path);
+
+                if let Ok(meta) = fs::metadata(&full_path) {
+                    let id = meta.ino();
+                    self.insert(id, full_path.clone());
+                    return Ok((id, full_path));
+                }
+            }
+        }
+
+        Err(CgroupError::Io(
+            "Cgroup not found in proc".into(),
+            std::io::Error::new(std::io::ErrorKind::NotFound, "No matching cgroup ID"),
+        ))
+    }
+
     fn initial_walk(&mut self) {
         if let Ok(entries) = fs::read_dir(&self.mount_point) {
             for entry in entries.flatten() {

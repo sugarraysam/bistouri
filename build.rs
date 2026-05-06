@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use libbpf_cargo::SkeletonBuilder;
 
-const SRC: &str = "src/bpf/profiler.bpf.c";
-const HEADER: &str = "src/bpf/profiler.h";
+const PROFILER_SRC: &str = "src/bpf/profiler.bpf.c";
+const PROFILER_HEADER: &str = "src/bpf/profiler.h";
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set in build script"))
@@ -17,13 +17,14 @@ fn main() {
         .expect("CARGO_CFG_TARGET_ARCH must be set in build script");
 
     SkeletonBuilder::new()
-        .source(SRC)
+        .source(PROFILER_SRC)
         .clang_args([
             OsStr::new("-I"),
-            vmlinux::include_path_root().join(arch).as_os_str(),
+            vmlinux::include_path_root().join(&arch).as_os_str(),
         ])
         .build_and_generate(&out)
         .unwrap();
-    println!("cargo:rerun-if-changed={SRC}");
-    println!("cargo:rerun-if-changed={HEADER}");
+
+    println!("cargo:rerun-if-changed={PROFILER_SRC}");
+    println!("cargo:rerun-if-changed={PROFILER_HEADER}");
 }

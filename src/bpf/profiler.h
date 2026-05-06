@@ -48,4 +48,16 @@ struct error_event {
     } data;
 };
 
+struct comm_lpm_key {
+    __u32 prefixlen; // in bits
+    char comm[TASK_COMM_LEN];
+};
+
+struct process_match_event {
+    __u32 rule_id;
+    __u32 pid;
+    __u64 cgroup_id;
+    char comm[TASK_COMM_LEN];
+};
+
 #endif /* __PROFILER_H */

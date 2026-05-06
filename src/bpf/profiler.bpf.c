@@ -23,6 +23,19 @@ struct {
     __uint(max_entries, 64 * 1024); // 64 KB
 } errors SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024); // Expected size: ~20KB (1024 entries * (20 bytes key + 4 bytes value))
+    __type(key, struct comm_lpm_key);
+    __type(value, __u32); // rule_id
+    __uint(map_flags, BPF_F_NO_PREALLOC); // REQUIRED by Linux kernel for LPM_TRIE
+} comm_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256KB for trigger events
+} trigger_events SEC(".maps");
+
 SEC("perf_event")
 int handle_perf(void *ctx)
 {
@@ -76,6 +89,37 @@ int handle_perf(void *ctx)
             bpf_ringbuf_submit(err, 0);
         }
     }
+
+    bpf_ringbuf_submit(event, 0);
+
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+    struct comm_lpm_key key = {};
+    bpf_get_current_comm(&key.comm, sizeof(key.comm));
+    
+    // Prefix length for a full match is 16 bytes * 8 bits = 128
+    key.prefixlen = sizeof(key.comm) * 8;
+
+    __u32 *rule_id_ptr = bpf_map_lookup_elem(&comm_rules, &key);
+    if (!rule_id_ptr) {
+        return 0; // No rule match
+    }
+
+    struct process_match_event *event = bpf_ringbuf_reserve(&trigger_events, sizeof(*event), 0);
+    if (!event) {
+        return 0; // Ringbuffer full
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    event->rule_id = *rule_id_ptr;
+    event->pid = pid_tgid >> 32;
+    event->cgroup_id = bpf_get_current_cgroup_id();
+    
+    __builtin_memcpy(event->comm, key.comm, sizeof(event->comm));
 
     bpf_ringbuf_submit(event, 0);
 

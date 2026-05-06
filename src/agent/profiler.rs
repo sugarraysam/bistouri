@@ -1,4 +1,6 @@
 use crate::agent::error::{AgentError, Result};
+use crate::trigger::config::{MatchRule, TriggerConfig};
+use crate::trigger::ProcessMatchEvent;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::MapCore;
 use perf_event::{events::Software, Builder, Counter};
@@ -7,6 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use tokio::sync::mpsc::Sender;
 
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/profiler.skel.rs"));
@@ -37,6 +40,46 @@ impl BpfPerfEvent {
             None
         }
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+struct BpfProcessMatchEvent {
+    rule_id: u32,
+    pid: u32,
+    cgroup_id: u64,
+    comm: [u8; TASK_COMM_LEN],
+}
+
+impl BpfProcessMatchEvent {
+    fn from_bytes(data: &[u8]) -> Option<&Self> {
+        if data.len() == std::mem::size_of::<Self>() {
+            Some(unsafe { &*data.as_ptr().cast::<Self>() })
+        } else {
+            None
+        }
+    }
+}
+
+impl From<&BpfProcessMatchEvent> for ProcessMatchEvent {
+    fn from(bpf: &BpfProcessMatchEvent) -> Self {
+        let comm = String::from_utf8_lossy(&bpf.comm)
+            .trim_matches(char::from(0))
+            .to_string();
+        ProcessMatchEvent {
+            rule_id: bpf.rule_id,
+            pid: bpf.pid,
+            cgroup_id: bpf.cgroup_id,
+            comm,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+struct CommLpmKey {
+    prefixlen: u32,
+    comm: [u8; TASK_COMM_LEN],
 }
 
 #[repr(C)]
@@ -136,13 +179,24 @@ unsafe impl Send for RingBufferRunner {}
 pub(crate) struct ProfilerAgent {
     freq: u64,
     ncpus: usize,
+    trigger_config: Option<Arc<TriggerConfig>>,
+    trigger_tx: Option<Sender<ProcessMatchEvent>>,
 }
 
 impl ProfilerAgent {
-    fn try_new(freq: u64) -> Result<Self> {
+    fn try_new(
+        freq: u64,
+        trigger_config: Option<Arc<TriggerConfig>>,
+        trigger_tx: Option<Sender<ProcessMatchEvent>>,
+    ) -> Result<Self> {
         let ncpus = libbpf_rs::num_possible_cpus()
             .map_err(|e| AgentError::Bpf("failed to get possible CPUs".into(), e))?;
-        Ok(Self { freq, ncpus })
+        Ok(Self {
+            freq,
+            ncpus,
+            trigger_config,
+            trigger_tx,
+        })
     }
 
     pub(crate) fn load_and_attach(self) -> Result<LoadedProfilerAgent> {
@@ -164,12 +218,62 @@ impl ProfilerAgent {
             // The declaration order here is CRITICAL for Rust's Drop semantics.
             // Fields are dropped from top to bottom.
             ring_buffer: None,
-            links: Vec::with_capacity(self.ncpus),
+            links: Vec::with_capacity(self.ncpus + 1),
             skel,
             object,
         };
 
-        loaded.setup_ringbuffers()?;
+        if let Some(config) = &self.trigger_config {
+            for target in config.targets.iter() {
+                let mut key = CommLpmKey {
+                    prefixlen: 0,
+                    comm: [0; TASK_COMM_LEN],
+                };
+
+                match &target.rule {
+                    MatchRule::Exact { comm } => {
+                        let bytes = comm.as_bytes();
+                        key.comm[..bytes.len()].copy_from_slice(bytes);
+                        key.prefixlen = ((bytes.len() + 1) * 8) as u32;
+                    }
+                    MatchRule::Prefix { comm } => {
+                        let bytes = comm.as_bytes();
+                        key.comm[..bytes.len()].copy_from_slice(bytes);
+                        key.prefixlen = (bytes.len() * 8) as u32;
+                    }
+                }
+
+                let key_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        (&key as *const CommLpmKey) as *const u8,
+                        std::mem::size_of::<CommLpmKey>(),
+                    )
+                };
+
+                loaded
+                    .skel
+                    .maps
+                    .comm_rules
+                    .update(
+                        key_bytes,
+                        &target.rule_id.to_ne_bytes(),
+                        libbpf_rs::MapFlags::ANY,
+                    )
+                    .map_err(|e| {
+                        AgentError::Bpf("failed to insert into comm_rules LPM trie".into(), e)
+                    })?;
+            }
+
+            let link = loaded
+                .skel
+                .progs
+                .handle_exec
+                .attach()
+                .map_err(|e| AgentError::Bpf("failed to attach handle_exec prog".into(), e))?;
+            loaded.links.push(link);
+        }
+
+        loaded.setup_ringbuffers(self.trigger_tx)?;
         loaded.attach_perf_events(self.ncpus, self.freq)?;
 
         Ok(loaded)
@@ -185,7 +289,7 @@ pub(crate) struct LoadedProfilerAgent {
 }
 
 impl LoadedProfilerAgent {
-    fn setup_ringbuffers(&mut self) -> Result<()> {
+    fn setup_ringbuffers(&mut self, trigger_tx: Option<Sender<ProcessMatchEvent>>) -> Result<()> {
         let mut builder = libbpf_rs::RingBufferBuilder::new();
 
         builder
@@ -207,6 +311,19 @@ impl LoadedProfilerAgent {
                 0
             })
             .map_err(|e| AgentError::Bpf("failed to add errors ringbuffer".into(), e))?;
+
+        if let Some(tx) = trigger_tx {
+            builder
+                .add(&self.skel.maps.trigger_events, move |data| {
+                    if let Some(bpf_event) = BpfProcessMatchEvent::from_bytes(data) {
+                        let _ = tx.blocking_send(bpf_event.into());
+                    }
+                    0
+                })
+                .map_err(|e| {
+                    AgentError::Bpf("failed to add trigger_events ringbuffer".into(), e)
+                })?;
+        }
 
         let ring_buffer = builder
             .build()
@@ -304,12 +421,16 @@ impl LoadedProfilerAgent {
 
 pub(crate) struct ProfilerAgentBuilder {
     freq: u64,
+    trigger_config: Option<Arc<TriggerConfig>>,
+    trigger_tx: Option<Sender<ProcessMatchEvent>>,
 }
 
 impl Default for ProfilerAgentBuilder {
     fn default() -> Self {
         Self {
             freq: DEFAULT_SAMPLING_FREQ_HZ,
+            trigger_config: None,
+            trigger_tx: None,
         }
     }
 }
@@ -325,7 +446,17 @@ impl ProfilerAgentBuilder {
         self
     }
 
+    pub(crate) fn with_trigger(
+        mut self,
+        config: Arc<TriggerConfig>,
+        tx: Sender<ProcessMatchEvent>,
+    ) -> Self {
+        self.trigger_config = Some(config);
+        self.trigger_tx = Some(tx);
+        self
+    }
+
     pub(crate) fn try_build(self) -> Result<ProfilerAgent> {
-        ProfilerAgent::try_new(self.freq)
+        ProfilerAgent::try_new(self.freq, self.trigger_config, self.trigger_tx)
     }
 }

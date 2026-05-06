@@ -66,3 +66,12 @@ external symbolizer service for analysis.
 - Make Checks: All code modifications must pass the `make` command,
   which runs `cargo fmt`, `cargo clippy`, and other essential validation
   steps.
+
+### 4. Eventual Consistency
+
+Bistouri operates under an eventual consistency model. During
+transient operations like config reloads, brief windows may exist
+where stale BPF events are generated or PSI watchers are temporarily
+absent. The system is designed to converge to the correct state within
+one proc_walk cycle. User-space filtering ensures no stale events
+produce incorrect side effects.

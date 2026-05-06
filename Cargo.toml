@@ -12,6 +12,11 @@ libc = "0.2"
 thiserror = "2.0.18"
 inotify = "0.11.1"
 futures-util = "0.3.32"
+presutaoru = "0.1.0-alpha.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_yml = "0.0.12"
+radix_trie = "0.2"
+tokio-util = "0.7.18"
 
 [build-dependencies]
 libbpf-cargo = "0.26"
