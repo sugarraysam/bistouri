@@ -27,3 +27,7 @@ rustc-ice-*.txt
 
 **/.vscode
 TODO.md
+
+# Quarto build output
+docs/_book/
+docs/.quarto/

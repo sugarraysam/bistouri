@@ -1,0 +1,20 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Bistouri — Building an eBPF Profiler"
+  chapters:
+    - overview.qmd
+    - trigger.qmd
+    - profiler.qmd
+    - ebpf.qmd
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-copy: true
+    mermaid:
+      theme: neutral

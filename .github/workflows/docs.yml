@@ -1,0 +1,61 @@
+name: Generate Documentation PR
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Every Sunday at midnight UTC
+  workflow_dispatch: # Manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  generate-docs-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install genai SDK
+        run: pip install google-genai
+
+      - name: Generate documentation
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scripts/generate_docs.py
+
+      - name: Check for meaningful changes
+        id: diff
+        run: |
+          git add docs/
+          if git diff --cached --stat | grep -q '.'; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update PR
+        if: steps.diff.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: docs/auto-update
+          commit-message: "docs: update from main via Gemini 3.1 Pro"
+          title: "📚 Weekly docs update"
+          body: |
+            **Review this diff carefully.** Only meaningful changes
+            should have been generated — cosmetic rewording is
+            explicitly suppressed in the prompt.
+
+            **Review checklist:**
+            - [ ] Changes reflect actual code changes, not random rephrasing
+            - [ ] Diagrams are accurate
+            - [ ] No hallucinated APIs, structs, or design claims
+            - [ ] Prose is readable and teaches something non-obvious
+          labels: documentation
+          delete-branch: true
