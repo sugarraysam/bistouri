@@ -41,6 +41,7 @@ impl TriggerConfig {
         let mut config = TriggerConfig { targets };
         config.assign_rule_ids();
         config.validate()?;
+        config.warn_overlapping_prefixes();
         Ok(config)
     }
 
@@ -132,6 +133,40 @@ impl TriggerConfig {
     /// Rule IDs are 1-indexed and assigned by `assign_rule_ids`.
     pub(crate) fn target_for_rule(&self, rule_id: u32) -> &TargetConfig {
         &self.targets[(rule_id as usize) - 1]
+    }
+
+    /// Warns about overlapping Prefix rules where one comm pattern is a prefix
+    /// of another. Both the userspace radix trie and BPF LPM trie return only
+    /// the longest prefix match, so the shorter rule is effectively shadowed.
+    /// This is not an error — the behavior is deterministic — but may surprise
+    /// users who expect both rules to fire independently.
+    fn warn_overlapping_prefixes(&self) {
+        let prefixes: Vec<(u32, &str)> = self
+            .targets
+            .iter()
+            .filter_map(|t| match &t.rule {
+                MatchRule::Prefix { comm } => Some((t.rule_id, comm.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        for (i, (id_a, comm_a)) in prefixes.iter().enumerate() {
+            for (id_b, comm_b) in &prefixes[i + 1..] {
+                if comm_b.starts_with(comm_a) {
+                    eprintln!(
+                        "Warning: Prefix rule {} ('{}') is shadowed by longer prefix rule {} ('{}') \
+                         — only the longest match fires",
+                        id_a, comm_a, id_b, comm_b
+                    );
+                } else if comm_a.starts_with(comm_b) {
+                    eprintln!(
+                        "Warning: Prefix rule {} ('{}') is shadowed by longer prefix rule {} ('{}') \
+                         — only the longest match fires",
+                        id_b, comm_b, id_a, comm_a
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -311,5 +346,24 @@ targets:
         assert_eq!(config.targets[0].rule_id, 1);
         assert_eq!(config.targets[1].rule_id, 2);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn overlapping_prefixes_does_not_error() {
+        let config =
+            TriggerConfig::try_new(vec![prefix_target("work", 0), prefix_target("worker-", 0)]);
+        // Overlapping prefixes are valid — just a warning, not an error.
+        assert!(config.is_ok());
+    }
+
+    fn prefix_target(comm: &str, _unused: u32) -> TargetConfig {
+        TargetConfig {
+            rule: MatchRule::Prefix {
+                comm: comm.to_string(),
+            },
+            resource: PsiResource::Cpu,
+            threshold: 10,
+            rule_id: 0,
+        }
     }
 }

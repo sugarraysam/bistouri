@@ -10,7 +10,7 @@ use config::{MatchRule, PsiResource, TriggerConfig};
 use error::{Result, TriggerError};
 use libbpf_rs::MapCore;
 use matcher::CommMatcher;
-use proc::{ProcWalker, RealProcSource};
+use proc::ProcWalker;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +21,13 @@ use tokio_util::sync::CancellationToken;
 
 /// Fixed PSI time window: all thresholds are expressed as a percentage of this.
 const TIME_WINDOW_MS: u64 = 1_000;
+
+/// Interval between periodic proc_walk scans. Each scan discovers matching
+/// processes that BPF exec tracing may have missed (duplicate-comm rules where
+/// the BPF LPM trie stores only one rule_id, or fork-without-exec workers).
+/// The BPF path is the fast path (immediate on exec); proc_walk is the
+/// completeness guarantee (all rules covered within one interval).
+const PROC_WALK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A process matched a trigger rule — the clean Rust-typed event used on channels.
 /// Both ProcWalker and BPF ringbuffer callbacks produce this type.
@@ -369,6 +376,9 @@ impl TriggerAgent {
         self.proc_handle = Some(handle);
     }
 
+    /// Spawns a periodic proc_walk loop. The first scan runs immediately,
+    /// then repeats every `PROC_WALK_INTERVAL`. Each individual walk runs
+    /// in `spawn_blocking` to protect the event loop.
     fn spawn_proc_walk(
         config: &Arc<TriggerConfig>,
         cache: SharedCgroupCache,
@@ -376,9 +386,25 @@ impl TriggerAgent {
         cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let config = Arc::clone(config);
-        tokio::task::spawn_blocking(move || {
-            let walker = ProcWalker::new(&config, cache, RealProcSource);
-            walker.walk(&tx, &cancel);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PROC_WALK_INTERVAL);
+            // First tick fires immediately; subsequent ticks maintain cadence
+            // even if a walk overruns (Delay is the default, no ticks are skipped).
+            loop {
+                interval.tick().await;
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let cfg = Arc::clone(&config);
+                let c = cache.clone();
+                let t = tx.clone();
+                let ct = cancel.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let walker = ProcWalker::new(&cfg, c);
+                    walker.walk(&t, &ct);
+                })
+                .await;
+            }
         })
     }
 
