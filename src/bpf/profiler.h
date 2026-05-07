@@ -19,8 +19,9 @@ struct bpf_perf_event {
 };
 
 enum error_kind {
-    ERR_RESERVE_STACK_RINGBUF = 1,
-    ERR_STACK_FETCH = 2,
+    ERR_RESERVE_STACK_RINGBUF   = 1,
+    ERR_STACK_FETCH             = 2,
+    ERR_RESERVE_TRIGGER_RINGBUF = 3,
 };
 
 enum space_kind {
@@ -40,11 +41,17 @@ struct err_stack_fetch {
     __u32 space;
 };
 
+struct err_reserve_trigger_ringbuf {
+    __u32 rule_id;
+    __u32 pid;
+};
+
 struct error_event {
     __u32 kind;
     union {
-        struct err_reserve_stack_ringbuf reserve_err;
-        struct err_stack_fetch fetch_err;
+        struct err_reserve_stack_ringbuf stack_reserve_err;
+        struct err_stack_fetch stack_fetch_err;
+        struct err_reserve_trigger_ringbuf trigger_reserve_err;
     } data;
 };
 

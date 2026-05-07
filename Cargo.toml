@@ -17,6 +17,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yml = "0.0.12"
 radix_trie = "0.2"
 tokio-util = "0.7.18"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 libbpf-cargo = "0.26"

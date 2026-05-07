@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 /// Fixed PSI time window: all thresholds are expressed as a percentage of this.
 const TIME_WINDOW_MS: u64 = 1_000;
@@ -150,6 +151,50 @@ impl TriggerAgentHandle {
     }
 }
 
+/// Aggregates non-fatal operational event counts for periodic summary logging.
+/// Prevents per-occurrence log spam while surfacing sustained failure patterns.
+struct ErrorCounters {
+    cgroup_resolve_failures: u64,
+    psi_fd_build_failures: u64,
+    stale_events: u64,
+    duplicate_psi_skips: u64,
+}
+
+impl ErrorCounters {
+    fn new() -> Self {
+        Self {
+            cgroup_resolve_failures: 0,
+            psi_fd_build_failures: 0,
+            stale_events: 0,
+            duplicate_psi_skips: 0,
+        }
+    }
+
+    fn has_counts(&self) -> bool {
+        self.cgroup_resolve_failures > 0
+            || self.psi_fd_build_failures > 0
+            || self.stale_events > 0
+            || self.duplicate_psi_skips > 0
+    }
+
+    /// Logs aggregated counts and resets. Called once per PROC_WALK_INTERVAL.
+    fn report_and_reset(&mut self) {
+        if self.has_counts() {
+            warn!(
+                cgroup_resolve_failures = self.cgroup_resolve_failures,
+                psi_fd_build_failures = self.psi_fd_build_failures,
+                stale_events = self.stale_events,
+                duplicate_psi_skips = self.duplicate_psi_skips,
+                "trigger agent event summary since last report",
+            );
+            self.cgroup_resolve_failures = 0;
+            self.psi_fd_build_failures = 0;
+            self.stale_events = 0;
+            self.duplicate_psi_skips = 0;
+        }
+    }
+}
+
 pub(crate) struct TriggerAgent {
     config: Arc<TriggerConfig>,
     matcher: CommMatcher,
@@ -162,6 +207,8 @@ pub(crate) struct TriggerAgent {
     event_rx: mpsc::Receiver<ProcessMatchEvent>,
     control_rx: mpsc::Receiver<TriggerControl>,
     shutdown_rx: oneshot::Receiver<()>,
+    error_counters: ErrorCounters,
+    report_interval: tokio::time::Interval,
 }
 
 impl TriggerAgent {
@@ -200,6 +247,8 @@ impl TriggerAgent {
             event_rx,
             control_rx,
             shutdown_rx,
+            error_counters: ErrorCounters::new(),
+            report_interval: tokio::time::interval(PROC_WALK_INTERVAL),
         };
 
         let task_handle = tokio::spawn(async move {
@@ -215,6 +264,10 @@ impl TriggerAgent {
 
     /// Main event loop — processes events and control messages until shutdown.
     async fn run(&mut self) {
+        // Consume the first immediate tick so the interval starts counting
+        // from now rather than firing a spurious report on the first select.
+        self.report_interval.tick().await;
+
         loop {
             tokio::select! {
                 biased;
@@ -226,6 +279,9 @@ impl TriggerAgent {
                 event = self.event_rx.recv() => match event {
                     None => break,
                     Some(e) => self.handle_process_event(e),
+                },
+                _ = self.report_interval.tick() => {
+                    self.error_counters.report_and_reset();
                 },
             }
         }
@@ -241,7 +297,16 @@ impl TriggerAgent {
             .resolve_cgroup_fallback(cgroup_id, event.pid)
         {
             Ok(path) => path,
-            Err(_) => return,
+            Err(e) => {
+                debug!(
+                    pid = event.pid,
+                    cgroup_id = cgroup_id,
+                    error = %e,
+                    "cgroup resolution failed, skipping event",
+                );
+                self.error_counters.cgroup_resolve_failures += 1;
+                return;
+            }
         };
 
         // Re-validate: confirm the comm still matches the rule in the current config.
@@ -251,6 +316,13 @@ impl TriggerAgent {
             .match_comm(&event.comm)
             .contains(&event.rule_id)
         {
+            debug!(
+                rule_id = event.rule_id,
+                comm = %event.comm,
+                pid = event.pid,
+                "stale event filtered: rule_id no longer matches current config",
+            );
+            self.error_counters.stale_events += 1;
             return;
         }
 
@@ -258,9 +330,17 @@ impl TriggerAgent {
         let registry_key = (cgroup_id, target.resource);
 
         // One PSI fd per (cgroup, resource) — first matching event wins.
-        // Subsequent PIDs in the same cgroup for the same resource are silent no-ops
+        // Subsequent PIDs in the same cgroup for the same resource are no-ops
         // (expected: multiple PIDs with the same comm often coexist in a cgroup).
         if self.psi_registry.contains_key(&registry_key) {
+            debug!(
+                rule_id = event.rule_id,
+                comm = %event.comm,
+                cgroup_id = cgroup_id,
+                resource = ?target.resource,
+                "PSI watcher already registered for this cgroup+resource, skipping",
+            );
+            self.error_counters.duplicate_psi_skips += 1;
             return;
         }
 
@@ -271,22 +351,23 @@ impl TriggerAgent {
                     // Non-fatal: the cgroup may have been removed between resolution
                     // and PSI fd creation (TOCTOU race). The registry key stays
                     // absent so a future event can retry.
-                    // TODO: implement structured retry logic for transient failures.
-                    eprintln!(
-                        "Failed to register PSI watcher for {:?}: {}",
-                        cgroup_path, e
+                    debug!(
+                        cgroup = %cgroup_path.display(),
+                        error = %e,
+                        "failed to build PSI fd, skipping",
                     );
+                    self.error_counters.psi_fd_build_failures += 1;
                     return;
                 }
             };
 
-        println!(
-            "Registered PSI trigger for rule {} (comm: {}, resource: {:?}, threshold: {}%) on cgroup {}",
-            event.rule_id,
-            event.comm,
-            target.resource,
-            target.threshold,
-            cgroup_path.display()
+        info!(
+            rule_id = event.rule_id,
+            comm = %event.comm,
+            resource = ?target.resource,
+            threshold = target.threshold,
+            cgroup = %cgroup_path.display(),
+            "registered PSI trigger",
         );
 
         let watcher = Self::spawn_psi_watcher(async_fd, event.rule_id, cgroup_path);
@@ -324,9 +405,10 @@ impl TriggerAgent {
         tokio::spawn(async move {
             while let Ok(mut guard) = async_fd.readable().await {
                 guard.clear_ready();
-                println!(
-                    "PSI threshold exceeded for rule {} on cgroup {:?}",
-                    rule_id, cgroup_path
+                info!(
+                    rule_id = rule_id,
+                    cgroup = %cgroup_path.display(),
+                    "PSI threshold exceeded",
                 );
                 // TODO: forward trigger event to the profiler sampling
                 // module (not yet implemented).
@@ -352,20 +434,26 @@ impl TriggerAgent {
         // 2. Nuke PSI registry — abort all watcher tasks
         self.shutdown_watchers();
 
-        // 3. Rebuild matcher and BPF trie with new config
-        self.matcher = CommMatcher::new(&new_config);
+        // 3. Rebuild matcher and BPF trie with new config.
+        //    If the BPF trie update fails, roll back entirely to avoid
+        //    split-brain (userspace matcher on new config, BPF trie on old).
+        let new_matcher = CommMatcher::new(&new_config);
         if let Err(e) = self.bpf_trie.repopulate(&new_config) {
-            // Non-fatal: the BPF trie may be stale until the next reload.
-            // Userspace re-validation in handle_process_event filters out
-            // stale matches (eventual consistency).
-            eprintln!(
-                "Failed to repopulate BPF trie: {} — BPF trie may be stale",
-                e
+            error!(
+                error = %e,
+                "failed to repopulate BPF trie, rolling back to previous config",
             );
+            // Restore old trie state — if this also fails we are in an
+            // unrecoverable state with an inconsistent BPF trie.
+            if let Err(e) = self.bpf_trie.repopulate(&self.config) {
+                panic!("fatal: failed to restore previous BPF trie state: {}", e);
+            }
+        } else {
+            self.matcher = new_matcher;
+            self.config = new_config;
         }
-        self.config = new_config;
 
-        // 4. Spawn new proc_walk
+        // 4. Spawn new proc_walk with whatever config we ended up with.
         self.cancel_token = CancellationToken::new();
         let handle = Self::spawn_proc_walk(
             &self.config,

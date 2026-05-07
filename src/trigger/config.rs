@@ -2,6 +2,7 @@ use crate::trigger::error::{Result, TriggerError};
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::{error, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -65,11 +66,11 @@ impl TriggerConfig {
         {
             Ok(Ok(config)) => Arc::new(config),
             Ok(Err(e)) => {
-                eprintln!("Failed to load config, using defaults: {}", e);
+                warn!(error = %e, "failed to load config, using defaults");
                 Arc::new(Self::default_config())
             }
             Err(e) => {
-                eprintln!("Config load task panicked: {}, using defaults", e);
+                error!(error = %e, "config load task panicked, using defaults");
                 Arc::new(Self::default_config())
             }
         }
@@ -153,16 +154,20 @@ impl TriggerConfig {
         for (i, (id_a, comm_a)) in prefixes.iter().enumerate() {
             for (id_b, comm_b) in &prefixes[i + 1..] {
                 if comm_b.starts_with(comm_a) {
-                    eprintln!(
-                        "Warning: Prefix rule {} ('{}') is shadowed by longer prefix rule {} ('{}') \
-                         — only the longest match fires",
-                        id_a, comm_a, id_b, comm_b
+                    warn!(
+                        shadowed_rule = id_a,
+                        shadowed_comm = comm_a,
+                        shadowing_rule = id_b,
+                        shadowing_comm = comm_b,
+                        "prefix rule shadowed by longer prefix — only the longest match fires",
                     );
                 } else if comm_a.starts_with(comm_b) {
-                    eprintln!(
-                        "Warning: Prefix rule {} ('{}') is shadowed by longer prefix rule {} ('{}') \
-                         — only the longest match fires",
-                        id_b, comm_b, id_a, comm_a
+                    warn!(
+                        shadowed_rule = id_b,
+                        shadowed_comm = comm_b,
+                        shadowing_rule = id_a,
+                        shadowing_comm = comm_a,
+                        "prefix rule shadowed by longer prefix — only the longest match fires",
                     );
                 }
             }

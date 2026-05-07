@@ -53,8 +53,8 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_RESERVE_STACK_RINGBUF;
-            err->data.reserve_err.tgid = tgid;
-            err->data.reserve_err.pid = pid;
+            err->data.stack_reserve_err.tgid = tgid;
+            err->data.stack_reserve_err.pid = pid;
             bpf_ringbuf_submit(err, 0);
         }
         return 0;
@@ -69,10 +69,10 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_STACK_FETCH;
-            err->data.fetch_err.tgid = tgid;
-            err->data.fetch_err.pid = pid;
-            err->data.fetch_err.ret_code = event->kernel_stack_sz;
-            err->data.fetch_err.space = SPACE_KERNEL;
+            err->data.stack_fetch_err.tgid = tgid;
+            err->data.stack_fetch_err.pid = pid;
+            err->data.stack_fetch_err.ret_code = event->kernel_stack_sz;
+            err->data.stack_fetch_err.space = SPACE_KERNEL;
             bpf_ringbuf_submit(err, 0);
         }
     }
@@ -82,10 +82,10 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_STACK_FETCH;
-            err->data.fetch_err.tgid = tgid;
-            err->data.fetch_err.pid = pid;
-            err->data.fetch_err.ret_code = event->user_stack_sz;
-            err->data.fetch_err.space = SPACE_USER;
+            err->data.stack_fetch_err.tgid = tgid;
+            err->data.stack_fetch_err.pid = pid;
+            err->data.stack_fetch_err.ret_code = event->user_stack_sz;
+            err->data.stack_fetch_err.space = SPACE_USER;
             bpf_ringbuf_submit(err, 0);
         }
     }
@@ -109,14 +109,23 @@ int match_comm_on_exec(struct trace_event_raw_sched_process_exec *ctx)
         return 0; // No rule match
     }
 
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+
     struct process_match_event *event = bpf_ringbuf_reserve(&trigger_events, sizeof(*event), 0);
     if (!event) {
-        return 0; // Ringbuffer full
+        struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
+        if (err) {
+            err->kind = ERR_RESERVE_TRIGGER_RINGBUF;
+            err->data.trigger_reserve_err.rule_id = *rule_id_ptr;
+            err->data.trigger_reserve_err.pid = pid;
+            bpf_ringbuf_submit(err, 0);
+        }
+        return 0;
     }
 
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
     event->rule_id = *rule_id_ptr;
-    event->pid = pid_tgid >> 32;
+    event->pid = pid;
     event->cgroup_id = bpf_get_current_cgroup_id();
     
     __builtin_memcpy(event->comm, key.comm, sizeof(event->comm));

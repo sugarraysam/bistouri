@@ -42,6 +42,9 @@ pub(crate) enum TriggerError {
 
     #[error("BPF comm_lpm_trie update failed: {0}")]
     BpfTrieUpdate(#[source] libbpf_rs::Error),
+
+    #[error("Config watcher setup failed: {0}")]
+    ConfigWatcher(#[source] std::io::Error),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, TriggerError>;

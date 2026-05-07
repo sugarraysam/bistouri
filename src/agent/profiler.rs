@@ -9,6 +9,7 @@ use std::sync::{
     Arc,
 };
 use tokio::sync::mpsc::Sender;
+use tracing::warn;
 
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/profiler.skel.rs"));
@@ -108,9 +109,17 @@ struct ErrStackFetch {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ErrReserveTriggerRingbuf {
+    rule_id: u32,
+    pid: u32,
+}
+
+#[repr(C)]
 union ErrorData {
-    reserve_err: ErrReserveStackRingbuf,
-    fetch_err: ErrStackFetch,
+    stack_reserve_err: ErrReserveStackRingbuf,
+    stack_fetch_err: ErrStackFetch,
+    trigger_reserve_err: ErrReserveTriggerRingbuf,
 }
 
 #[repr(C)]
@@ -130,6 +139,8 @@ pub(crate) enum ProfilerError {
         ret_code: i32,
         space: SpaceKind,
     },
+    #[error("Failed to reserve trigger ringbuffer for rule: {rule_id}, pid: {pid}")]
+    ReserveTriggerRingbuf { rule_id: u32, pid: u32 },
     #[error("Unknown error kind: {0}")]
     Unknown(u32),
 }
@@ -140,21 +151,29 @@ impl ProfilerError {
             let event = unsafe { &*data.as_ptr().cast::<ErrorEvent>() };
             match event.kind {
                 1 => {
-                    // SAFETY: We verify the tag `kind == 1` before accessing the `reserve_err` union field.
-                    let reserve = unsafe { event.data.reserve_err };
+                    // SAFETY: We verify the tag `kind == 1` before accessing the union field.
+                    let reserve = unsafe { event.data.stack_reserve_err };
                     Some(ProfilerError::ReserveStackRingbuf {
                         tgid: reserve.tgid,
                         pid: reserve.pid,
                     })
                 }
                 2 => {
-                    // SAFETY: We verify the tag `kind == 2` before accessing the `fetch_err` union field.
-                    let fetch = unsafe { event.data.fetch_err };
+                    // SAFETY: We verify the tag `kind == 2` before accessing the union field.
+                    let fetch = unsafe { event.data.stack_fetch_err };
                     Some(ProfilerError::StackFetch {
                         tgid: fetch.tgid,
                         pid: fetch.pid,
                         ret_code: fetch.ret_code,
                         space: fetch.space,
+                    })
+                }
+                3 => {
+                    // SAFETY: We verify the tag `kind == 3` before accessing the union field.
+                    let trigger = unsafe { event.data.trigger_reserve_err };
+                    Some(ProfilerError::ReserveTriggerRingbuf {
+                        rule_id: trigger.rule_id,
+                        pid: trigger.pid,
                     })
                 }
                 k => Some(ProfilerError::Unknown(k)),
@@ -250,8 +269,7 @@ impl LoadedProfilerAgent {
         builder
             .add(&self.skel.maps.errors, |data| {
                 if let Some(err) = ProfilerError::from_bytes(data) {
-                    // TODO: process error
-                    eprintln!("eBPF Profiler Error: {}", err);
+                    warn!(error = %err, "BPF error event received");
                 }
                 0
             })
@@ -330,7 +348,7 @@ impl LoadedProfilerAgent {
                 if let Err(e) = runner.0.poll(std::time::Duration::from_millis(100)) {
                     // Only log the error but don't exit the loop.
                     // EINTR or timeout shouldn't crash the polling thread.
-                    eprintln!("Warning: Ringbuffer poll returned error: {}", e);
+                    warn!(error = %e, "ringbuffer poll error");
                 }
             }
         });
