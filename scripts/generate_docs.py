@@ -21,7 +21,7 @@ import google.genai as genai
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-MODEL = "gemini-3.1-pro-preview"
+MODEL = "gemini-3-flash"
 DOCS_DIR = Path("docs")
 RATE_LIMIT_SECONDS = 12  # 5 requests/minute = 1 every 12 seconds
 
