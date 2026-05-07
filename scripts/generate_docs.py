@@ -21,7 +21,10 @@ import google.genai as genai
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-MODEL = "gemini-3-flash"
+# Model to use for generation.
+# "gemini-2.5-flash" is the stable free-tier model.
+# Upgrade to "gemini-3-flash-preview" once your project has free-tier access to it.
+MODEL = "gemini-3-flash-preview"
 DOCS_DIR = Path("docs")
 RATE_LIMIT_SECONDS = 12  # 5 requests/minute = 1 every 12 seconds
 
@@ -125,20 +128,23 @@ CHAPTERS = [
         "filename": "overview.qmd",
         "title": "Architecture & Design Philosophy",
         "sources": ["src/main.rs", "src/args.rs", "AGENTS.md", "Cargo.toml"],
-        "skeleton": """\
+        "skeleton": (
+            """\
 ## What is Bistouri?
 ## Why eBPF for Profiling?
 ## Architecture at a Glance
 ## Component Map (use a ```mermaid``` flowchart)
 ## The Event Pipeline
 ## Design Principles
-## Key Tradeoffs""",
+## Key Tradeoffs"""
+        ),
     },
     {
         "filename": "trigger.qmd",
         "title": "Trigger Agent",
         "sources": ["src/trigger/"],
-        "skeleton": """\
+        "skeleton": (
+            """\
 ## The Problem: When to Profile?
 ## PSI as a Trigger Mechanism
 ## Trie-Based Process Routing
@@ -146,33 +152,38 @@ CHAPTERS = [
 ## The proc_walk Loop
 ## Hot Reload Without Downtime
 ## Eventual Consistency Model
-## Data Flow (use a ```mermaid``` diagram)""",
+## Data Flow (use a ```mermaid``` diagram)"""
+        ),
     },
     {
         "filename": "profiler.qmd",
         "title": "Profiler Agent",
         "sources": ["src/agent/"],
-        "skeleton": """\
+        "skeleton": (
+            """\
 ## From Trigger to Stack Trace
 ## BPF Map Lifecycle
 ## Ring Buffer vs Perf Buffer
 ## LPM Trie for Cgroup Matching
 ## Batch Updates & Performance
 ## Error Recovery
-## Agent Lifecycle (use a ```mermaid``` diagram)""",
+## Agent Lifecycle (use a ```mermaid``` diagram)"""
+        ),
     },
     {
         "filename": "ebpf.qmd",
         "title": "eBPF Programs",
         "sources": ["src/bpf/", "build.rs"],
-        "skeleton": """\
+        "skeleton": (
+            """\
 ## eBPF in 5 Minutes
 ## The Profiler Program
 ## Shared Data Structures (Kernel ↔ Userspace)
 ## Satisfying the Verifier
 ## Build Pipeline (libbpf-cargo)
 ## Memory Layout & repr(C)
-## Program Flow (use a ```mermaid``` diagram)""",
+## Program Flow (use a ```mermaid``` diagram)"""
+        ),
     },
 ]
 
@@ -263,7 +274,10 @@ def main() -> None:
     """Generate all documentation chapters."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("ERROR: GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
+        print(
+            "ERROR: GEMINI_API_KEY environment variable is not set.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     client = genai.Client(api_key=api_key)
