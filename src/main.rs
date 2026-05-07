@@ -1,26 +1,43 @@
 mod agent;
+mod args;
 mod sys;
 mod trigger;
 
 use agent::error::AgentError;
-use std::path::PathBuf;
+use args::Args;
+use clap::Parser;
 use std::sync::{Arc, RwLock};
 use sys::cgroup::{cgroup_watcher_task, CgroupCache, SharedCgroupCache};
 use tracing::info;
 use trigger::config::TriggerConfig;
 
-/// Default config file path when BISTOURI_CONFIG is not set.
-const DEFAULT_CONFIG_PATH: &str = "/etc/bistouri/trigger.yaml";
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+    // Log level resolution: --log-level flag > RUST_LOG env > "bistouri=info"
+    // Clap's `env` attribute already handles flag > env precedence, so
+    // args.log_level is Some if either was set.
+    let filter = args
+        .log_level
+        .as_deref()
+        .unwrap_or("bistouri=info")
+        .to_string();
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("bistouri=info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
         .init();
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.io_threads)
+        .max_blocking_threads(args.blocking_threads)
+        .enable_all()
+        .thread_name("bistouri-worker")
+        .build()?;
+
+    rt.block_on(run(args))
+}
+
+async fn run(args: Args) -> anyhow::Result<()> {
     let cache: SharedCgroupCache = Arc::new(RwLock::new(CgroupCache::new()?));
 
     let watcher_cache = Arc::clone(&cache);
@@ -28,12 +45,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = cgroup_watcher_task(watcher_cache).await;
     });
 
-    // Config path: BISTOURI_CONFIG env var or /etc/bistouri/trigger.yaml
-    let config_path = PathBuf::from(
-        std::env::var("BISTOURI_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string()),
-    );
-
-    let trigger_config = TriggerConfig::load_or_default(&config_path).await;
+    let trigger_config = TriggerConfig::load_or_default(&args.config).await;
 
     let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<trigger::ProcessMatchEvent>(1024);
 
@@ -48,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     // are all managed internally by the agent.
     let trigger_handle = trigger::TriggerAgent::start(
         trigger_config,
-        config_path,
+        args.config,
         comm_lpm_trie_handle,
         Arc::clone(&cache),
         trigger_tx,

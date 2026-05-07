@@ -8,6 +8,7 @@ libbpf-rs = "0.26"
 perf-event = "0.4"
 tokio = { version = "1.52", features = ["full"] }
 anyhow = "1.0"
+clap = { version = "4", features = ["derive", "env", "color"] }
 libc = "0.2"
 thiserror = "2.0.18"
 inotify = "0.11.1"
