@@ -72,7 +72,7 @@ mod tests {
                 comm: comm.to_string(),
             },
             resource: PsiResource::Memory,
-            threshold: 10,
+            threshold: 10.0,
             rule_id,
         }
     }
@@ -83,7 +83,7 @@ mod tests {
                 comm: comm.to_string(),
             },
             resource: PsiResource::Cpu,
-            threshold: 10,
+            threshold: 10.0,
             rule_id,
         }
     }
@@ -165,7 +165,7 @@ mod tests {
                     comm: "bistouri".to_string(),
                 },
                 resource: PsiResource::Cpu,
-                threshold: 10,
+                threshold: 10.0,
                 rule_id: 2,
             },
         ]);

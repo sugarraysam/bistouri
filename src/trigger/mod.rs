@@ -2,26 +2,23 @@ pub(crate) mod config;
 pub(crate) mod error;
 pub(crate) mod matcher;
 pub(crate) mod proc;
+mod psi;
+mod trie;
 pub(crate) mod watcher;
 
-use crate::agent::profiler::TASK_COMM_LEN;
 use crate::sys::cgroup::SharedCgroupCache;
-use config::{MatchRule, PsiResource, TriggerConfig};
-use error::{Result, TriggerError};
-use libbpf_rs::MapCore;
+use config::TriggerConfig;
+use error::{ErrorCounters, Result};
 use matcher::CommMatcher;
 use proc::ProcWalker;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use psi::{PsiRegisterResult, PsiRegistry};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-
-/// Fixed PSI time window: all thresholds are expressed as a percentage of this.
-const TIME_WINDOW_MS: u64 = 1_000;
+use tracing::{debug, error, info};
+use trie::BpfTrie;
 
 /// Interval between periodic proc_walk scans. Each scan discovers matching
 /// processes that BPF exec tracing may have missed (duplicate-comm rules where
@@ -39,92 +36,8 @@ pub(crate) struct ProcessMatchEvent {
     pub comm: String,
 }
 
-/// Layout-compatible with the BPF `struct comm_lpm_key` in profiler.h.
-#[repr(C)]
-struct CommLpmKey {
-    prefixlen: u32,
-    comm: [u8; TASK_COMM_LEN],
-}
-
-impl CommLpmKey {
-    fn to_bytes(&self) -> &[u8] {
-        // SAFETY: CommLpmKey is #[repr(C)] with no padding ambiguity.
-        // The struct is trivially copyable and the returned slice borrows self.
-        unsafe {
-            std::slice::from_raw_parts(
-                (self as *const CommLpmKey) as *const u8,
-                std::mem::size_of::<CommLpmKey>(),
-            )
-        }
-    }
-
-    fn from_rule(rule: &MatchRule) -> Self {
-        let mut key = CommLpmKey {
-            prefixlen: 0,
-            comm: [0; TASK_COMM_LEN],
-        };
-        match rule {
-            MatchRule::Exact { comm } => {
-                let bytes = comm.as_bytes();
-                key.comm[..bytes.len()].copy_from_slice(bytes);
-                // +1 accounts for the NUL terminator position, differentiating
-                // "node" from "nodejs" at the bit-prefix level.
-                key.prefixlen = ((bytes.len() + 1) * 8) as u32;
-            }
-            MatchRule::Prefix { comm } => {
-                let bytes = comm.as_bytes();
-                key.comm[..bytes.len()].copy_from_slice(bytes);
-                key.prefixlen = (bytes.len() * 8) as u32;
-            }
-        }
-        key
-    }
-}
-
-/// Owns a `MapHandle` to the BPF `comm_lpm_trie` map and tracks inserted
-/// keys on the Rust side to avoid relying on kernel-side LPM trie iteration.
-struct BpfTrie {
-    map: libbpf_rs::MapHandle,
-    inserted_keys: Vec<Vec<u8>>,
-}
-
-impl BpfTrie {
-    fn new(map: libbpf_rs::MapHandle) -> Self {
-        Self {
-            map,
-            inserted_keys: Vec::new(),
-        }
-    }
-
-    /// Clears all existing entries and repopulates from the given config.
-    fn repopulate(&mut self, config: &TriggerConfig) -> Result<()> {
-        // Delete previously inserted keys. Ignore ENOENT — the entry may
-        // have been removed by a concurrent BPF program (harmless race).
-        for key in self.inserted_keys.drain(..) {
-            let _ = self.map.delete(&key);
-        }
-
-        for target in &config.targets {
-            let key = CommLpmKey::from_rule(&target.rule);
-            let key_bytes = key.to_bytes();
-
-            self.map
-                .update(
-                    key_bytes,
-                    &target.rule_id.to_ne_bytes(),
-                    libbpf_rs::MapFlags::ANY,
-                )
-                .map_err(TriggerError::BpfTrieUpdate)?;
-
-            self.inserted_keys.push(key_bytes.to_vec());
-        }
-
-        Ok(())
-    }
-}
-
 /// Control messages for the TriggerAgent event loop.
-pub(crate) enum TriggerControl {
+pub(super) enum TriggerControl {
     /// Hot-reload with a new configuration. Nukes PSI watchers, rebuilds matcher
     /// and proc_walk from scratch.
     Reload(Arc<TriggerConfig>),
@@ -134,7 +47,6 @@ pub(crate) enum TriggerControl {
 pub(crate) struct TriggerAgentHandle {
     pub(crate) task_handle: tokio::task::JoinHandle<()>,
     shutdown_tx: oneshot::Sender<()>,
-    control_tx: mpsc::Sender<TriggerControl>,
 }
 
 impl TriggerAgentHandle {
@@ -143,56 +55,6 @@ impl TriggerAgentHandle {
         let _ = self.shutdown_tx.send(());
         self.task_handle
     }
-
-    /// Returns a clone of the control channel sender for external producers
-    /// (e.g., config file watcher).
-    pub(crate) fn control_tx(&self) -> mpsc::Sender<TriggerControl> {
-        self.control_tx.clone()
-    }
-}
-
-/// Aggregates non-fatal operational event counts for periodic summary logging.
-/// Prevents per-occurrence log spam while surfacing sustained failure patterns.
-struct ErrorCounters {
-    cgroup_resolve_failures: u64,
-    psi_fd_build_failures: u64,
-    stale_events: u64,
-    duplicate_psi_skips: u64,
-}
-
-impl ErrorCounters {
-    fn new() -> Self {
-        Self {
-            cgroup_resolve_failures: 0,
-            psi_fd_build_failures: 0,
-            stale_events: 0,
-            duplicate_psi_skips: 0,
-        }
-    }
-
-    fn has_counts(&self) -> bool {
-        self.cgroup_resolve_failures > 0
-            || self.psi_fd_build_failures > 0
-            || self.stale_events > 0
-            || self.duplicate_psi_skips > 0
-    }
-
-    /// Logs aggregated counts and resets. Called once per PROC_WALK_INTERVAL.
-    fn report_and_reset(&mut self) {
-        if self.has_counts() {
-            warn!(
-                cgroup_resolve_failures = self.cgroup_resolve_failures,
-                psi_fd_build_failures = self.psi_fd_build_failures,
-                stale_events = self.stale_events,
-                duplicate_psi_skips = self.duplicate_psi_skips,
-                "trigger agent event summary since last report",
-            );
-            self.cgroup_resolve_failures = 0;
-            self.psi_fd_build_failures = 0;
-            self.stale_events = 0;
-            self.duplicate_psi_skips = 0;
-        }
-    }
 }
 
 pub(crate) struct TriggerAgent {
@@ -200,8 +62,9 @@ pub(crate) struct TriggerAgent {
     matcher: CommMatcher,
     bpf_trie: BpfTrie,
     cache: SharedCgroupCache,
-    psi_registry: HashMap<(u64, PsiResource), tokio::task::JoinHandle<()>>,
+    psi_registry: PsiRegistry,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
+    watcher_handle: Option<tokio::task::JoinHandle<()>>,
     cancel_token: CancellationToken,
     event_tx: mpsc::Sender<ProcessMatchEvent>,
     event_rx: mpsc::Receiver<ProcessMatchEvent>,
@@ -213,8 +76,12 @@ pub(crate) struct TriggerAgent {
 
 impl TriggerAgent {
     /// Creates and starts the trigger agent. Returns a handle for shutdown and control.
+    ///
+    /// Owns the full lifecycle: BPF trie, proc_walk, PSI watchers, and config
+    /// file watcher are all managed internally.
     pub(crate) async fn start(
         config: Arc<TriggerConfig>,
+        config_path: PathBuf,
         comm_lpm_trie_handle: libbpf_rs::MapHandle,
         cache: SharedCgroupCache,
         event_tx: mpsc::Sender<ProcessMatchEvent>,
@@ -235,13 +102,18 @@ impl TriggerAgent {
             cancel_token.clone(),
         );
 
+        // Spawn config file watcher — sends Reload messages on config changes.
+        // Watcher setup failures are fatal: hot-reload is an inherent part of the system.
+        let watcher_handle = Self::spawn_config_watcher(config_path, control_tx);
+
         let mut agent = TriggerAgent {
             config,
             matcher,
             bpf_trie,
             cache,
-            psi_registry: HashMap::new(),
+            psi_registry: PsiRegistry::new(),
             proc_handle: Some(proc_handle),
+            watcher_handle: Some(watcher_handle),
             cancel_token,
             event_tx,
             event_rx,
@@ -258,7 +130,17 @@ impl TriggerAgent {
         Ok(TriggerAgentHandle {
             task_handle,
             shutdown_tx,
-            control_tx,
+        })
+    }
+
+    fn spawn_config_watcher(
+        config_path: PathBuf,
+        control_tx: mpsc::Sender<TriggerControl>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = watcher::config_watcher_task(config_path, control_tx).await {
+                error!(error = %e, "config watcher failed");
+            }
         })
     }
 
@@ -285,7 +167,7 @@ impl TriggerAgent {
                 },
             }
         }
-        self.shutdown_watchers();
+        self.shutdown();
     }
 
     fn handle_process_event(&mut self, event: ProcessMatchEvent) {
@@ -327,93 +209,43 @@ impl TriggerAgent {
         }
 
         let target = self.config.target_for_rule(event.rule_id);
-        let registry_key = (cgroup_id, target.resource);
 
-        // One PSI fd per (cgroup, resource) — first matching event wins.
-        // Subsequent PIDs in the same cgroup for the same resource are no-ops
-        // (expected: multiple PIDs with the same comm often coexist in a cgroup).
-        if self.psi_registry.contains_key(&registry_key) {
-            debug!(
-                rule_id = event.rule_id,
-                comm = %event.comm,
-                cgroup_id = cgroup_id,
-                resource = ?target.resource,
-                "PSI watcher already registered for this cgroup+resource, skipping",
-            );
-            self.error_counters.duplicate_psi_skips += 1;
-            return;
-        }
-
-        let async_fd =
-            match Self::build_psi_async_fd(&cgroup_path, target.resource, target.threshold) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    // Non-fatal: the cgroup may have been removed between resolution
-                    // and PSI fd creation (TOCTOU race). The registry key stays
-                    // absent so a future event can retry.
-                    debug!(
-                        cgroup = %cgroup_path.display(),
-                        error = %e,
-                        "failed to build PSI fd, skipping",
-                    );
-                    self.error_counters.psi_fd_build_failures += 1;
-                    return;
-                }
-            };
-
-        info!(
-            rule_id = event.rule_id,
-            comm = %event.comm,
-            resource = ?target.resource,
-            threshold = target.threshold,
-            cgroup = %cgroup_path.display(),
-            "registered PSI trigger",
-        );
-
-        let watcher = Self::spawn_psi_watcher(async_fd, event.rule_id, cgroup_path);
-        self.psi_registry.insert(registry_key, watcher);
-    }
-
-    fn build_psi_async_fd(
-        cgroup_path: &Path,
-        resource: PsiResource,
-        threshold: u8,
-    ) -> Result<AsyncFd<presutaoru::PsiFd>> {
-        let entry = presutaoru::PsiEntry::Cgroup(resource.into(), cgroup_path);
-        let stall_amount = Duration::from_millis((threshold as u64 * TIME_WINDOW_MS) / 100);
-
-        let psi_fd = presutaoru::PsiFdBuilder::default()
-            .entry(entry)
-            .stall_type(presutaoru::StallType::Some)
-            .time_window(Duration::from_millis(TIME_WINDOW_MS))
-            .stall_amount(stall_amount)
-            .build()
-            .map_err(|e| TriggerError::PsiFdBuild {
-                path: cgroup_path.to_path_buf(),
-                source: e,
-            })?;
-
-        let async_fd = AsyncFd::new(psi_fd).map_err(TriggerError::AsyncFd)?;
-        Ok(async_fd)
-    }
-
-    fn spawn_psi_watcher(
-        async_fd: AsyncFd<presutaoru::PsiFd>,
-        rule_id: u32,
-        cgroup_path: PathBuf,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Ok(mut guard) = async_fd.readable().await {
-                guard.clear_ready();
+        match self.psi_registry.register(
+            cgroup_id,
+            &cgroup_path,
+            target.resource,
+            target.threshold,
+            event.rule_id,
+        ) {
+            PsiRegisterResult::Registered => {
                 info!(
-                    rule_id = rule_id,
+                    rule_id = event.rule_id,
+                    comm = %event.comm,
+                    resource = ?target.resource,
+                    threshold = target.threshold,
                     cgroup = %cgroup_path.display(),
-                    "PSI threshold exceeded",
+                    "registered PSI trigger",
                 );
-                // TODO: forward trigger event to the profiler sampling
-                // module (not yet implemented).
             }
-        })
+            PsiRegisterResult::AlreadyExists => {
+                debug!(
+                    rule_id = event.rule_id,
+                    comm = %event.comm,
+                    cgroup_id = cgroup_id,
+                    resource = ?target.resource,
+                    "PSI watcher already registered for this cgroup+resource, skipping",
+                );
+                self.error_counters.duplicate_psi_skips += 1;
+            }
+            PsiRegisterResult::BuildFailed => {
+                debug!(
+                    cgroup = %cgroup_path.display(),
+                    rule_id = event.rule_id,
+                    "failed to build PSI fd, skipping",
+                );
+                self.error_counters.psi_fd_build_failures += 1;
+            }
+        }
     }
 
     /// Hot-reload: cancel current walk, nuke PSI watchers, rebuild with new config.
@@ -432,7 +264,7 @@ impl TriggerAgent {
         }
 
         // 2. Nuke PSI registry — abort all watcher tasks
-        self.shutdown_watchers();
+        self.psi_registry.shutdown();
 
         // 3. Rebuild matcher and BPF trie with new config.
         //    If the BPF trie update fails, roll back entirely to avoid
@@ -496,19 +328,10 @@ impl TriggerAgent {
         })
     }
 
-    fn shutdown_watchers(&mut self) {
-        for (_, handle) in self.psi_registry.drain() {
+    fn shutdown(&mut self) {
+        self.psi_registry.shutdown();
+        if let Some(handle) = self.watcher_handle.take() {
             handle.abort();
-        }
-    }
-}
-
-impl From<PsiResource> for presutaoru::CgroupEntryType {
-    fn from(resource: PsiResource) -> Self {
-        match resource {
-            PsiResource::Memory => presutaoru::CgroupEntryType::Memory,
-            PsiResource::Cpu => presutaoru::CgroupEntryType::Cpu,
-            PsiResource::Io => presutaoru::CgroupEntryType::Io,
         }
     }
 }

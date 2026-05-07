@@ -23,8 +23,9 @@ pub(crate) enum PsiResource {
 pub(crate) struct TargetConfig {
     pub(crate) rule: MatchRule,
     pub(crate) resource: PsiResource,
-    /// PSI stall threshold as a percentage of the 1 000 ms time window (1–99).
-    pub(crate) threshold: u8,
+    /// PSI stall threshold as a percentage of the 1 000 ms time window.
+    /// Must be in the range (0.0, 100.0) exclusive.
+    pub(crate) threshold: f64,
     /// Unique identifier assigned during construction.
     /// Not user-facing — derived from the target's position in the Vec.
     #[serde(skip)]
@@ -85,7 +86,7 @@ impl TriggerConfig {
                     comm: "bistouri".to_string(),
                 },
                 resource: PsiResource::Memory,
-                threshold: 10,
+                threshold: 10.0,
                 rule_id: 0,
             },
             TargetConfig {
@@ -93,7 +94,7 @@ impl TriggerConfig {
                     comm: "bistouri".to_string(),
                 },
                 resource: PsiResource::Cpu,
-                threshold: 10,
+                threshold: 10.0,
                 rule_id: 0,
             },
         ])
@@ -120,7 +121,7 @@ impl TriggerConfig {
             if comm.len() > 15 {
                 return Err(TriggerError::CommTooLong { comm: comm.clone() });
             }
-            if target.threshold == 0 || target.threshold >= 100 {
+            if target.threshold <= 0.0 || target.threshold >= 100.0 {
                 return Err(TriggerError::InvalidThreshold {
                     threshold: target.threshold,
                     comm: comm.clone(),
@@ -367,7 +368,7 @@ targets:
                 comm: comm.to_string(),
             },
             resource: PsiResource::Cpu,
-            threshold: 10,
+            threshold: 10.0,
             rule_id: 0,
         }
     }

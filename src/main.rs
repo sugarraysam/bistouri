@@ -6,7 +6,7 @@ use agent::error::AgentError;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use sys::cgroup::{cgroup_watcher_task, CgroupCache, SharedCgroupCache};
-use tracing::{error, info};
+use tracing::info;
 use trigger::config::TriggerConfig;
 
 /// Default config file path when BISTOURI_CONFIG is not set.
@@ -44,26 +44,17 @@ async fn main() -> anyhow::Result<()> {
 
     let (poll_handle, stop_flag) = loaded_agent.start_polling()?;
 
-    // Start TriggerAgent — proc_walk and event loop are managed internally.
+    // Start TriggerAgent — proc_walk, PSI watchers, and config file watcher
+    // are all managed internally by the agent.
     let trigger_handle = trigger::TriggerAgent::start(
         trigger_config,
+        config_path,
         comm_lpm_trie_handle,
         Arc::clone(&cache),
         trigger_tx,
         trigger_rx,
     )
     .await?;
-
-    // Spawn config file watcher — sends Reload messages on config changes.
-    // Watcher setup failures are fatal: hot-reload is an inherent part of the system.
-    let control_tx = trigger_handle.control_tx();
-    let watcher_config_path = config_path.clone();
-    let config_watcher = tokio::spawn(async move {
-        if let Err(e) = trigger::watcher::config_watcher_task(watcher_config_path, control_tx).await
-        {
-            error!(error = %e, "config watcher failed");
-        }
-    });
 
     info!("BPF profiler agent started");
 
@@ -83,9 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let task_handle = trigger_handle.shutdown();
     let _ = task_handle.await;
 
-    // Abort watcher tasks
-    config_watcher.abort();
-    let _ = config_watcher.await;
+    // Abort cgroup watcher
     cgroup_watcher.abort();
     let _ = cgroup_watcher.await;
 
