@@ -125,7 +125,7 @@ CURRENT SOURCE CODE:
 
 CHAPTERS = [
     {
-        "filename": "overview.qmd",
+        "filename": "index.qmd",
         "title": "Architecture & Design Philosophy",
         "sources": ["src/main.rs", "src/args.rs", "AGENTS.md", "Cargo.toml"],
         "skeleton": (

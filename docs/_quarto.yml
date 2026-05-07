@@ -5,7 +5,7 @@ project:
 book:
   title: "Bistouri — Building an eBPF Profiler"
   chapters:
-    - overview.qmd
+    - index.qmd
     - trigger.qmd
     - profiler.qmd
     - ebpf.qmd
