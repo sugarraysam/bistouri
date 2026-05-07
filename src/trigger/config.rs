@@ -1,4 +1,7 @@
+use crate::trigger::error::{Result, TriggerError};
 use serde::Deserialize;
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -21,7 +24,7 @@ pub(crate) struct TargetConfig {
     pub(crate) resource: PsiResource,
     /// PSI stall threshold as a percentage of the 1 000 ms time window (1–99).
     pub(crate) threshold: u8,
-    /// Unique identifier assigned by TriggerConfig during loading.
+    /// Unique identifier assigned during construction.
     /// Not user-facing — derived from the target's position in the Vec.
     #[serde(skip)]
     pub(crate) rule_id: u32,
@@ -33,37 +36,93 @@ pub(crate) struct TriggerConfig {
 }
 
 impl TriggerConfig {
-    pub(crate) fn load_from_file(path: &str) -> std::result::Result<Self, anyhow::Error> {
-        let contents = std::fs::read_to_string(path)?;
-        let mut config: TriggerConfig = serde_yml::from_str(&contents)?;
+    /// Single constructor: assigns rule IDs and validates in one place.
+    pub(crate) fn try_new(targets: Vec<TargetConfig>) -> Result<Self> {
+        let mut config = TriggerConfig { targets };
         config.assign_rule_ids();
         config.validate()?;
         Ok(config)
     }
 
+    /// Loads and validates config from a YAML file. This performs synchronous
+    /// file I/O and should be called from `spawn_blocking`.
+    pub(crate) fn load_from_file(path: &str) -> Result<Self> {
+        let contents = std::fs::read_to_string(path).map_err(TriggerError::ConfigIo)?;
+        let raw: TriggerConfig =
+            serde_yml::from_str(&contents).map_err(TriggerError::ConfigParse)?;
+        Self::try_new(raw.targets)
+    }
+
+    /// Loads config from file if it exists, falling back to default config.
+    /// Config parsing runs in `spawn_blocking` to protect the event loop.
+    pub(crate) async fn load_or_default(path: &Path) -> Arc<Self> {
+        let path = path.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            Self::load_from_file(path.to_str().unwrap_or_default())
+        })
+        .await
+        {
+            Ok(Ok(config)) => Arc::new(config),
+            Ok(Err(e)) => {
+                eprintln!("Failed to load config, using defaults: {}", e);
+                Arc::new(Self::default_config())
+            }
+            Err(e) => {
+                eprintln!("Config load task panicked: {}, using defaults", e);
+                Arc::new(Self::default_config())
+            }
+        }
+    }
+
+    /// Minimal default config: watch the bistouri process itself for
+    /// Memory and CPU pressure at 10% threshold.
+    pub(crate) fn default_config() -> Self {
+        Self::try_new(vec![
+            TargetConfig {
+                rule: MatchRule::Exact {
+                    comm: "bistouri".to_string(),
+                },
+                resource: PsiResource::Memory,
+                threshold: 10,
+                rule_id: 0,
+            },
+            TargetConfig {
+                rule: MatchRule::Exact {
+                    comm: "bistouri".to_string(),
+                },
+                resource: PsiResource::Cpu,
+                threshold: 10,
+                rule_id: 0,
+            },
+        ])
+        // Safe: we control these inputs and they are known-valid.
+        .expect("default config must be valid")
+    }
+
     /// Assigns stable, 1-indexed rule IDs based on position in the targets Vec.
-    /// This is the single source of truth for rule_id assignment.
     fn assign_rule_ids(&mut self) {
         for (i, target) in self.targets.iter_mut().enumerate() {
             target.rule_id = (i + 1) as u32;
         }
     }
 
-    fn validate(&self) -> std::result::Result<(), anyhow::Error> {
+    fn validate(&self) -> Result<()> {
+        if self.targets.is_empty() {
+            return Err(TriggerError::EmptyTargets);
+        }
         for target in &self.targets {
             let comm = match &target.rule {
                 MatchRule::Exact { comm } => comm,
                 MatchRule::Prefix { comm } => comm,
             };
             if comm.len() > 15 {
-                anyhow::bail!("Comm string '{}' exceeds 15 characters kernel limit", comm);
+                return Err(TriggerError::CommTooLong { comm: comm.clone() });
             }
             if target.threshold == 0 || target.threshold >= 100 {
-                anyhow::bail!(
-                    "Threshold {} for comm '{}' must be between 1 and 99 (inclusive)",
-                    target.threshold,
-                    comm
-                );
+                return Err(TriggerError::InvalidThreshold {
+                    threshold: target.threshold,
+                    comm: comm.clone(),
+                });
             }
         }
         Ok(())
@@ -73,5 +132,184 @@ impl TriggerConfig {
     /// Rule IDs are 1-indexed and assigned by `assign_rule_ids`.
     pub(crate) fn target_for_rule(&self, rule_id: u32) -> &TargetConfig {
         &self.targets[(rule_id as usize) - 1]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_yaml(yaml: &str) -> std::result::Result<TriggerConfig, TriggerError> {
+        let raw: TriggerConfig = serde_yml::from_str(yaml).map_err(TriggerError::ConfigParse)?;
+        TriggerConfig::try_new(raw.targets)
+    }
+
+    #[test]
+    fn parse_valid_exact_and_prefix() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: memory
+    threshold: 10
+  - rule:
+      type: Prefix
+      comm: "worker-"
+    resource: cpu
+    threshold: 50
+"#;
+        let config = parse_yaml(yaml).unwrap();
+        assert_eq!(config.targets.len(), 2);
+        assert!(matches!(&config.targets[0].rule, MatchRule::Exact { comm } if comm == "node"));
+        assert!(matches!(&config.targets[1].rule, MatchRule::Prefix { comm } if comm == "worker-"));
+        assert_eq!(config.targets[0].resource, PsiResource::Memory);
+        assert_eq!(config.targets[1].resource, PsiResource::Cpu);
+    }
+
+    #[test]
+    fn empty_targets_fails() {
+        let yaml = "targets: []\n";
+        let result = parse_yaml(yaml);
+        assert!(matches!(result, Err(TriggerError::EmptyTargets)));
+    }
+
+    #[test]
+    fn threshold_zero_fails() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: memory
+    threshold: 0
+"#;
+        let result = parse_yaml(yaml);
+        assert!(matches!(result, Err(TriggerError::InvalidThreshold { .. })));
+    }
+
+    #[test]
+    fn threshold_hundred_fails() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: memory
+    threshold: 100
+"#;
+        let result = parse_yaml(yaml);
+        assert!(matches!(result, Err(TriggerError::InvalidThreshold { .. })));
+    }
+
+    #[test]
+    fn threshold_boundary_valid() {
+        let yaml_1 = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: memory
+    threshold: 1
+"#;
+        let yaml_99 = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: memory
+    threshold: 99
+"#;
+        assert!(parse_yaml(yaml_1).is_ok());
+        assert!(parse_yaml(yaml_99).is_ok());
+    }
+
+    #[test]
+    fn comm_exceeds_kernel_limit() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: "1234567890123456"
+    resource: memory
+    threshold: 10
+"#;
+        let result = parse_yaml(yaml);
+        assert!(matches!(result, Err(TriggerError::CommTooLong { .. })));
+    }
+
+    #[test]
+    fn comm_at_kernel_limit() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: "123456789012345"
+    resource: memory
+    threshold: 10
+"#;
+        assert!(parse_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn rule_ids_assigned_sequentially() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: memory
+    threshold: 10
+  - rule:
+      type: Exact
+      comm: python
+    resource: cpu
+    threshold: 20
+  - rule:
+      type: Prefix
+      comm: "go-"
+    resource: io
+    threshold: 30
+"#;
+        let config = parse_yaml(yaml).unwrap();
+        assert_eq!(config.targets[0].rule_id, 1);
+        assert_eq!(config.targets[1].rule_id, 2);
+        assert_eq!(config.targets[2].rule_id, 3);
+    }
+
+    #[test]
+    fn unknown_resource_fails() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: disk
+    threshold: 10
+"#;
+        let result = parse_yaml(yaml);
+        assert!(matches!(result, Err(TriggerError::ConfigParse(_))));
+    }
+
+    #[test]
+    fn missing_threshold_fails() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resource: memory
+"#;
+        let result = parse_yaml(yaml);
+        assert!(matches!(result, Err(TriggerError::ConfigParse(_))));
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        let config = TriggerConfig::default_config();
+        assert_eq!(config.targets.len(), 2);
+        assert_eq!(config.targets[0].rule_id, 1);
+        assert_eq!(config.targets[1].rule_id, 2);
+        assert!(config.validate().is_ok());
     }
 }

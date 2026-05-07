@@ -24,6 +24,21 @@ pub(crate) enum TriggerError {
 
     #[error("Proc walk task panicked: {0}")]
     ProcWalk(String),
+
+    #[error("At least one target rule is required")]
+    EmptyTargets,
+
+    #[error("Comm string '{comm}' exceeds 15 characters kernel limit")]
+    CommTooLong { comm: String },
+
+    #[error("Threshold {threshold} for comm '{comm}' must be between 1 and 99 (inclusive)")]
+    InvalidThreshold { threshold: u8, comm: String },
+
+    #[error("Failed to parse config: {0}")]
+    ConfigParse(#[source] serde_yml::Error),
+
+    #[error("Failed to read config file: {0}")]
+    ConfigIo(#[source] std::io::Error),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, TriggerError>;

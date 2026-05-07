@@ -2,6 +2,7 @@ pub(crate) mod config;
 pub(crate) mod error;
 pub(crate) mod matcher;
 pub(crate) mod proc;
+pub(crate) mod watcher;
 
 use crate::sys::cgroup::SharedCgroupCache;
 use config::{PsiResource, TriggerConfig};
@@ -29,7 +30,6 @@ pub(crate) struct ProcessMatchEvent {
 }
 
 /// Control messages for the TriggerAgent event loop.
-#[allow(dead_code)]
 pub(crate) enum TriggerControl {
     /// Hot-reload with a new configuration. Nukes PSI watchers, rebuilds matcher
     /// and proc_walk from scratch.
@@ -40,7 +40,6 @@ pub(crate) enum TriggerControl {
 pub(crate) struct TriggerAgentHandle {
     pub(crate) task_handle: tokio::task::JoinHandle<()>,
     shutdown_tx: oneshot::Sender<()>,
-    #[allow(dead_code)]
     control_tx: mpsc::Sender<TriggerControl>,
 }
 
@@ -49,6 +48,12 @@ impl TriggerAgentHandle {
     pub(crate) fn shutdown(self) -> tokio::task::JoinHandle<()> {
         let _ = self.shutdown_tx.send(());
         self.task_handle
+    }
+
+    /// Returns a clone of the control channel sender for external producers
+    /// (e.g., config file watcher).
+    pub(crate) fn control_tx(&self) -> mpsc::Sender<TriggerControl> {
+        self.control_tx.clone()
     }
 }
 
@@ -141,9 +146,13 @@ impl TriggerAgent {
             Err(_) => return,
         };
 
-        // Re-validate: confirm the comm still matches a rule in the current config.
+        // Re-validate: confirm the comm still matches the rule in the current config.
         // Filters out stale events from a pre-reload BPF trie state.
-        if self.matcher.match_comm(&event.comm) != Some(event.rule_id) {
+        if !self
+            .matcher
+            .match_comm(&event.comm)
+            .contains(&event.rule_id)
+        {
             return;
         }
 

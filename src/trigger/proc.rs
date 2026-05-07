@@ -60,9 +60,10 @@ impl<P: ProcSource> ProcWalker<P> {
                 continue;
             };
 
-            let Some(rule_id) = self.matcher.match_comm(&comm) else {
+            let rule_ids = self.matcher.match_comm(&comm);
+            if rule_ids.is_empty() {
                 continue;
-            };
+            }
 
             let cgroup_id = match self.cache.write().unwrap().resolve_cgroup_by_pid(pid) {
                 Ok((id, _path)) => id,
@@ -73,14 +74,15 @@ impl<P: ProcSource> ProcWalker<P> {
                 }
             };
 
-            let event = ProcessMatchEvent {
-                rule_id,
-                pid,
-                cgroup_id,
-                comm,
-            };
-
-            let _ = tx.blocking_send(event);
+            for rule_id in rule_ids {
+                let event = ProcessMatchEvent {
+                    rule_id,
+                    pid,
+                    cgroup_id,
+                    comm: comm.clone(),
+                };
+                let _ = tx.blocking_send(event);
+            }
         }
     }
 }

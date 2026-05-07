@@ -75,3 +75,11 @@ where stale BPF events are generated or PSI watchers are temporarily
 absent. The system is designed to converge to the correct state within
 one proc_walk cycle. User-space filtering ensures no stale events
 produce incorrect side effects.
+
+### 5. Event Loop Protection
+
+The tokio event loop must never be blocked by CPU-heavy or I/O-bound
+synchronous work. Use `tokio::task::spawn_blocking` for operations
+like file parsing, /proc walking, or any computation that may take
+more than a trivial amount of time. Keep the event loop crisp and
+responsive to async events (PSI triggers, inotify, channels).

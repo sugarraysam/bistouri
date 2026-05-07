@@ -3,41 +3,48 @@ mod sys;
 mod trigger;
 
 use agent::error::AgentError;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use sys::cgroup::{cgroup_watcher_task, CgroupCache, SharedCgroupCache};
+use trigger::config::TriggerConfig;
+
+/// Default config file path when BISTOURI_CONFIG is not set.
+const DEFAULT_CONFIG_PATH: &str = "/etc/bistouri/trigger.yaml";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cache: SharedCgroupCache = Arc::new(RwLock::new(CgroupCache::new()?));
 
     let watcher_cache = Arc::clone(&cache);
-    let watcher_handle = tokio::spawn(async move {
+    let cgroup_watcher = tokio::spawn(async move {
         let _ = cgroup_watcher_task(watcher_cache).await;
     });
 
-    // Create TriggerConfig
-    let trigger_config_path = "trigger.yaml";
-    let trigger_config = std::sync::Arc::new(trigger::config::TriggerConfig::load_from_file(
-        trigger_config_path,
-    )?);
+    // Config path: BISTOURI_CONFIG env var or /etc/bistouri/trigger.yaml
+    let config_path = PathBuf::from(
+        std::env::var("BISTOURI_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string()),
+    );
+
+    let trigger_config = TriggerConfig::load_or_default(&config_path).await;
+
     let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<trigger::ProcessMatchEvent>(1024);
 
     let agent_builder = agent::profiler::ProfilerAgentBuilder::new()
-        .with_trigger(std::sync::Arc::clone(&trigger_config), trigger_tx.clone());
+        .with_trigger(Arc::clone(&trigger_config), trigger_tx.clone());
     let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
 
     let (poll_handle, stop_flag) = loaded_agent.start_polling()?;
 
-    // Initialize TriggerAgent — proc_walk and event loop are managed internally.
-    // TODO: the control_tx on the returned handle can be used to send
-    // TriggerControl::Reload messages once a config file watcher is implemented.
-    let trigger_handle = trigger::TriggerAgent::start(
-        trigger_config,
-        std::sync::Arc::clone(&cache),
-        trigger_tx,
-        trigger_rx,
-    )
-    .await?;
+    // Start TriggerAgent — proc_walk and event loop are managed internally.
+    let trigger_handle =
+        trigger::TriggerAgent::start(trigger_config, Arc::clone(&cache), trigger_tx, trigger_rx)
+            .await?;
+
+    // Spawn config file watcher — sends Reload messages on config changes.
+    let config_watcher = tokio::spawn(trigger::watcher::config_watcher_task(
+        config_path,
+        trigger_handle.control_tx(),
+    ));
 
     println!("BPF profiler agent started. Press Ctrl-C to exit.");
 
@@ -57,9 +64,11 @@ async fn main() -> anyhow::Result<()> {
     let task_handle = trigger_handle.shutdown();
     let _ = task_handle.await;
 
-    // Abort the cgroup watcher task
-    watcher_handle.abort();
-    let _ = watcher_handle.await;
+    // Abort watcher tasks
+    config_watcher.abort();
+    let _ = config_watcher.await;
+    cgroup_watcher.abort();
+    let _ = cgroup_watcher.await;
 
     println!("Shutdown complete.");
 
