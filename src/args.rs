@@ -29,9 +29,10 @@ pub(crate) struct Args {
 
     /// Max threads in the spawn_blocking pool.
     ///
-    /// Used for synchronous work like /proc walking and config file parsing.
-    /// These tasks are serialized in practice, so 1 is sufficient.
-    #[arg(long, default_value_t = 1)]
+    /// The ring buffer poller permanently occupies one blocking thread, so
+    /// the minimum is 2: one for polling, one for transient work like /proc
+    /// walking and config file parsing.
+    #[arg(long, default_value_t = 2)]
     pub blocking_threads: usize,
 
     /// Log level filter (e.g. "bistouri=debug", "bistouri=info,tokio=warn").
@@ -39,6 +40,13 @@ pub(crate) struct Args {
     /// Resolution order: --log-level flag > RUST_LOG env > "bistouri=info"
     #[arg(long, env = "RUST_LOG")]
     pub log_level: Option<String>,
+
+    /// Port for the Prometheus /metrics HTTP endpoint.
+    ///
+    /// Default 9464 follows the OpenTelemetry exporter convention.
+    /// Prometheus will scrape this endpoint for operational metrics.
+    #[arg(long, env = "BISTOURI_METRICS_PORT", default_value_t = 9464)]
+    pub metrics_port: u16,
 }
 
 // Define your custom color palette

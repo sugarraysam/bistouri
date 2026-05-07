@@ -8,7 +8,7 @@ pub(crate) mod watcher;
 
 use crate::sys::cgroup::SharedCgroupCache;
 use config::TriggerConfig;
-use error::{ErrorCounters, Result};
+use error::Result;
 use matcher::CommMatcher;
 use proc::ProcWalker;
 use psi::{PsiRegisterResult, PsiRegistry};
@@ -26,6 +26,12 @@ use trie::BpfTrie;
 /// The BPF path is the fast path (immediate on exec); proc_walk is the
 /// completeness guarantee (all rules covered within one interval).
 const PROC_WALK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Buffer size for the internal trigger event channel (BPF → TriggerAgent).
+/// 1024 is generous for most deployments — events are consumed quickly by the
+/// event loop, so backpressure is unlikely. Sized to absorb brief bursts from
+/// concurrent proc_walk + BPF ringbuffer callbacks without dropping.
+const TRIGGER_CHANNEL_SIZE: usize = 1024;
 
 /// A process matched a trigger rule — the clean Rust-typed event used on channels.
 /// Both ProcWalker and BPF ringbuffer callbacks produce this type.
@@ -57,7 +63,144 @@ impl TriggerAgentHandle {
     }
 }
 
-pub(crate) struct TriggerAgent {
+// ---------------------------------------------------------------------------
+// Metric counter names — constants prevent typos and centralize naming.
+// ---------------------------------------------------------------------------
+
+const METRIC_CGROUP_RESOLVE_FAILURES: &str = "bistouri_trigger_cgroup_resolve_failures";
+const METRIC_PSI_FD_BUILD_FAILURES: &str = "bistouri_trigger_psi_fd_build_failures";
+const METRIC_STALE_EVENTS: &str = "bistouri_trigger_stale_events";
+const METRIC_DUPLICATE_PSI_SKIPS: &str = "bistouri_trigger_duplicate_psi_skips";
+const METRIC_CONFIG_RELOADS: &str = "bistouri_trigger_config_reloads";
+const METRIC_CONFIG_RELOAD_FAILURES: &str = "bistouri_trigger_config_reload_failures";
+
+/// Registers metric descriptions with the `metrics` facade. Called once
+/// during `prepare()` so that Prometheus help text is available before
+/// any counters are incremented.
+fn describe_metrics() {
+    metrics::describe_counter!(
+        METRIC_CGROUP_RESOLVE_FAILURES,
+        "Number of cgroup resolution failures during event processing"
+    );
+    metrics::describe_counter!(
+        METRIC_PSI_FD_BUILD_FAILURES,
+        "Number of PSI file descriptor build failures"
+    );
+    metrics::describe_counter!(
+        METRIC_STALE_EVENTS,
+        "Number of stale events filtered after config reload"
+    );
+    metrics::describe_counter!(
+        METRIC_DUPLICATE_PSI_SKIPS,
+        "Number of duplicate PSI watcher registration attempts skipped"
+    );
+    metrics::describe_counter!(
+        METRIC_CONFIG_RELOADS,
+        "Number of successful configuration hot-reloads"
+    );
+    metrics::describe_counter!(
+        METRIC_CONFIG_RELOAD_FAILURES,
+        "Number of failed configuration hot-reload attempts"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Two-phase init
+// ---------------------------------------------------------------------------
+
+/// Intermediate state after channel + config are ready but before the BPF trie
+/// handle is available. Resolves the circular dependency between ProfilerAgent
+/// (needs the Sender) and TriggerAgent (needs the MapHandle).
+pub(crate) struct PreparedTriggerAgent {
+    config: Arc<TriggerConfig>,
+    config_path: PathBuf,
+    event_tx: mpsc::Sender<ProcessMatchEvent>,
+    event_rx: Option<mpsc::Receiver<ProcessMatchEvent>>,
+    cache: SharedCgroupCache,
+}
+
+impl PreparedTriggerAgent {
+    /// Phase 1: Load config, create channel. No BPF dependency yet.
+    pub(crate) async fn prepare(config_path: PathBuf, cache: SharedCgroupCache) -> Self {
+        describe_metrics();
+        let config = TriggerConfig::load_or_default(&config_path).await;
+        let (event_tx, event_rx) = mpsc::channel::<ProcessMatchEvent>(TRIGGER_CHANNEL_SIZE);
+
+        Self {
+            config,
+            config_path,
+            event_tx,
+            event_rx: Some(event_rx),
+            cache,
+        }
+    }
+
+    /// Returns a clone of the Sender for ProfilerAgent to use.
+    pub(crate) fn trigger_tx(&self) -> mpsc::Sender<ProcessMatchEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Phase 2: Consume self, inject BPF handle, start the event loop.
+    pub(crate) async fn start(
+        mut self,
+        comm_lpm_trie_handle: libbpf_rs::MapHandle,
+    ) -> Result<TriggerAgentHandle> {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (control_tx, control_rx) = mpsc::channel::<TriggerControl>(8);
+
+        let matcher = CommMatcher::new(&self.config);
+        let mut bpf_trie = BpfTrie::new(comm_lpm_trie_handle);
+        bpf_trie.repopulate(&self.config)?;
+        let cancel_token = CancellationToken::new();
+
+        let proc_handle = TriggerAgent::spawn_proc_walk(
+            &self.config,
+            Arc::clone(&self.cache),
+            self.event_tx.clone(),
+            cancel_token.clone(),
+        );
+
+        // Spawn config file watcher — sends Reload messages on config changes.
+        // Watcher setup failures are fatal: hot-reload is an inherent part of the system.
+        let watcher_handle =
+            TriggerAgent::spawn_config_watcher(self.config_path.clone(), control_tx);
+
+        let event_rx = self
+            .event_rx
+            .take()
+            .expect("event_rx consumed before start");
+
+        let mut agent = TriggerAgent {
+            config: self.config,
+            matcher,
+            bpf_trie,
+            cache: self.cache,
+            psi_registry: PsiRegistry::new(),
+            proc_handle: Some(proc_handle),
+            watcher_handle: Some(watcher_handle),
+            cancel_token,
+            event_tx: self.event_tx,
+            event_rx,
+            control_rx,
+            shutdown_rx,
+        };
+
+        let task_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        Ok(TriggerAgentHandle {
+            task_handle,
+            shutdown_tx,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TriggerAgent (private event loop)
+// ---------------------------------------------------------------------------
+
+struct TriggerAgent {
     config: Arc<TriggerConfig>,
     matcher: CommMatcher,
     bpf_trie: BpfTrie,
@@ -70,86 +213,11 @@ pub(crate) struct TriggerAgent {
     event_rx: mpsc::Receiver<ProcessMatchEvent>,
     control_rx: mpsc::Receiver<TriggerControl>,
     shutdown_rx: oneshot::Receiver<()>,
-    error_counters: ErrorCounters,
-    report_interval: tokio::time::Interval,
 }
 
 impl TriggerAgent {
-    /// Creates and starts the trigger agent. Returns a handle for shutdown and control.
-    ///
-    /// Owns the full lifecycle: BPF trie, proc_walk, PSI watchers, and config
-    /// file watcher are all managed internally.
-    pub(crate) async fn start(
-        config: Arc<TriggerConfig>,
-        config_path: PathBuf,
-        comm_lpm_trie_handle: libbpf_rs::MapHandle,
-        cache: SharedCgroupCache,
-        event_tx: mpsc::Sender<ProcessMatchEvent>,
-        event_rx: mpsc::Receiver<ProcessMatchEvent>,
-    ) -> Result<TriggerAgentHandle> {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let (control_tx, control_rx) = mpsc::channel::<TriggerControl>(8);
-
-        let matcher = CommMatcher::new(&config);
-        let mut bpf_trie = BpfTrie::new(comm_lpm_trie_handle);
-        bpf_trie.repopulate(&config)?;
-        let cancel_token = CancellationToken::new();
-
-        let proc_handle = Self::spawn_proc_walk(
-            &config,
-            Arc::clone(&cache),
-            event_tx.clone(),
-            cancel_token.clone(),
-        );
-
-        // Spawn config file watcher — sends Reload messages on config changes.
-        // Watcher setup failures are fatal: hot-reload is an inherent part of the system.
-        let watcher_handle = Self::spawn_config_watcher(config_path, control_tx);
-
-        let mut agent = TriggerAgent {
-            config,
-            matcher,
-            bpf_trie,
-            cache,
-            psi_registry: PsiRegistry::new(),
-            proc_handle: Some(proc_handle),
-            watcher_handle: Some(watcher_handle),
-            cancel_token,
-            event_tx,
-            event_rx,
-            control_rx,
-            shutdown_rx,
-            error_counters: ErrorCounters::new(),
-            report_interval: tokio::time::interval(PROC_WALK_INTERVAL),
-        };
-
-        let task_handle = tokio::spawn(async move {
-            agent.run().await;
-        });
-
-        Ok(TriggerAgentHandle {
-            task_handle,
-            shutdown_tx,
-        })
-    }
-
-    fn spawn_config_watcher(
-        config_path: PathBuf,
-        control_tx: mpsc::Sender<TriggerControl>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            if let Err(e) = watcher::config_watcher_task(config_path, control_tx).await {
-                error!(error = %e, "config watcher failed");
-            }
-        })
-    }
-
     /// Main event loop — processes events and control messages until shutdown.
     async fn run(&mut self) {
-        // Consume the first immediate tick so the interval starts counting
-        // from now rather than firing a spurious report on the first select.
-        self.report_interval.tick().await;
-
         loop {
             tokio::select! {
                 biased;
@@ -161,9 +229,6 @@ impl TriggerAgent {
                 event = self.event_rx.recv() => match event {
                     None => break,
                     Some(e) => self.handle_process_event(e),
-                },
-                _ = self.report_interval.tick() => {
-                    self.error_counters.report_and_reset();
                 },
             }
         }
@@ -186,7 +251,7 @@ impl TriggerAgent {
                     error = %e,
                     "cgroup resolution failed, skipping event",
                 );
-                self.error_counters.cgroup_resolve_failures += 1;
+                metrics::counter!(METRIC_CGROUP_RESOLVE_FAILURES).increment(1);
                 return;
             }
         };
@@ -204,7 +269,7 @@ impl TriggerAgent {
                 pid = event.pid,
                 "stale event filtered: rule_id no longer matches current config",
             );
-            self.error_counters.stale_events += 1;
+            metrics::counter!(METRIC_STALE_EVENTS).increment(1);
             return;
         }
 
@@ -235,7 +300,7 @@ impl TriggerAgent {
                     resource = ?target.resource,
                     "PSI watcher already registered for this cgroup+resource, skipping",
                 );
-                self.error_counters.duplicate_psi_skips += 1;
+                metrics::counter!(METRIC_DUPLICATE_PSI_SKIPS).increment(1);
             }
             PsiRegisterResult::BuildFailed => {
                 debug!(
@@ -243,7 +308,7 @@ impl TriggerAgent {
                     rule_id = event.rule_id,
                     "failed to build PSI fd, skipping",
                 );
-                self.error_counters.psi_fd_build_failures += 1;
+                metrics::counter!(METRIC_PSI_FD_BUILD_FAILURES).increment(1);
             }
         }
     }
@@ -280,9 +345,11 @@ impl TriggerAgent {
             if let Err(e) = self.bpf_trie.repopulate(&self.config) {
                 panic!("fatal: failed to restore previous BPF trie state: {}", e);
             }
+            metrics::counter!(METRIC_CONFIG_RELOAD_FAILURES).increment(1);
         } else {
             self.matcher = new_matcher;
             self.config = new_config;
+            metrics::counter!(METRIC_CONFIG_RELOADS).increment(1);
         }
 
         // 4. Spawn new proc_walk with whatever config we ended up with.
@@ -324,6 +391,17 @@ impl TriggerAgent {
                     walker.walk(&t, &ct);
                 })
                 .await;
+            }
+        })
+    }
+
+    fn spawn_config_watcher(
+        config_path: PathBuf,
+        control_tx: mpsc::Sender<TriggerControl>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = watcher::config_watcher_task(config_path, control_tx).await {
+                error!(error = %e, "config watcher failed");
             }
         })
     }

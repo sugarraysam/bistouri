@@ -20,6 +20,8 @@ radix_trie = "0.2"
 tokio-util = "0.7.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
 
 [build-dependencies]
 libbpf-cargo = "0.26"

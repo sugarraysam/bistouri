@@ -67,11 +67,11 @@ impl TriggerConfig {
         {
             Ok(Ok(config)) => Arc::new(config),
             Ok(Err(e)) => {
-                warn!(error = %e, "failed to load config, using defaults");
+                warn!(error = %e, "failed to load config, using default");
                 Arc::new(Self::default_config())
             }
             Err(e) => {
-                error!(error = %e, "config load task panicked, using defaults");
+                error!(error = %e, "config load task panicked, using default");
                 Arc::new(Self::default_config())
             }
         }

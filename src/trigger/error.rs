@@ -1,7 +1,6 @@
 use crate::sys::cgroup::error::CgroupError;
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::warn;
 
 #[derive(Error, Debug)]
 #[allow(dead_code)]
@@ -49,47 +48,3 @@ pub(crate) enum TriggerError {
 }
 
 pub(crate) type Result<T> = std::result::Result<T, TriggerError>;
-
-/// Aggregates non-fatal operational event counts for periodic summary logging.
-/// Prevents per-occurrence log spam while surfacing sustained failure patterns.
-pub(super) struct ErrorCounters {
-    pub(super) cgroup_resolve_failures: u64,
-    pub(super) psi_fd_build_failures: u64,
-    pub(super) stale_events: u64,
-    pub(super) duplicate_psi_skips: u64,
-}
-
-impl ErrorCounters {
-    pub(super) fn new() -> Self {
-        Self {
-            cgroup_resolve_failures: 0,
-            psi_fd_build_failures: 0,
-            stale_events: 0,
-            duplicate_psi_skips: 0,
-        }
-    }
-
-    fn has_counts(&self) -> bool {
-        self.cgroup_resolve_failures > 0
-            || self.psi_fd_build_failures > 0
-            || self.stale_events > 0
-            || self.duplicate_psi_skips > 0
-    }
-
-    /// Logs aggregated counts and resets. Called once per PROC_WALK_INTERVAL.
-    pub(super) fn report_and_reset(&mut self) {
-        if self.has_counts() {
-            warn!(
-                cgroup_resolve_failures = self.cgroup_resolve_failures,
-                psi_fd_build_failures = self.psi_fd_build_failures,
-                stale_events = self.stale_events,
-                duplicate_psi_skips = self.duplicate_psi_skips,
-                "trigger agent event summary since last report",
-            );
-            self.cgroup_resolve_failures = 0;
-            self.psi_fd_build_failures = 0;
-            self.stale_events = 0;
-            self.duplicate_psi_skips = 0;
-        }
-    }
-}

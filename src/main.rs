@@ -6,10 +6,9 @@ mod trigger;
 use agent::error::AgentError;
 use args::Args;
 use clap::Parser;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use sys::cgroup::{cgroup_watcher_task, CgroupCache, SharedCgroupCache};
 use tracing::info;
-use trigger::config::TriggerConfig;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -38,35 +37,34 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let cache: SharedCgroupCache = Arc::new(RwLock::new(CgroupCache::new()?));
+    let cache: SharedCgroupCache = Arc::new(std::sync::RwLock::new(CgroupCache::new()?));
 
     let watcher_cache = Arc::clone(&cache);
     let cgroup_watcher = tokio::spawn(async move {
         let _ = cgroup_watcher_task(watcher_cache).await;
     });
 
-    let trigger_config = TriggerConfig::load_or_default(&args.config).await;
+    // Initialize the global metrics recorder and start the Prometheus HTTP
+    // scrape endpoint. Bind failure (e.g. port conflict) is fatal at startup.
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(([0, 0, 0, 0], args.metrics_port))
+        .install()
+        .map_err(|e| anyhow::anyhow!("metrics server on port {}: {e}", args.metrics_port))?;
 
-    let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<trigger::ProcessMatchEvent>(1024);
+    // Phase 1: Prepare TriggerAgent — loads config, creates channel.
+    // No BPF dependency yet, so ProfilerAgent can receive the Sender.
+    let prepared = trigger::PreparedTriggerAgent::prepare(args.config, Arc::clone(&cache)).await;
 
+    // Phase 2: Build ProfilerAgent with the Sender from phase 1.
     let agent_builder =
-        agent::profiler::ProfilerAgentBuilder::new().with_trigger_tx(trigger_tx.clone());
+        agent::profiler::ProfilerAgentBuilder::new().with_trigger_tx(prepared.trigger_tx());
     let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
     let comm_lpm_trie_handle = loaded_agent.comm_lpm_trie_handle()?;
 
     let (poll_handle, stop_flag) = loaded_agent.start_polling()?;
 
-    // Start TriggerAgent — proc_walk, PSI watchers, and config file watcher
-    // are all managed internally by the agent.
-    let trigger_handle = trigger::TriggerAgent::start(
-        trigger_config,
-        args.config,
-        comm_lpm_trie_handle,
-        Arc::clone(&cache),
-        trigger_tx,
-        trigger_rx,
-    )
-    .await?;
+    // Phase 3: Start TriggerAgent with the BPF trie handle from phase 2.
+    let trigger_handle = prepared.start(comm_lpm_trie_handle).await?;
 
     info!("BPF profiler agent started");
 
