@@ -3,7 +3,7 @@ use crate::trigger::error::{Result, TriggerError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{unix::AsyncFd, Interest};
 use tracing::info;
 
 /// Fixed PSI time window: all thresholds are expressed as a percentage of this.
@@ -89,7 +89,11 @@ impl PsiRegistry {
                 source: e,
             })?;
 
-        let async_fd = AsyncFd::new(psi_fd).map_err(TriggerError::AsyncFd)?;
+        // PSI triggers signal threshold crossings via POLLPRI, not POLLIN.
+        // Using AsyncFd::new() (READABLE) would return immediately every time
+        // because PSI fds are always POLLIN-ready as readable stat files.
+        let async_fd =
+            AsyncFd::with_interest(psi_fd, Interest::PRIORITY).map_err(TriggerError::AsyncFd)?;
         Ok(async_fd)
     }
 
