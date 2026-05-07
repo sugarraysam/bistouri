@@ -1,6 +1,0 @@
-targets:
-  - rule:
-      type: "Exact"
-      comm: "node"
-    resource: memory
-    threshold: 10

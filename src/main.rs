@@ -29,16 +29,22 @@ async fn main() -> anyhow::Result<()> {
 
     let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<trigger::ProcessMatchEvent>(1024);
 
-    let agent_builder = agent::profiler::ProfilerAgentBuilder::new()
-        .with_trigger(Arc::clone(&trigger_config), trigger_tx.clone());
+    let agent_builder =
+        agent::profiler::ProfilerAgentBuilder::new().with_trigger_tx(trigger_tx.clone());
     let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
+    let comm_lpm_trie_handle = loaded_agent.comm_lpm_trie_handle()?;
 
     let (poll_handle, stop_flag) = loaded_agent.start_polling()?;
 
     // Start TriggerAgent — proc_walk and event loop are managed internally.
-    let trigger_handle =
-        trigger::TriggerAgent::start(trigger_config, Arc::clone(&cache), trigger_tx, trigger_rx)
-            .await?;
+    let trigger_handle = trigger::TriggerAgent::start(
+        trigger_config,
+        comm_lpm_trie_handle,
+        Arc::clone(&cache),
+        trigger_tx,
+        trigger_rx,
+    )
+    .await?;
 
     // Spawn config file watcher — sends Reload messages on config changes.
     let config_watcher = tokio::spawn(trigger::watcher::config_watcher_task(

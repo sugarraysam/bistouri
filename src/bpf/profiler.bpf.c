@@ -29,7 +29,7 @@ struct {
     __type(key, struct comm_lpm_key);
     __type(value, __u32); // rule_id
     __uint(map_flags, BPF_F_NO_PREALLOC); // REQUIRED by Linux kernel for LPM_TRIE
-} comm_rules SEC(".maps");
+} comm_lpm_trie SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -96,7 +96,7 @@ int handle_perf(void *ctx)
 }
 
 SEC("tracepoint/sched/sched_process_exec")
-int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+int match_comm_on_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
     struct comm_lpm_key key = {};
     bpf_get_current_comm(&key.comm, sizeof(key.comm));
@@ -104,7 +104,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     // Prefix length for a full match is 16 bytes * 8 bits = 128
     key.prefixlen = sizeof(key.comm) * 8;
 
-    __u32 *rule_id_ptr = bpf_map_lookup_elem(&comm_rules, &key);
+    __u32 *rule_id_ptr = bpf_map_lookup_elem(&comm_lpm_trie, &key);
     if (!rule_id_ptr) {
         return 0; // No rule match
     }

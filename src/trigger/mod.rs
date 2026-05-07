@@ -4,9 +4,11 @@ pub(crate) mod matcher;
 pub(crate) mod proc;
 pub(crate) mod watcher;
 
+use crate::agent::profiler::TASK_COMM_LEN;
 use crate::sys::cgroup::SharedCgroupCache;
-use config::{PsiResource, TriggerConfig};
+use config::{MatchRule, PsiResource, TriggerConfig};
 use error::{Result, TriggerError};
+use libbpf_rs::MapCore;
 use matcher::CommMatcher;
 use proc::{ProcWalker, RealProcSource};
 use std::collections::HashMap;
@@ -27,6 +29,90 @@ pub(crate) struct ProcessMatchEvent {
     pub pid: u32,
     pub cgroup_id: u64,
     pub comm: String,
+}
+
+/// Layout-compatible with the BPF `struct comm_lpm_key` in profiler.h.
+#[repr(C)]
+struct CommLpmKey {
+    prefixlen: u32,
+    comm: [u8; TASK_COMM_LEN],
+}
+
+impl CommLpmKey {
+    fn to_bytes(&self) -> &[u8] {
+        // SAFETY: CommLpmKey is #[repr(C)] with no padding ambiguity.
+        // The struct is trivially copyable and the returned slice borrows self.
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const CommLpmKey) as *const u8,
+                std::mem::size_of::<CommLpmKey>(),
+            )
+        }
+    }
+
+    fn from_rule(rule: &MatchRule) -> Self {
+        let mut key = CommLpmKey {
+            prefixlen: 0,
+            comm: [0; TASK_COMM_LEN],
+        };
+        match rule {
+            MatchRule::Exact { comm } => {
+                let bytes = comm.as_bytes();
+                key.comm[..bytes.len()].copy_from_slice(bytes);
+                // +1 accounts for the NUL terminator position, differentiating
+                // "node" from "nodejs" at the bit-prefix level.
+                key.prefixlen = ((bytes.len() + 1) * 8) as u32;
+            }
+            MatchRule::Prefix { comm } => {
+                let bytes = comm.as_bytes();
+                key.comm[..bytes.len()].copy_from_slice(bytes);
+                key.prefixlen = (bytes.len() * 8) as u32;
+            }
+        }
+        key
+    }
+}
+
+/// Owns a `MapHandle` to the BPF `comm_lpm_trie` map and tracks inserted
+/// keys on the Rust side to avoid relying on kernel-side LPM trie iteration.
+struct BpfTrie {
+    map: libbpf_rs::MapHandle,
+    inserted_keys: Vec<Vec<u8>>,
+}
+
+impl BpfTrie {
+    fn new(map: libbpf_rs::MapHandle) -> Self {
+        Self {
+            map,
+            inserted_keys: Vec::new(),
+        }
+    }
+
+    /// Clears all existing entries and repopulates from the given config.
+    fn repopulate(&mut self, config: &TriggerConfig) -> Result<()> {
+        // Delete previously inserted keys. Ignore ENOENT — the entry may
+        // have been removed by a concurrent BPF program (harmless race).
+        for key in self.inserted_keys.drain(..) {
+            let _ = self.map.delete(&key);
+        }
+
+        for target in &config.targets {
+            let key = CommLpmKey::from_rule(&target.rule);
+            let key_bytes = key.to_bytes();
+
+            self.map
+                .update(
+                    key_bytes,
+                    &target.rule_id.to_ne_bytes(),
+                    libbpf_rs::MapFlags::ANY,
+                )
+                .map_err(TriggerError::BpfTrieUpdate)?;
+
+            self.inserted_keys.push(key_bytes.to_vec());
+        }
+
+        Ok(())
+    }
 }
 
 /// Control messages for the TriggerAgent event loop.
@@ -60,6 +146,7 @@ impl TriggerAgentHandle {
 pub(crate) struct TriggerAgent {
     config: Arc<TriggerConfig>,
     matcher: CommMatcher,
+    bpf_trie: BpfTrie,
     cache: SharedCgroupCache,
     psi_registry: HashMap<(u64, PsiResource), tokio::task::JoinHandle<()>>,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
@@ -74,6 +161,7 @@ impl TriggerAgent {
     /// Creates and starts the trigger agent. Returns a handle for shutdown and control.
     pub(crate) async fn start(
         config: Arc<TriggerConfig>,
+        comm_lpm_trie_handle: libbpf_rs::MapHandle,
         cache: SharedCgroupCache,
         event_tx: mpsc::Sender<ProcessMatchEvent>,
         event_rx: mpsc::Receiver<ProcessMatchEvent>,
@@ -82,6 +170,8 @@ impl TriggerAgent {
         let (control_tx, control_rx) = mpsc::channel::<TriggerControl>(8);
 
         let matcher = CommMatcher::new(&config);
+        let mut bpf_trie = BpfTrie::new(comm_lpm_trie_handle);
+        bpf_trie.repopulate(&config)?;
         let cancel_token = CancellationToken::new();
 
         let proc_handle = Self::spawn_proc_walk(
@@ -94,6 +184,7 @@ impl TriggerAgent {
         let mut agent = TriggerAgent {
             config,
             matcher,
+            bpf_trie,
             cache,
             psi_registry: HashMap::new(),
             proc_handle: Some(proc_handle),
@@ -254,13 +345,20 @@ impl TriggerAgent {
         // 2. Nuke PSI registry — abort all watcher tasks
         self.shutdown_watchers();
 
-        // 3. Rebuild matcher with new config
+        // 3. Rebuild matcher and BPF trie with new config
         self.matcher = CommMatcher::new(&new_config);
+        if let Err(e) = self.bpf_trie.repopulate(&new_config) {
+            // Non-fatal: the BPF trie may be stale until the next reload.
+            // Userspace re-validation in handle_process_event filters out
+            // stale matches (eventual consistency).
+            eprintln!(
+                "Failed to repopulate BPF trie: {} — BPF trie may be stale",
+                e
+            );
+        }
         self.config = new_config;
 
         // 4. Spawn new proc_walk
-        // TODO: also clear and repopulate BPF LPM trie (requires access to
-        // LoadedProfilerAgent which is not yet plumbed through).
         self.cancel_token = CancellationToken::new();
         let handle = Self::spawn_proc_walk(
             &self.config,

@@ -39,6 +39,9 @@ pub(crate) enum TriggerError {
 
     #[error("Failed to read config file: {0}")]
     ConfigIo(#[source] std::io::Error),
+
+    #[error("BPF comm_lpm_trie update failed: {0}")]
+    BpfTrieUpdate(#[source] libbpf_rs::Error),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, TriggerError>;

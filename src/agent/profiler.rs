@@ -1,5 +1,4 @@
 use crate::agent::error::{AgentError, Result};
-use crate::trigger::config::{MatchRule, TriggerConfig};
 use crate::trigger::ProcessMatchEvent;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::MapCore;
@@ -73,13 +72,6 @@ impl From<&BpfProcessMatchEvent> for ProcessMatchEvent {
             comm,
         }
     }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-struct CommLpmKey {
-    prefixlen: u32,
-    comm: [u8; TASK_COMM_LEN],
 }
 
 #[repr(C)]
@@ -179,22 +171,16 @@ unsafe impl Send for RingBufferRunner {}
 pub(crate) struct ProfilerAgent {
     freq: u64,
     ncpus: usize,
-    trigger_config: Option<Arc<TriggerConfig>>,
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
 }
 
 impl ProfilerAgent {
-    fn try_new(
-        freq: u64,
-        trigger_config: Option<Arc<TriggerConfig>>,
-        trigger_tx: Option<Sender<ProcessMatchEvent>>,
-    ) -> Result<Self> {
+    fn try_new(freq: u64, trigger_tx: Option<Sender<ProcessMatchEvent>>) -> Result<Self> {
         let ncpus = libbpf_rs::num_possible_cpus()
             .map_err(|e| AgentError::Bpf("failed to get possible CPUs".into(), e))?;
         Ok(Self {
             freq,
             ncpus,
-            trigger_config,
             trigger_tx,
         })
     }
@@ -223,55 +209,14 @@ impl ProfilerAgent {
             object,
         };
 
-        if let Some(config) = &self.trigger_config {
-            for target in config.targets.iter() {
-                let mut key = CommLpmKey {
-                    prefixlen: 0,
-                    comm: [0; TASK_COMM_LEN],
-                };
-
-                match &target.rule {
-                    MatchRule::Exact { comm } => {
-                        let bytes = comm.as_bytes();
-                        key.comm[..bytes.len()].copy_from_slice(bytes);
-                        key.prefixlen = ((bytes.len() + 1) * 8) as u32;
-                    }
-                    MatchRule::Prefix { comm } => {
-                        let bytes = comm.as_bytes();
-                        key.comm[..bytes.len()].copy_from_slice(bytes);
-                        key.prefixlen = (bytes.len() * 8) as u32;
-                    }
-                }
-
-                let key_bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        (&key as *const CommLpmKey) as *const u8,
-                        std::mem::size_of::<CommLpmKey>(),
-                    )
-                };
-
-                loaded
-                    .skel
-                    .maps
-                    .comm_rules
-                    .update(
-                        key_bytes,
-                        &target.rule_id.to_ne_bytes(),
-                        libbpf_rs::MapFlags::ANY,
-                    )
-                    .map_err(|e| {
-                        AgentError::Bpf("failed to insert into comm_rules LPM trie".into(), e)
-                    })?;
-            }
-
-            let link = loaded
-                .skel
-                .progs
-                .handle_exec
-                .attach()
-                .map_err(|e| AgentError::Bpf("failed to attach handle_exec prog".into(), e))?;
-            loaded.links.push(link);
-        }
+        // Always attach match_comm_on_exec — the BPF program is a no-op when
+        // the comm_lpm_trie is empty (bpf_map_lookup_elem returns NULL).
+        // Trie population is handled by TriggerAgent which owns the config.
+        let link =
+            loaded.skel.progs.match_comm_on_exec.attach().map_err(|e| {
+                AgentError::Bpf("failed to attach match_comm_on_exec prog".into(), e)
+            })?;
+        loaded.links.push(link);
 
         loaded.setup_ringbuffers(self.trigger_tx)?;
         loaded.attach_perf_events(self.ncpus, self.freq)?;
@@ -393,6 +338,13 @@ impl LoadedProfilerAgent {
         Ok((handle, stop_flag))
     }
 
+    /// Returns a standalone handle to the BPF `comm_lpm_trie` map.
+    /// The handle duplicates the underlying FD and is safe to send across threads.
+    pub(crate) fn comm_lpm_trie_handle(&self) -> Result<libbpf_rs::MapHandle> {
+        libbpf_rs::MapHandle::try_from(&self.skel.maps.comm_lpm_trie)
+            .map_err(|e| AgentError::Bpf("failed to create comm_lpm_trie MapHandle".into(), e))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn monitor_pid(&self, tgid: u32) -> Result<()> {
         let active: u8 = 1;
@@ -421,7 +373,6 @@ impl LoadedProfilerAgent {
 
 pub(crate) struct ProfilerAgentBuilder {
     freq: u64,
-    trigger_config: Option<Arc<TriggerConfig>>,
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
 }
 
@@ -429,7 +380,6 @@ impl Default for ProfilerAgentBuilder {
     fn default() -> Self {
         Self {
             freq: DEFAULT_SAMPLING_FREQ_HZ,
-            trigger_config: None,
             trigger_tx: None,
         }
     }
@@ -446,17 +396,12 @@ impl ProfilerAgentBuilder {
         self
     }
 
-    pub(crate) fn with_trigger(
-        mut self,
-        config: Arc<TriggerConfig>,
-        tx: Sender<ProcessMatchEvent>,
-    ) -> Self {
-        self.trigger_config = Some(config);
+    pub(crate) fn with_trigger_tx(mut self, tx: Sender<ProcessMatchEvent>) -> Self {
         self.trigger_tx = Some(tx);
         self
     }
 
     pub(crate) fn try_build(self) -> Result<ProfilerAgent> {
-        ProfilerAgent::try_new(self.freq, self.trigger_config, self.trigger_tx)
+        ProfilerAgent::try_new(self.freq, self.trigger_tx)
     }
 }
