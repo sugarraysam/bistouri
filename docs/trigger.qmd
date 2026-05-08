@@ -78,26 +78,26 @@ The following diagram illustrates how a process discovery event flows from the k
 ```{mermaid}
 graph TD
     subgraph "Kernel Space"
-        K_EXEC[Process Exec/Fork] -->|Tracepoint| BPF_PROG[BPF Probe]
-        BPF_PROG -->|LPM Lookup| BPF_TRIE[(BPF LPM Trie)]
-        BPF_PROG -->|Match Found| RING_BUF{{BPF Ring Buffer}}
+        K_EXEC["Process Exec/Fork"] -->|"Tracepoint"| BPF_PROG["BPF Probe"]
+        BPF_PROG -->|"LPM Lookup"| BPF_TRIE[("BPF LPM Trie")]
+        BPF_PROG -->|"Match Found"| RING_BUF["BPF Ring Buffer"]
     end
 
-    subgraph "Userspace (Bistouri Trigger Agent)"
-        RING_BUF -->|Event| EV_LOOP[Event Loop]
-        PROC_SCAN[Periodic /proc Walk] -->|Match| EV_LOOP
+    subgraph "Userspace - Trigger Agent"
+        RING_BUF -->|"Event"| EV_LOOP["Event Loop"]
+        PROC_SCAN["Periodic /proc Walk"] -->|"Match"| EV_LOOP
 
-        INOTIFY[inotify Watcher] -->|Reload Config| EV_LOOP
+        INOTIFY["inotify Watcher"] -->|"Reload Config"| EV_LOOP
 
-        EV_LOOP -->|Validate Rule ID| MATCHER{Comm Matcher}
-        MATCHER -->|Valid| PSI_REG[PSI Registry]
+        EV_LOOP -->|"Validate Rule ID"| MATCHER["Comm Matcher"]
+        MATCHER -->|"Valid"| PSI_REG["PSI Registry"]
 
-        PSI_REG -->|New Cgroup/Resource| SPAWN[Spawn Watcher Task]
-        SPAWN -->|poll POLLPRI| PSI_FILE[/proc/pressure/...]
+        PSI_REG -->|"New Cgroup"| SPAWN["Spawn Watcher Task"]
+        SPAWN -->|"poll POLLPRI"| PSI_FILE["/proc/pressure/..."]
     end
 
-    PSI_FILE -->|Threshold Crossed| SPAWN
-    SPAWN -->|Trigger| PROFILER[Profiler Agent]
+    PSI_FILE -->|"Threshold Crossed"| SPAWN
+    SPAWN -->|"Trigger"| PROFILER["Profiler Agent"]
 ```
 
 ---

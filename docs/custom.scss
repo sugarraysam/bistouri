@@ -1,0 +1,137 @@
+/*-- scss:defaults --*/
+
+// Color palette — a refined indigo/purple accent on a clean white base
+$primary: #5b4fc4;
+$link-color: #5b4fc4;
+$link-hover-color: #3d348b;
+$body-bg: #fdfdfe;
+$body-color: #2d3748;
+$code-color: #6c5ce7;
+
+// Typography
+$headings-font-weight: 700;
+$headings-color: #1a202c;
+$font-size-root: 17px;
+
+/*-- scss:rules --*/
+
+// Google Fonts import
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+// Smooth page transitions
+body {
+  line-height: 1.75;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+// Refined headings
+h1, h2, h3, h4, h5, h6 {
+  letter-spacing: -0.025em;
+  margin-top: 2rem;
+}
+
+h1 {
+  font-size: 2.2rem;
+  border-bottom: 3px solid $primary;
+  padding-bottom: 0.4rem;
+  margin-bottom: 1.5rem;
+}
+
+h2 {
+  font-size: 1.55rem;
+  color: #2d3748;
+  border-bottom: 1px solid #e2e8f0;
+  padding-bottom: 0.3rem;
+}
+
+// Code blocks — polished with subtle shadow
+div.sourceCode {
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  margin: 1.5rem 0;
+}
+
+pre > code {
+  font-size: 0.88rem;
+  line-height: 1.6;
+}
+
+// Inline code
+code {
+  font-size: 0.9em;
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  background-color: #f1f0ff;
+  color: $code-color;
+}
+
+// Mermaid diagrams — better sizing and spacing
+.mermaid {
+  margin: 2rem auto;
+  padding: 1.5rem;
+  background: #f8f9fc;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+// Sidebar / TOC refinements
+.sidebar nav .active {
+  border-left: 3px solid $primary;
+  font-weight: 600;
+}
+
+// Callout blocks
+.callout {
+  border-radius: 8px;
+  margin: 1.5rem 0;
+}
+
+// Blockquotes — subtle left accent
+blockquote {
+  border-left: 4px solid $primary;
+  padding: 0.75rem 1.25rem;
+  background: #f8f7ff;
+  border-radius: 0 6px 6px 0;
+  margin: 1.5rem 0;
+  color: #4a5568;
+  font-style: italic;
+}
+
+// Lists — better spacing
+ol, ul {
+  padding-left: 1.5rem;
+}
+
+li {
+  margin-bottom: 0.35rem;
+}
+
+// Auto-generated footer styling
+hr + p > em {
+  display: block;
+  text-align: center;
+  font-size: 0.8rem;
+  color: #a0aec0;
+  margin-top: 2rem;
+  padding-top: 0.5rem;
+}
+
+// Chapter nav links at bottom
+.nav-page {
+  border-top: 1px solid #e2e8f0;
+  margin-top: 3rem;
+  padding-top: 1rem;
+}
+
+// Smooth scrolling
+html {
+  scroll-behavior: smooth;
+}

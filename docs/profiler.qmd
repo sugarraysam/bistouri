@@ -55,17 +55,17 @@ In userspace, these are caught, decoded, and logged. This allows us to distingui
 The lifecycle of the agent is managed through a strict sequence of loading, attaching, and polling. We use Rust's ownership model to ensure that BPF links (which keep the programs attached) are not dropped prematurely.
 
 ```{mermaid}
-state_machine
-    [*] --> Unloaded: ProfilerAgentBuilder::build()
-    Unloaded --> Loaded: load()
-    note right of Loaded: Maps created, PROG_LOAD called
-    Loaded --> Attached: attach_perf_events()
-    note right of Attached: Progs linked to CPU_CLOCK
-    Attached --> Polling: start_polling()
-    note right of Polling: Blocking thread running rb.poll()
-    Polling --> Attached: stop_flag.set(true)
-    Attached --> [*]: Drop LoadedProfilerAgent
-    note left of [*]: Links dropped, Progs detached
+stateDiagram-v2
+    [*] --> Unloaded : build()
+    Unloaded --> Loaded : load()
+    Loaded --> Attached : attach_perf_events()
+    Attached --> Polling : start_polling()
+    Polling --> Attached : stop_flag.set(true)
+    Attached --> [*] : Drop
+
+    note right of Loaded : Maps created, PROG_LOAD called
+    note right of Attached : Progs linked to CPU_CLOCK
+    note right of Polling : Blocking thread running rb.poll()
 ```
 
 The `LoadedProfilerAgent` struct uses a specific field order to ensure that when it is dropped, the ring buffer and links are cleaned up before the BPF skeleton itself. This prevents use-after-free-like scenarios where the kernel might try to push data into a ring buffer that userspace has already unmapped.

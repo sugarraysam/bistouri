@@ -12,9 +12,16 @@ book:
 
 format:
   html:
-    theme: cosmo
+    theme:
+      - flatly
+      - custom.scss
     toc: true
     toc-depth: 3
     code-copy: true
+    code-block-bg: true
+    code-block-border-left: "#6c5ce7"
+    highlight-style: github
+    mainfont: "Inter, system-ui, -apple-system, sans-serif"
+    monofont: "JetBrains Mono, Fira Code, monospace"
     mermaid:
-      theme: neutral
+      theme: default

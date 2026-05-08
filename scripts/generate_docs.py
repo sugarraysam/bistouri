@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -27,6 +28,14 @@ import google.genai as genai
 MODEL = "gemini-3-flash-preview"
 DOCS_DIR = Path("docs")
 RATE_LIMIT_SECONDS = 12  # 5 requests/minute = 1 every 12 seconds
+
+# Live documentation URLs — passed to the LLM for self-verification context
+LIVE_DOCS_URLS = {
+    "index.qmd": "https://sugarraysam.github.io/bistouri/",
+    "trigger.qmd": "https://sugarraysam.github.io/bistouri/trigger.html",
+    "profiler.qmd": "https://sugarraysam.github.io/bistouri/profiler.html",
+    "ebpf.qmd": "https://sugarraysam.github.io/bistouri/ebpf.html",
+}
 
 # ── System prompt (sent with every call) ─────────────────────────────────────
 
@@ -50,19 +59,46 @@ WRITING PHILOSOPHY:
   is better than parroting source.
 - Use code snippets ONLY to illustrate a design point — never to catalogue an
   implementation.
-- Use mermaid diagrams for data flow and state machines — they should clarify
-  relationships that prose alone cannot.
-- CRITICAL: Quarto requires mermaid blocks to use curly-brace syntax:
-  ```{mermaid}
-  graph TD
-      A --> B
-  ```
-  Do NOT use ```mermaid (without curly braces) — it will NOT render.
 - A reader should finish each chapter able to explain the design to someone
   else without looking at the code.
 - If a chapter is not interesting — if it does not teach something surprising
   or non-obvious — output only the YAML frontmatter with a comment:
   <!-- Nothing interesting to document here yet. -->
+
+MERMAID DIAGRAM RULES:
+- Use mermaid diagrams for data flow and state machines — they should clarify
+  relationships that prose alone cannot.
+- CRITICAL: Quarto requires mermaid blocks to use curly-brace syntax:
+  ```{{mermaid}}
+  graph TD
+      A --> B
+  ```
+  Do NOT use ```mermaid (without curly braces) — it will NOT render.
+- Valid diagram types: graph TD, graph LR, flowchart TD, flowchart LR,
+  stateDiagram-v2, sequenceDiagram, classDiagram.
+- DO NOT use "state_machine" — that is NOT a valid Mermaid keyword. Use
+  "stateDiagram-v2" for state diagrams.
+- ALWAYS quote node labels containing special characters (parentheses, slashes,
+  brackets, dots, colons). Example: A["Label (with parens)"] not A[Label (with parens)]
+- ALWAYS quote edge labels: A -->|"label text"| B
+- Use subgraph titles with quotes: subgraph "My Group"
+- Do NOT use double-curly-brace node shapes like {{{{text}}}} — they conflict
+  with Quarto template syntax. Use ["text"] instead.
+- Keep diagrams clean: max ~15 nodes, clear labels, logical grouping.
+- Test mentally: would this parse as standard Mermaid JS syntax? If unsure, simplify.
+
+AESTHETICS:
+- These docs are publicly deployed and represent the project's professional quality.
+- Use rich, descriptive section introductions that draw the reader in.
+- Use Quarto callout blocks to highlight key insights:
+  ::: {{.callout-tip}}
+  ## Key Insight
+  Explanation here.
+  :::
+  Valid types: .callout-note, .callout-tip, .callout-important, .callout-warning
+- Prefer prose paragraphs over bullet lists. Bullets are acceptable for
+  enumerating distinct items (e.g., map types) but narrative flow is preferred
+  for explaining design reasoning.
 
 STABILITY AND CONSERVATISM:
 - Be conservative about changes. Documentation should evolve incrementally,
@@ -73,8 +109,20 @@ STABILITY AND CONSERVATISM:
   existing chapter UNCHANGED. Do not rephrase for the sake of rephrasing.
 - Never reorganize sections. The skeleton is fixed.
 
+LIVE DOCUMENTATION (your output becomes these pages):
+- Landing:  {live_url_landing}
+- Trigger:  {live_url_trigger}
+- Profiler: {live_url_profiler}
+- eBPF:     {live_url_ebpf}
+
+Your output will be rendered by Quarto and deployed to GitHub Pages. If anything
+in the current live pages is broken (e.g. diagrams not rendering, placeholder
+text, formatting issues), FIX IT in your output.
+
 OUTPUT FORMAT:
-1. Valid Quarto Markdown (.qmd).
+1. Output ONLY valid Quarto Markdown (.qmd). No wrapping code fences.
+   Do NOT wrap your output in ```qmd ... ``` or ```markdown ... ``` blocks.
+   The raw output is written directly to a .qmd file.
 2. Start with YAML frontmatter:
    ---
    title: "<chapter title>"
@@ -116,6 +164,8 @@ YOUR TASK:
   naturally into the existing narrative.
 - DO NOT rewrite sections that are still accurate just to sound different.
 - DO NOT change the section skeleton.
+- VERIFY that all mermaid diagrams use valid syntax (see system prompt rules).
+  Fix any broken diagrams.
 
 CURRENT CHAPTER:
 {existing_chapter_content}
@@ -173,7 +223,7 @@ CHAPTERS = [
 ## LPM Trie for Cgroup Matching
 ## Batch Updates & Performance
 ## Error Recovery
-## Agent Lifecycle (use a ```{mermaid}``` diagram)"""
+## Agent Lifecycle (use a ```{mermaid}``` stateDiagram-v2 — NOT state_machine)"""
         ),
     },
     {
@@ -229,6 +279,22 @@ def read_sources(paths: list[str]) -> str:
     return context
 
 
+def strip_wrapping_fences(text: str) -> str:
+    """Strip markdown code fences that LLMs sometimes wrap their output in.
+
+    Handles patterns like:
+        ```qmd\n...\n```
+        ```markdown\n...\n```
+        ```\n...\n```
+    """
+    # Match opening fence with optional language tag, then content, then closing fence
+    pattern = r"^\s*```(?:qmd|markdown|md)?\s*\n(.*?)```\s*$"
+    match = re.match(pattern, text, re.DOTALL)
+    if match:
+        return match.group(1)
+    return text
+
+
 def generate_chapter(
     client: genai.Client,
     chapter: dict,
@@ -244,7 +310,11 @@ def generate_chapter(
     if output_path.exists():
         content = output_path.read_text().strip()
         # Only treat as existing if it has real content (not just a placeholder)
-        if content and "# Placeholder" not in content:
+        if (
+            content
+            and "# Placeholder" not in content
+            and "will be generated by the documentation pipeline" not in content
+        ):
             existing_content = content
 
     if existing_content is not None:
@@ -262,6 +332,10 @@ def generate_chapter(
     system_instruction = SYSTEM_PROMPT.format(
         commit_sha=commit_sha,
         date=date_str,
+        live_url_landing=LIVE_DOCS_URLS.get("index.qmd", "N/A"),
+        live_url_trigger=LIVE_DOCS_URLS.get("trigger.qmd", "N/A"),
+        live_url_profiler=LIVE_DOCS_URLS.get("profiler.qmd", "N/A"),
+        live_url_ebpf=LIVE_DOCS_URLS.get("ebpf.qmd", "N/A"),
     )
 
     response = client.models.generate_content(
@@ -272,7 +346,10 @@ def generate_chapter(
         ),
     )
 
-    output_path.write_text(response.text)
+    # Post-process: strip any wrapping code fences from LLM output
+    cleaned = strip_wrapping_fences(response.text)
+
+    output_path.write_text(cleaned)
     print(f"  ✓ {chapter['filename']}")
 
 
