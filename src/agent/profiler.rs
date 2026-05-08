@@ -239,9 +239,14 @@ impl ProfilerAgent {
             .open(&mut object)
             .map_err(|e| AgentError::Bpf("failed to open BPF skeleton".into(), e))?;
 
-        let skel = open_skel
-            .load()
-            .map_err(|e| AgentError::Bpf("failed to load BPF skeleton".into(), e))?;
+        let skel = open_skel.load().map_err(|e| {
+            AgentError::Bpf(
+                "failed to load BPF skeleton — ensure the kernel supports BPF ring buffers \
+                 (Linux 5.8+) and that bistouri runs with CAP_BPF+CAP_PERFMON or as root"
+                    .into(),
+                e,
+            )
+        })?;
 
         // SAFETY: Erasing lifetime because `object` is Boxed and will outlive `skel` inside LoadedProfilerAgent.
         let skel: bpf::ProfilerSkel<'static> = unsafe { std::mem::transmute(skel) };

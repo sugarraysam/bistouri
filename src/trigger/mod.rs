@@ -118,7 +118,8 @@ impl PreparedTriggerAgent {
         let cgroup2_mount = find_cgroup2_mount().map_err(|e| {
             error!(
                 error = %e,
-                "cgroup2 is not mounted — bistouri requires cgroup2 for PSI support",
+                "cgroup2 is not mounted — bistouri requires cgroup2 for PSI triggers. \
+                 Mount with: mount -t cgroup2 none /sys/fs/cgroup",
             );
             error::TriggerError::Cgroup2NotMounted(e)
         })?;

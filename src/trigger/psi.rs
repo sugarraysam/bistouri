@@ -102,9 +102,19 @@ impl PsiRegistry {
             .time_window(Duration::from_millis(TIME_WINDOW_MS as u64))
             .stall_amount(stall_amount)
             .build()
-            .map_err(|e| TriggerError::PsiFdBuild {
-                path: cgroup_path.to_path_buf(),
-                source: e,
+            .map_err(|e| {
+                error!(
+                    cgroup = %cgroup_path.display(),
+                    resource = ?resource,
+                    error = %e,
+                    "PSI fd build failed — if this persists for all cgroups, \
+                     verify CONFIG_PSI=y in your kernel config \
+                     (grep CONFIG_PSI /boot/config-$(uname -r))",
+                );
+                TriggerError::PsiFdBuild {
+                    path: cgroup_path.to_path_buf(),
+                    source: e,
+                }
             })?;
 
         // PSI triggers signal threshold crossings via POLLPRI, not POLLIN.
