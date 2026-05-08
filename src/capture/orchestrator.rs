@@ -178,6 +178,10 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         }
         *refcount += 1;
 
+        // Extract label values before request.comm is moved into the session.
+        let resource_label = request.resource.to_string();
+        let comm_label = request.comm.clone();
+
         let session = CaptureSession::new(request.pid, request.comm, request.resource);
         let session_id = session.id();
 
@@ -195,7 +199,12 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             duration_secs = self.capture_duration.as_secs(),
             "capture session started",
         );
-        metrics::counter!(METRIC_SESSIONS_STARTED).increment(1);
+        metrics::counter!(
+            METRIC_SESSIONS_STARTED,
+            "resource" => resource_label,
+            "comm" => comm_label,
+        )
+        .increment(1);
 
         self.sessions.insert(session_id, session);
     }
@@ -287,7 +296,12 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             unique_traces = completed.stack_traces.len(),
             "capture session completed",
         );
-        metrics::counter!(METRIC_SESSIONS_COMPLETED).increment(1);
+        metrics::counter!(
+            METRIC_SESSIONS_COMPLETED,
+            "resource" => completed.resource.to_string(),
+            "comm" => completed.comm.clone(),
+        )
+        .increment(1);
 
         if self.session_tx.send(completed).await.is_err() {
             warn!("downstream receiver dropped, completed session lost");

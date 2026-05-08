@@ -1,0 +1,18 @@
+# Stress workload image for Bistouri E2E integration tests.
+#
+# Produces three statically-linked binaries with distinct Linux `comm` names
+# (cpu-burner, io-burner, mem-hog) so Bistouri's comm-based matching can
+# differentiate them. Final image is FROM scratch (~200KB total).
+
+FROM gcc:bookworm AS builder
+
+COPY cpu_burner.c io_burner.c mem_hog.c ./
+
+RUN gcc -static -O2 -o cpu-burner cpu_burner.c -lm \
+ && gcc -static -O2 -o io-burner io_burner.c \
+ && gcc -static -O2 -o mem-hog   mem_hog.c
+
+FROM scratch
+COPY --from=builder /cpu-burner /io-burner /mem-hog /
+# io-burner writes to /tmp — scratch images have no directories.
+COPY --from=builder /tmp /tmp

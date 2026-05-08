@@ -22,3 +22,7 @@ Dockerfile
 
 # Brain / App Data Directory (if run locally)
 .gemini/
+
+# E2E test infrastructure (not needed in Bistouri image)
+tests/
+docs/

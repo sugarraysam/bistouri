@@ -1,0 +1,77 @@
+# Bistouri DaemonSet for E2E integration tests.
+#
+# Security model: granular Linux capabilities, no privileged mode.
+# Mirrors the permissions from `make docker-run`.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: bistouri
+  labels:
+    app: bistouri
+spec:
+  selector:
+    matchLabels:
+      app: bistouri
+  template:
+    metadata:
+      labels:
+        app: bistouri
+    spec:
+      # Access /proc for all host processes (comm, cgroup discovery).
+      hostPID: true
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: bistouri
+        image: bistouri-agent:local
+        imagePullPolicy: Never
+        args:
+        - "--config"
+        - "/etc/bistouri/trigger.yaml"
+        - "--log-level"
+        - "bistouri=debug"
+        ports:
+        - containerPort: 9464
+          name: metrics
+          protocol: TCP
+        securityContext:
+          capabilities:
+            add:
+            # Load BPF programs and create BPF maps (kernel ≥ 5.8).
+            - BPF
+            # Attach to perf events for stack sampling via perf_event_open().
+            - PERFMON
+            # Create PSI trigger file descriptors with sub-2s windows.
+            # Without this, the kernel restricts PSI windows to multiples of 2s.
+            - SYS_RESOURCE
+          # Allow bpf() and perf_event_open() syscalls which are blocked
+          # by the default container seccomp profile.
+          seccompProfile:
+            type: Unconfined
+        volumeMounts:
+        # Tracing filesystem — read-only, used by BPF tracepoint attachment.
+        - name: sys-kernel-tracing
+          mountPath: /sys/kernel/tracing
+          readOnly: true
+        # BPF filesystem — BPF map pinning.
+        - name: sys-fs-bpf
+          mountPath: /sys/fs/bpf
+        # Cgroup filesystem — read cgroup info + write PSI trigger FDs.
+        # Must be read-write: PSI trigger creation writes to <cgroup>/cpu.pressure etc.
+        - name: sys-fs-cgroup
+          mountPath: /sys/fs/cgroup
+        # Trigger config file, mounted from ConfigMap.
+        - name: config
+          mountPath: /etc/bistouri
+      volumes:
+      - name: sys-kernel-tracing
+        hostPath:
+          path: /sys/kernel/tracing
+      - name: sys-fs-bpf
+        hostPath:
+          path: /sys/fs/bpf
+      - name: sys-fs-cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+      - name: config
+        configMap:
+          name: bistouri-config

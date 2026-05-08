@@ -29,6 +29,16 @@ pub(crate) enum PsiResource {
     Io,
 }
 
+impl std::fmt::Display for PsiResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PsiResource::Memory => write!(f, "memory"),
+            PsiResource::Cpu => write!(f, "cpu"),
+            PsiResource::Io => write!(f, "io"),
+        }
+    }
+}
+
 /// Per-resource trigger configuration within a target rule.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ResourceConfig {

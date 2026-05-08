@@ -1,0 +1,51 @@
+# Phase 1 config: 9 rules — all 3 resources for all 3 workloads.
+#
+# Expected triggers:
+#   cpu-burner  → cpu     (tight 100m CPU limit creates cpu.pressure stalls)
+#   io-burner   → io      (fsync loop creates io.pressure stalls)
+#   mem-hog     → memory  (tight 32Mi limit creates memory.pressure stalls)
+#
+# The remaining 6 rules should NOT trigger because those resources
+# are not constrained for those workloads.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bistouri-config
+data:
+  trigger.yaml: |
+    targets:
+      # cpu-burner: CPU-bound workload — only cpu.pressure should fire
+      - rule:
+          type: Exact
+          comm: "cpu-burner"
+        resources:
+          - resource: cpu
+            threshold: 5.0
+          - resource: memory
+            threshold: 5.0
+          - resource: io
+            threshold: 5.0
+
+      # io-burner: IO-bound workload — only io.pressure should fire
+      - rule:
+          type: Exact
+          comm: "io-burner"
+        resources:
+          - resource: cpu
+            threshold: 5.0
+          - resource: memory
+            threshold: 5.0
+          - resource: io
+            threshold: 5.0
+
+      # mem-hog: Memory-bound workload — only memory.pressure should fire
+      - rule:
+          type: Exact
+          comm: "mem-hog"
+        resources:
+          - resource: cpu
+            threshold: 5.0
+          - resource: memory
+            threshold: 5.0
+          - resource: io
+            threshold: 5.0

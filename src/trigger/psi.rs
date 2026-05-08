@@ -4,7 +4,8 @@ use crate::trigger::error::{Result, TriggerError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{unix::AsyncFd, Interest};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, Ready};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -123,8 +124,11 @@ impl PsiRegistry {
         capture_tx: mpsc::Sender<CaptureRequest>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            while let Ok(mut guard) = async_fd.readable().await {
-                guard.clear_ready();
+            // PSI triggers fire via POLLPRI, not POLLIN. We must use
+            // .ready(Interest::PRIORITY) — .readable() waits for POLLIN
+            // which is always set on PSI fds (they are stat-like files).
+            while let Ok(mut guard) = async_fd.ready(Interest::PRIORITY).await {
+                guard.clear_ready_matching(Ready::PRIORITY);
                 info!(
                     pid = pid,
                     comm = %comm,
@@ -144,7 +148,12 @@ impl PsiRegistry {
                         "capture request channel full, PSI event dropped — \
                          consider doubling CAPTURE_REQUEST_CHANNEL_SIZE",
                     );
-                    metrics::counter!(METRIC_CAPTURE_CHANNEL_FULL).increment(1);
+                    metrics::counter!(
+                        METRIC_CAPTURE_CHANNEL_FULL,
+                        "resource" => format!("{resource:?}").to_lowercase(),
+                        "comm" => comm.clone(),
+                    )
+                    .increment(1);
                 }
             }
         })

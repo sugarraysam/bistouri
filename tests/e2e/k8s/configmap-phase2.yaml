@@ -1,0 +1,46 @@
+# Phase 2 config: 6 rules — drop the "hot" resource per workload.
+#
+# Hot-reload test: after applying this config, Bistouri should detect the
+# file change via inotify, nuke PSI watchers, rebuild with 6 rules, and
+# NO new capture sessions should start (the remaining resources are "cold").
+#
+# Dropped rules:
+#   cpu-burner  → cpu     (was triggering — now removed)
+#   io-burner   → io      (was triggering — now removed)
+#   mem-hog     → memory  (was triggering — now removed)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bistouri-config
+data:
+  trigger.yaml: |
+    targets:
+      # cpu-burner: only memory + io (dropped cpu)
+      - rule:
+          type: Exact
+          comm: "cpu-burner"
+        resources:
+          - resource: memory
+            threshold: 5.0
+          - resource: io
+            threshold: 5.0
+
+      # io-burner: only cpu + memory (dropped io)
+      - rule:
+          type: Exact
+          comm: "io-burner"
+        resources:
+          - resource: cpu
+            threshold: 5.0
+          - resource: memory
+            threshold: 5.0
+
+      # mem-hog: only cpu + io (dropped memory)
+      - rule:
+          type: Exact
+          comm: "mem-hog"
+        resources:
+          - resource: cpu
+            threshold: 5.0
+          - resource: io
+            threshold: 5.0

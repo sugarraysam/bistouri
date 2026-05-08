@@ -1,0 +1,84 @@
+# Stress workload pods for Bistouri E2E integration tests.
+#
+# Each pod runs a single stress binary with resource limits designed to
+# create targeted PSI pressure on exactly one resource type.
+# The pressure comes from tight cgroup limits, not workload intensity.
+
+# ── cpu-burner ──────────────────────────────────────────────────────
+# Tight CPU limit (100m = 0.1 cores) causes the cgroup CPU throttler
+# to stall the process, generating cpu.pressure.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-stress
+  labels:
+    app: stress
+    type: cpu
+spec:
+  restartPolicy: Always
+  containers:
+  - name: burner
+    image: bistouri-stress:local
+    imagePullPolicy: Never
+    command: ["/cpu-burner"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "64Mi"
+      limits:
+        cpu: "100m"
+        memory: "64Mi"
+
+---
+# ── io-burner ──────────────────────────────────────────────────────
+# fsync() loop creates natural IO wait. No Kubernetes IO limits needed —
+# the sync write pattern forces the process to block on the block device,
+# generating io.pressure.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: io-stress
+  labels:
+    app: stress
+    type: io
+spec:
+  restartPolicy: Always
+  containers:
+  - name: burner
+    image: bistouri-stress:local
+    imagePullPolicy: Never
+    command: ["/io-burner"]
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "64Mi"
+      limits:
+        cpu: "500m"
+        memory: "64Mi"
+
+---
+# ── mem-hog ────────────────────────────────────────────────────────
+# Tight memory limit (32Mi) forces the kernel to aggressively reclaim
+# pages as the workload continuously allocates and touches 16MB chunks,
+# generating memory.pressure.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mem-stress
+  labels:
+    app: stress
+    type: memory
+spec:
+  restartPolicy: Always
+  containers:
+  - name: hog
+    image: bistouri-stress:local
+    imagePullPolicy: Never
+    command: ["/mem-hog"]
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "32Mi"
+      limits:
+        cpu: "500m"
+        memory: "32Mi"
