@@ -1,5 +1,6 @@
 mod agent;
 mod args;
+mod capture;
 mod sys;
 mod trigger;
 

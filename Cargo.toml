@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 libbpf-rs = "0.26"
 perf-event = "0.4"
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.52", features = ["full", "test-util"] }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive", "env", "color"] }
 libc = "0.2"
@@ -17,7 +17,8 @@ presutaoru = "0.1.0-alpha.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_yml = "0.0.12"
 radix_trie = "0.2"
-tokio-util = "0.7.18"
+tokio-util = { version = "0.7.18", features = ["time"] }
+uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"

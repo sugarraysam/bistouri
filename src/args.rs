@@ -40,6 +40,15 @@ pub(crate) struct Args {
     #[arg(long, env = "RUST_LOG")]
     pub log_level: Option<String>,
 
+    /// Duration in seconds to capture stack traces after a PSI trigger fires.
+    ///
+    /// At the default sampling frequency of 19 Hz, a 3-second capture window
+    /// yields ~57 stack samples per PID — enough for a statistically meaningful
+    /// flamegraph. Shorter windows risk missing patterns; longer windows increase
+    /// memory usage and may outlast the stall event.
+    #[arg(long, env = "BISTOURI_CAPTURE_DURATION", default_value_t = 3)]
+    pub capture_duration_secs: u64,
+
     /// Port for the Prometheus /metrics HTTP endpoint.
     ///
     /// Default 9464 follows the OpenTelemetry exporter convention.
