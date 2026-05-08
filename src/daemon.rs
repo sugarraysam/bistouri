@@ -3,9 +3,7 @@ use crate::args::Args;
 use crate::capture::orchestrator::{CaptureOrchestrator, STACK_SAMPLE_CHANNEL_SIZE};
 use crate::capture::session::CompletedSession;
 use crate::capture::trace::StackSample;
-use crate::sys::cgroup::{cgroup_watcher_task, CgroupCache, SharedCgroupCache};
 use crate::trigger::PreparedTriggerAgent;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -30,7 +28,6 @@ pub(crate) struct BistouriDaemon {
     trigger_handle: JoinHandle<()>,
     orch_handle: JoinHandle<()>,
     downstream_handle: JoinHandle<()>,
-    cgroup_watcher: JoinHandle<()>,
 }
 
 impl BistouriDaemon {
@@ -42,22 +39,8 @@ impl BistouriDaemon {
     /// - Config file watcher
     /// - Capture orchestrator
     /// - Downstream consumer
-    /// - Cgroup watcher
     pub(crate) async fn start(args: Args) -> anyhow::Result<Self> {
         let cancel = CancellationToken::new();
-
-        // Cgroup cache shared across trigger agent and proc walker.
-        let cache: SharedCgroupCache = Arc::new(std::sync::RwLock::new(CgroupCache::new()?));
-
-        let cgroup_cancel = cancel.clone();
-        let watcher_cache = Arc::clone(&cache);
-        let cgroup_watcher = tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = cgroup_cancel.cancelled() => {},
-                result = cgroup_watcher_task(watcher_cache) => { let _ = result; },
-            }
-        });
 
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(([0, 0, 0, 0], args.metrics_port))
@@ -69,8 +52,9 @@ impl BistouriDaemon {
         // the orchestrator exists. All other channels are internal to start().
         let (stack_tx, stack_rx) = mpsc::channel::<StackSample>(STACK_SAMPLE_CHANNEL_SIZE);
 
-        // Phase 1: Prepare TriggerAgent (loads config, creates event channel).
-        let prepared = PreparedTriggerAgent::prepare(args.config, Arc::clone(&cache)).await;
+        // Phase 1: Prepare TriggerAgent (loads config, creates event channel,
+        // resolves cgroup2 mount point).
+        let prepared = PreparedTriggerAgent::prepare(args.config).await?;
 
         // Phase 2: Build ProfilerAgent with trigger + stack sample senders.
         let agent_builder = ProfilerAgentBuilder::new()
@@ -114,7 +98,6 @@ impl BistouriDaemon {
             trigger_handle,
             orch_handle: orch_task,
             downstream_handle,
-            cgroup_watcher,
         })
     }
 
@@ -126,7 +109,6 @@ impl BistouriDaemon {
         let _ = self.trigger_handle.await;
         let _ = self.orch_handle.await;
         let _ = self.downstream_handle.await;
-        let _ = self.cgroup_watcher.await;
 
         // loaded_agent drops here — BPF skel, links, and object are released last.
     }

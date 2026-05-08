@@ -1,4 +1,3 @@
-use crate::sys::cgroup::error::CgroupError;
 use crate::trigger::config::PsiResource;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -6,13 +5,6 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub(crate) enum TriggerError {
-    #[error("Failed to resolve cgroup for pid {pid}: {source}")]
-    CgroupResolve {
-        pid: u32,
-        #[source]
-        source: CgroupError,
-    },
-
     #[error("Failed to build PSI file descriptor for cgroup {path:?}: {source}")]
     PsiFdBuild {
         path: PathBuf,
@@ -52,6 +44,9 @@ pub(crate) enum TriggerError {
 
     #[error("Config watcher setup failed: {0}")]
     ConfigWatcher(#[source] std::io::Error),
+
+    #[error("cgroup2 is not mounted: {0}")]
+    Cgroup2NotMounted(#[source] std::io::Error),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, TriggerError>;

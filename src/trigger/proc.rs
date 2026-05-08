@@ -1,8 +1,9 @@
-use crate::sys::cgroup::SharedCgroupCache;
+use crate::sys::cgroup::resolve_cgroup_path;
 use crate::trigger::config::TriggerConfig;
 use crate::trigger::matcher::CommMatcher;
 use crate::trigger::ProcessMatchEvent;
 use std::fs;
+use std::path::Path;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -10,14 +11,14 @@ use tracing::debug;
 /// Walks /proc, matches process comms against configured rules, and emits events.
 pub(crate) struct ProcWalker {
     matcher: CommMatcher,
-    cache: SharedCgroupCache,
+    cgroup2_mount: Box<Path>,
 }
 
 impl ProcWalker {
-    pub(crate) fn new(config: &TriggerConfig, cache: SharedCgroupCache) -> Self {
+    pub(crate) fn new(config: &TriggerConfig, cgroup2_mount: &Path) -> Self {
         Self {
             matcher: CommMatcher::new(config),
-            cache,
+            cgroup2_mount: cgroup2_mount.into(),
         }
     }
 
@@ -40,11 +41,16 @@ impl ProcWalker {
                 continue;
             }
 
-            let cgroup_id = match self.cache.write().unwrap().resolve_cgroup_by_pid(pid) {
-                Ok((id, _path)) => id,
-                Err(_) => {
+            let cgroup_path = match resolve_cgroup_path(&self.cgroup2_mount, pid) {
+                Ok(path) => path,
+                Err(e) => {
                     // Non-fatal: process likely exited between /proc scan and
                     // cgroup resolution — skip this pid and continue the walk.
+                    debug!(
+                        pid = pid,
+                        error = %e,
+                        "proc_walk: cgroup resolution failed, skipping pid",
+                    );
                     continue;
                 }
             };
@@ -54,13 +60,13 @@ impl ProcWalker {
                     pid = pid,
                     comm = %comm,
                     rule_id = rule_id,
-                    cgroup_id = cgroup_id,
+                    cgroup = %cgroup_path.display(),
                     "proc_walk matched process",
                 );
                 let event = ProcessMatchEvent {
                     rule_id: *rule_id,
                     pid,
-                    cgroup_id,
+                    cgroup_path: Some(cgroup_path.clone()),
                     comm: comm.clone(),
                 };
                 let _ = tx.blocking_send(event);

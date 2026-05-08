@@ -74,7 +74,7 @@ impl From<&ProcessMatchBpfEvent> for ProcessMatchEvent {
         ProcessMatchEvent {
             rule_id: bpf.rule_id,
             pid: bpf.pid,
-            cgroup_id: bpf.cgroup_id,
+            cgroup_path: None,
             comm,
         }
     }

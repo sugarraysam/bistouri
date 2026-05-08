@@ -7,14 +7,13 @@ mod trie;
 pub(crate) mod watcher;
 
 use crate::capture::session::CaptureRequest;
-
-use crate::sys::cgroup::SharedCgroupCache;
+use crate::sys::cgroup::{cgroup_path_to_id, find_cgroup2_mount, resolve_cgroup_path};
 use config::TriggerConfig;
 use error::Result;
 use matcher::CommMatcher;
 use proc::ProcWalker;
 use psi::{PsiRegisterResult, PsiRegistry};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -41,7 +40,9 @@ const TRIGGER_CHANNEL_SIZE: usize = 1024;
 pub(crate) struct ProcessMatchEvent {
     pub rule_id: u32,
     pub pid: u32,
-    pub cgroup_id: u64,
+    /// Pre-resolved by proc_walk (`Some`), or needs inline resolution for BPF
+    /// events (`None`) via `/proc/<pid>/cgroup`.
+    pub cgroup_path: Option<PathBuf>,
     pub comm: String,
 }
 
@@ -105,23 +106,30 @@ pub(crate) struct PreparedTriggerAgent {
     config_path: PathBuf,
     event_tx: mpsc::Sender<ProcessMatchEvent>,
     event_rx: Option<mpsc::Receiver<ProcessMatchEvent>>,
-    cache: SharedCgroupCache,
+    cgroup2_mount: PathBuf,
 }
 
 impl PreparedTriggerAgent {
-    /// Phase 1: Load config, create channel. No BPF dependency yet.
-    pub(crate) async fn prepare(config_path: PathBuf, cache: SharedCgroupCache) -> Self {
+    /// Phase 1: Load config, create channel, resolve cgroup2 mount. No BPF dependency yet.
+    pub(crate) async fn prepare(config_path: PathBuf) -> Result<Self> {
         describe_metrics();
         let config = TriggerConfig::load_or_default(&config_path).await;
         let (event_tx, event_rx) = mpsc::channel::<ProcessMatchEvent>(TRIGGER_CHANNEL_SIZE);
+        let cgroup2_mount = find_cgroup2_mount().map_err(|e| {
+            error!(
+                error = %e,
+                "cgroup2 is not mounted — bistouri requires cgroup2 for PSI support",
+            );
+            error::TriggerError::Cgroup2NotMounted(e)
+        })?;
 
-        Self {
+        Ok(Self {
             config,
             config_path,
             event_tx,
             event_rx: Some(event_rx),
-            cache,
-        }
+            cgroup2_mount,
+        })
     }
 
     /// Returns a clone of the Sender for ProfilerAgent to use.
@@ -149,7 +157,7 @@ impl PreparedTriggerAgent {
 
         let proc_handle = TriggerAgent::spawn_proc_walk(
             &self.config,
-            Arc::clone(&self.cache),
+            &self.cgroup2_mount,
             self.event_tx.clone(),
             proc_walk_cancel.clone(),
         );
@@ -170,7 +178,7 @@ impl PreparedTriggerAgent {
             config: self.config,
             matcher,
             bpf_trie,
-            cache: self.cache,
+            cgroup2_mount: self.cgroup2_mount,
             psi_registry: PsiRegistry::new(capture_tx),
             proc_handle: Some(proc_handle),
             watcher_handle: Some(watcher_handle),
@@ -197,7 +205,7 @@ struct TriggerAgent {
     config: Arc<TriggerConfig>,
     matcher: CommMatcher,
     bpf_trie: BpfTrie,
-    cache: SharedCgroupCache,
+    cgroup2_mount: PathBuf,
     psi_registry: PsiRegistry,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
@@ -231,24 +239,22 @@ impl TriggerAgent {
     }
 
     fn handle_process_event(&mut self, event: ProcessMatchEvent) {
-        let cgroup_id = event.cgroup_id;
-        let cgroup_path = match self
-            .cache
-            .write()
-            .unwrap()
-            .resolve_cgroup_fallback(cgroup_id, event.pid)
-        {
-            Ok(path) => path,
-            Err(e) => {
-                debug!(
-                    pid = event.pid,
-                    cgroup_id = cgroup_id,
-                    error = %e,
-                    "cgroup resolution failed, skipping event",
-                );
-                metrics::counter!(METRIC_CGROUP_RESOLVE_FAILURES).increment(1);
-                return;
-            }
+        let cgroup_path = match event.cgroup_path {
+            // proc_walk already resolved the path.
+            Some(path) => path,
+            // BPF event: inline /proc/<pid>/cgroup read (~10-50µs).
+            None => match resolve_cgroup_path(&self.cgroup2_mount, event.pid) {
+                Ok(path) => path,
+                Err(e) => {
+                    error!(
+                        pid = event.pid,
+                        error = %e,
+                        "cgroup resolution failed for BPF event, skipping",
+                    );
+                    metrics::counter!(METRIC_CGROUP_RESOLVE_FAILURES).increment(1);
+                    return;
+                }
+            },
         };
 
         // Re-validate: confirm the comm still matches the rule in the current config.
@@ -269,6 +275,7 @@ impl TriggerAgent {
         }
 
         let target = self.config.target_for_rule(event.rule_id);
+        let cgroup_id = cgroup_path_to_id(&cgroup_path);
 
         for res_cfg in &target.resources {
             match self.psi_registry.register(
@@ -355,7 +362,7 @@ impl TriggerAgent {
         self.proc_walk_cancel = self.cancel.child_token();
         let handle = Self::spawn_proc_walk(
             &self.config,
-            Arc::clone(&self.cache),
+            &self.cgroup2_mount,
             self.event_tx.clone(),
             self.proc_walk_cancel.clone(),
         );
@@ -367,11 +374,12 @@ impl TriggerAgent {
     /// in `spawn_blocking` to protect the event loop.
     fn spawn_proc_walk(
         config: &Arc<TriggerConfig>,
-        cache: SharedCgroupCache,
+        cgroup2_mount: &Path,
         tx: mpsc::Sender<ProcessMatchEvent>,
         cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let config = Arc::clone(config);
+        let mount = cgroup2_mount.to_path_buf();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PROC_WALK_INTERVAL);
             // First tick fires immediately; subsequent ticks maintain cadence
@@ -386,11 +394,11 @@ impl TriggerAgent {
                     break;
                 }
                 let cfg = Arc::clone(&config);
-                let c = cache.clone();
+                let m = mount.clone();
                 let t = tx.clone();
                 let ct = cancel.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let walker = ProcWalker::new(&cfg, c);
+                    let walker = ProcWalker::new(&cfg, &m);
                     walker.walk(&t, &ct);
                 })
                 .await;
