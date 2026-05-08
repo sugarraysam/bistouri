@@ -7,6 +7,7 @@ use tokio_util::time::DelayQueue;
 use tracing::{debug, info, warn};
 
 use super::error::Result;
+use super::pid_filter::BpfPidFilter;
 use super::session::{CaptureRequest, CaptureSession, CompletedSession, SessionId};
 use super::trace::StackSample;
 use crate::trigger::config::PsiResource;
@@ -285,6 +286,77 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         if self.session_tx.send(completed).await.is_err() {
             warn!("downstream receiver dropped, completed session lost");
             metrics::counter!(METRIC_SINK_FAILURES).increment(1);
+        }
+    }
+}
+
+/// Channel buffer for PSI → CaptureOrchestrator capture requests.
+/// PSI fires are rare; 128 absorbs any burst.
+const CAPTURE_REQUEST_CHANNEL_SIZE: usize = 128;
+
+/// Channel buffer for BPF ring buffer → CaptureOrchestrator stack samples.
+/// At 19Hz × N monitored PIDs, 4096 provides ~20s of buffering for 10 PIDs.
+/// `pub(crate)` because the stack sample channel is created externally (see
+/// `main.rs`) due to a circular dependency: the BPF ringbuffer callback needs
+/// the `Sender` at agent build time, before the orchestrator exists.
+pub(crate) const STACK_SAMPLE_CHANNEL_SIZE: usize = 4096;
+
+/// Channel buffer for CaptureOrchestrator → downstream completed sessions.
+/// Sessions complete every ~3s per PID; 64 is generous.
+const COMPLETED_SESSION_CHANNEL_SIZE: usize = 64;
+
+/// Returned by `CaptureOrchestrator::start()`. Provides channel endpoints
+/// for wiring to PSI watchers and the downstream consumer (symbolizer).
+pub(crate) struct CaptureOrchestratorHandle {
+    task_handle: tokio::task::JoinHandle<()>,
+    /// Send `CaptureRequest`s here (from PSI watchers).
+    pub capture_tx: mpsc::Sender<CaptureRequest>,
+    /// Receive `CompletedSession`s here (downstream symbolizer).
+    pub completed_rx: mpsc::Receiver<CompletedSession>,
+}
+
+impl CaptureOrchestratorHandle {
+    pub(crate) fn shutdown(self) {
+        self.task_handle.abort();
+    }
+}
+
+impl CaptureOrchestrator<BpfPidFilter> {
+    /// Production entry point: creates channels, spawns the event loop.
+    ///
+    /// Accepts raw BPF handle and duration seconds — hides `BpfPidFilter`
+    /// and `Duration` construction from the caller.
+    ///
+    /// `stack_rx` is provided externally because the BPF ringbuffer callback
+    /// needs the corresponding `Sender` at agent build time — before the
+    /// orchestrator exists. The remaining channels (capture requests, completed
+    /// sessions) are created internally since they have no such dependency.
+    ///
+    /// Tests use `new()` + `run()` directly with `MockPidFilter`.
+    pub(crate) fn start(
+        pid_filter_handle: libbpf_rs::MapHandle,
+        capture_duration_secs: u64,
+        stack_rx: mpsc::Receiver<StackSample>,
+    ) -> CaptureOrchestratorHandle {
+        let pid_filter = BpfPidFilter::new(pid_filter_handle);
+        let capture_duration = Duration::from_secs(capture_duration_secs);
+
+        let (capture_tx, request_rx) = mpsc::channel(CAPTURE_REQUEST_CHANNEL_SIZE);
+        let (session_tx, completed_rx) = mpsc::channel(COMPLETED_SESSION_CHANNEL_SIZE);
+
+        let mut orch = Self::new(
+            request_rx,
+            stack_rx,
+            session_tx,
+            pid_filter,
+            capture_duration,
+        );
+        let task_handle = tokio::spawn(async move { orch.run().await });
+
+        CaptureOrchestratorHandle {
+            task_handle,
+            capture_tx,
+            completed_rx,
         }
     }
 }

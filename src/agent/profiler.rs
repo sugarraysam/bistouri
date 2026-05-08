@@ -1,5 +1,6 @@
 use crate::agent::error::{AgentError, Result};
 use crate::agent::ringbuf::AsyncRingBuffer;
+use crate::capture::trace::StackSample;
 use crate::trigger::ProcessMatchEvent;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::MapCore;
@@ -7,7 +8,7 @@ use perf_event::{events::Software, Builder, Counter};
 use std::os::fd::AsRawFd;
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, error};
 
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/profiler.skel.rs"));
@@ -22,6 +23,7 @@ const METRIC_STACK_RINGBUF_FULL: &str = "bistouri_profiler_stack_ringbuf_full";
 const METRIC_STACK_FETCH_ERRORS: &str = "bistouri_profiler_stack_fetch_errors";
 const METRIC_TRIGGER_RINGBUF_FULL: &str = "bistouri_profiler_trigger_ringbuf_full";
 const METRIC_TRIGGER_CHANNEL_FULL: &str = "bistouri_profiler_trigger_channel_full";
+const METRIC_STACK_CHANNEL_FULL: &str = "bistouri_profiler_stack_channel_full";
 pub(super) const METRIC_RINGBUF_POLL_ERRORS: &str = "bistouri_profiler_ringbuf_poll_errors";
 
 #[repr(C)]
@@ -210,16 +212,22 @@ pub(crate) struct ProfilerAgent {
     freq: u64,
     ncpus: usize,
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
+    stack_tx: Sender<StackSample>,
 }
 
 impl ProfilerAgent {
-    fn try_new(freq: u64, trigger_tx: Option<Sender<ProcessMatchEvent>>) -> Result<Self> {
+    fn try_new(
+        freq: u64,
+        trigger_tx: Option<Sender<ProcessMatchEvent>>,
+        stack_tx: Sender<StackSample>,
+    ) -> Result<Self> {
         let ncpus = libbpf_rs::num_possible_cpus()
             .map_err(|e| AgentError::Bpf("failed to get possible CPUs".into(), e))?;
         Ok(Self {
             freq,
             ncpus,
             trigger_tx,
+            stack_tx,
         })
     }
 
@@ -256,7 +264,7 @@ impl ProfilerAgent {
             })?;
         loaded.links.push(link);
 
-        loaded.setup_ringbuffers(self.trigger_tx)?;
+        loaded.setup_ringbuffers(self.trigger_tx, self.stack_tx)?;
         loaded.attach_perf_events(self.ncpus, self.freq)?;
 
         Ok(loaded)
@@ -278,14 +286,24 @@ impl LoadedProfilerAgent {
     /// async event loop. Keep them to O(1) operations (pointer casts, `try_send`).
     /// Heavy processing (symbolization, batching, network IO) belongs on a
     /// separate task fed via a channel.
-    fn setup_ringbuffers(&mut self, trigger_tx: Option<Sender<ProcessMatchEvent>>) -> Result<()> {
+    fn setup_ringbuffers(
+        &mut self,
+        trigger_tx: Option<Sender<ProcessMatchEvent>>,
+        stack_tx: Sender<StackSample>,
+    ) -> Result<()> {
         let mut builder = libbpf_rs::RingBufferBuilder::new();
 
         builder
-            .add(&self.skel.maps.stack_events, |data| {
+            .add(&self.skel.maps.stack_events, move |data| {
                 if let Some(event) = StackTraceEvent::from_bytes(data) {
-                    // TODO: process stacktrace
-                    let _ = event;
+                    let sample = StackSample::from_event(event);
+                    if let Err(mpsc::error::TrySendError::Full(_)) = stack_tx.try_send(sample) {
+                        error!(
+                            "stack sample channel full, samples being dropped — \
+                             consider doubling STACK_SAMPLE_CHANNEL_SIZE",
+                        );
+                        metrics::counter!(METRIC_STACK_CHANNEL_FULL).increment(1);
+                    }
                 }
                 0
             })
@@ -382,6 +400,10 @@ impl LoadedProfilerAgent {
             "Trigger events dropped due to full channel (proc_walk provides completeness)"
         );
         metrics::describe_counter!(
+            METRIC_STACK_CHANNEL_FULL,
+            "Stack samples dropped due to full channel (statistical loss at 19Hz)"
+        );
+        metrics::describe_counter!(
             METRIC_RINGBUF_POLL_ERRORS,
             "Epoll errors on ring buffer fd (unrecoverable, polling stops)"
         );
@@ -417,6 +439,13 @@ impl LoadedProfilerAgent {
             .map_err(|e| AgentError::Bpf("failed to create comm_lpm_trie MapHandle".into(), e))
     }
 
+    /// Returns a standalone handle to the BPF `pid_filter_map`.
+    /// Used by `BpfPidFilter` to add/remove monitored PIDs.
+    pub(crate) fn pid_filter_handle(&self) -> Result<libbpf_rs::MapHandle> {
+        libbpf_rs::MapHandle::try_from(&self.skel.maps.pid_filter_map)
+            .map_err(|e| AgentError::Bpf("failed to create pid_filter MapHandle".into(), e))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn monitor_pid(&self, pid: u32) -> Result<()> {
         let active: u8 = 1;
@@ -446,6 +475,7 @@ impl LoadedProfilerAgent {
 pub(crate) struct ProfilerAgentBuilder {
     freq: u64,
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
+    stack_tx: Option<Sender<StackSample>>,
 }
 
 impl Default for ProfilerAgentBuilder {
@@ -453,6 +483,7 @@ impl Default for ProfilerAgentBuilder {
         Self {
             freq: DEFAULT_SAMPLING_FREQ_HZ,
             trigger_tx: None,
+            stack_tx: None,
         }
     }
 }
@@ -473,7 +504,15 @@ impl ProfilerAgentBuilder {
         self
     }
 
+    pub(crate) fn with_stack_tx(mut self, tx: Sender<StackSample>) -> Self {
+        self.stack_tx = Some(tx);
+        self
+    }
+
     pub(crate) fn try_build(self) -> Result<ProfilerAgent> {
-        ProfilerAgent::try_new(self.freq, self.trigger_tx)
+        let stack_tx = self
+            .stack_tx
+            .ok_or_else(|| AgentError::InvalidState("stack_tx is required".into()))?;
+        ProfilerAgent::try_new(self.freq, self.trigger_tx, stack_tx)
     }
 }

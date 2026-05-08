@@ -1,10 +1,14 @@
+use crate::capture::session::CaptureRequest;
 use crate::trigger::config::PsiResource;
 use crate::trigger::error::{Result, TriggerError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{unix::AsyncFd, Interest};
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+
+const METRIC_CAPTURE_CHANNEL_FULL: &str = "bistouri_psi_capture_channel_full";
 
 /// Fixed PSI time window: all thresholds are expressed as a percentage of this.
 const TIME_WINDOW_MS: f64 = 1_000.0;
@@ -24,24 +28,30 @@ pub(crate) enum PsiRegisterResult {
 /// registry tracking, and shutdown.
 pub(crate) struct PsiRegistry {
     watchers: HashMap<(u64, PsiResource), tokio::task::JoinHandle<()>>,
+    capture_tx: mpsc::Sender<CaptureRequest>,
 }
 
 impl PsiRegistry {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(capture_tx: mpsc::Sender<CaptureRequest>) -> Self {
         Self {
             watchers: HashMap::new(),
+            capture_tx,
         }
     }
 
     /// Attempts to register a PSI watcher for the given (cgroup, resource) pair.
     /// Returns the outcome so the caller can update counters accordingly.
+    ///
+    /// When the PSI threshold is exceeded, the watcher sends a `CaptureRequest`
+    /// for the given `pid` and `comm` to the `CaptureOrchestrator`.
     pub(crate) fn register(
         &mut self,
         cgroup_id: u64,
         cgroup_path: &Path,
         resource: PsiResource,
         threshold: f64,
-        rule_id: u32,
+        pid: u32,
+        comm: String,
     ) -> PsiRegisterResult {
         let registry_key = (cgroup_id, resource);
 
@@ -57,7 +67,14 @@ impl PsiRegistry {
             Err(_) => return PsiRegisterResult::BuildFailed,
         };
 
-        let watcher = Self::spawn_watcher(async_fd, rule_id, cgroup_path.to_path_buf());
+        let watcher = Self::spawn_watcher(
+            async_fd,
+            pid,
+            comm,
+            resource,
+            cgroup_path.to_path_buf(),
+            self.capture_tx.clone(),
+        );
         self.watchers.insert(registry_key, watcher);
 
         PsiRegisterResult::Registered
@@ -99,19 +116,36 @@ impl PsiRegistry {
 
     fn spawn_watcher(
         async_fd: AsyncFd<presutaoru::PsiFd>,
-        rule_id: u32,
+        pid: u32,
+        comm: String,
+        resource: PsiResource,
         cgroup_path: PathBuf,
+        capture_tx: mpsc::Sender<CaptureRequest>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Ok(mut guard) = async_fd.readable().await {
                 guard.clear_ready();
                 info!(
-                    rule_id = rule_id,
+                    pid = pid,
+                    comm = %comm,
+                    resource = ?resource,
                     cgroup = %cgroup_path.display(),
-                    "PSI threshold exceeded",
+                    "PSI threshold exceeded, requesting capture",
                 );
-                // TODO: forward trigger event to the profiler sampling
-                // module (not yet implemented).
+                let req = CaptureRequest {
+                    pid,
+                    comm: comm.clone(),
+                    resource,
+                };
+                // Best-effort: if the capture channel is full, the orchestrator's
+                // dedup guard will reject a repeat when the next PSI fires.
+                if capture_tx.try_send(req).is_err() {
+                    error!(
+                        "capture request channel full, PSI event dropped — \
+                         consider doubling CAPTURE_REQUEST_CHANNEL_SIZE",
+                    );
+                    metrics::counter!(METRIC_CAPTURE_CHANNEL_FULL).increment(1);
+                }
             }
         })
     }

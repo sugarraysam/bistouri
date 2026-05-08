@@ -6,6 +6,8 @@ mod psi;
 mod trie;
 pub(crate) mod watcher;
 
+use crate::capture::session::CaptureRequest;
+
 use crate::sys::cgroup::SharedCgroupCache;
 use config::TriggerConfig;
 use error::Result;
@@ -140,10 +142,11 @@ impl PreparedTriggerAgent {
         self.event_tx.clone()
     }
 
-    /// Phase 2: Consume self, inject BPF handle, start the event loop.
+    /// Phase 2: Consume self, inject BPF handle and capture channel, start the event loop.
     pub(crate) async fn start(
         mut self,
         comm_lpm_trie_handle: libbpf_rs::MapHandle,
+        capture_tx: mpsc::Sender<CaptureRequest>,
     ) -> Result<TriggerAgentHandle> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (control_tx, control_rx) = mpsc::channel::<TriggerControl>(8);
@@ -175,7 +178,7 @@ impl PreparedTriggerAgent {
             matcher,
             bpf_trie,
             cache: self.cache,
-            psi_registry: PsiRegistry::new(),
+            psi_registry: PsiRegistry::new(capture_tx),
             proc_handle: Some(proc_handle),
             watcher_handle: Some(watcher_handle),
             cancel_token,
@@ -280,7 +283,8 @@ impl TriggerAgent {
             &cgroup_path,
             target.resource,
             target.threshold,
-            event.rule_id,
+            event.pid,
+            event.comm.clone(),
         ) {
             PsiRegisterResult::Registered => {
                 info!(
