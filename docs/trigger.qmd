@@ -75,7 +75,7 @@ We handle this by assigning a unique, monotonically increasing `rule_id` to ever
 
 The following diagram illustrates how a process discovery event flows from the kernel up to the point where a PSI watcher is registered.
 
-```mermaid
+```{mermaid}
 graph TD
     subgraph "Kernel Space"
         K_EXEC[Process Exec/Fork] -->|Tracepoint| BPF_PROG[BPF Probe]
@@ -86,16 +86,16 @@ graph TD
     subgraph "Userspace (Bistouri Trigger Agent)"
         RING_BUF -->|Event| EV_LOOP[Event Loop]
         PROC_SCAN[Periodic /proc Walk] -->|Match| EV_LOOP
-        
+
         INOTIFY[inotify Watcher] -->|Reload Config| EV_LOOP
-        
+
         EV_LOOP -->|Validate Rule ID| MATCHER{Comm Matcher}
         MATCHER -->|Valid| PSI_REG[PSI Registry]
-        
+
         PSI_REG -->|New Cgroup/Resource| SPAWN[Spawn Watcher Task]
         SPAWN -->|poll POLLPRI| PSI_FILE[/proc/pressure/...]
     end
-    
+
     PSI_FILE -->|Threshold Crossed| SPAWN
     SPAWN -->|Trigger| PROFILER[Profiler Agent]
 ```

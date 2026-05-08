@@ -36,7 +36,7 @@ The eBPF verifier is our most demanding "code reviewer." To satisfy it, we adopt
 
 ## Build Pipeline (libbpf-cargo)
 
-Bistouri uses `libbpf-cargo` to bridge the C and Rust worlds. The build process is orchestrated by `build.rs`, which invokes the `SkeletonBuilder`. 
+Bistouri uses `libbpf-cargo` to bridge the C and Rust worlds. The build process is orchestrated by `build.rs`, which invokes the `SkeletonBuilder`.
 
 This generates a "skeleton"—a Rust module that embeds the compiled BPF bytecode and provides a type-safe interface for loading and attaching the programs. A key component here is `vmlinux.h`, generated via CO-RE (Compile Once – Run Everywhere). Instead of relying on local kernel headers, we use a generated header that describes the kernel's internal structures. This allows a single Bistouri binary to run on different kernel versions, even if internal struct offsets have shifted.
 
@@ -50,25 +50,25 @@ We use explicit width types (`__u32`, `__u64`) to ensure consistency across the 
 
 The following diagram illustrates how an event flows from a kernel trigger through our eBPF logic and into the ring buffers for userspace consumption.
 
-```mermaid
+```{mermaid}
 graph TD
     subgraph "Kernel Space"
         P[Perf Event / Timer] -->|Trigger| H[handle_perf]
         E[execve] -->|Trigger| M[match_comm_on_exec]
-        
+
         H --> L1{PID in filter?}
         L1 -- No --> Exit
         L1 -- Yes --> R1[Reserve Ringbuf Space]
-        
+
         R1 -- Success --> S[Capture Kernel & User Stacks]
         S --> Sub[Submit Event]
         R1 -- Failure --> Err[Log to Error Map]
-        
+
         M --> L2{Comm in Trie?}
         L2 -- Yes --> R2[Reserve Trigger Space]
         R2 -- Success --> Sub2[Submit Match Event]
     end
-    
+
     subgraph "Maps & Buffers"
         Sub --> RB1[(perf_events Ringbuf)]
         Sub2 --> RB2[(trigger_events Ringbuf)]
@@ -76,7 +76,7 @@ graph TD
         T[comm_lpm_trie] -.-> L2
         F[pid_filter_map] -.-> L1
     end
-    
+
     subgraph "User Space (Rust)"
         RB1 --> Reader1[Profile Collector]
         RB2 --> Reader2[Trigger Handler]

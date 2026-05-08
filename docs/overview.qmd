@@ -28,7 +28,7 @@ This separation ensures that we don't load heavy BPF objects until we are sure t
 
 The following diagram illustrates how pressure events flow from the kernel, through our reactive logic, and back into the kernel to trigger stack captures.
 
-```mermaid
+```{mermaid}
 graph TD
     subgraph "Kernel Space"
         PSI[PSI Events /proc/pressure] -->|Poll/Select| UA

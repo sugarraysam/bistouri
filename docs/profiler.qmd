@@ -16,7 +16,7 @@ This design ensures that the cost of profiling is proportional to the number of 
 
 Managing BPF maps requires a careful dance between the lifetime of the BPF object and the Rust handles that manipulate them. In Bistouri, we use `libbpf-rs` to manage the skeleton, but we've made a specific design choice regarding map access: we use `MapHandle`.
 
-A `MapHandle` duplicates the underlying file descriptor of a BPF map. This is critical for our architecture because it allows the `TriggerAgent` (which determines which processes to profile) to update the `comm_lpm_trie` independently of the `ProfilerAgent`'s main loop. By duplicating the FD, we avoid complex borrow-checking issues where multiple components would otherwise need to hold a reference to the entire BPF skeleton. 
+A `MapHandle` duplicates the underlying file descriptor of a BPF map. This is critical for our architecture because it allows the `TriggerAgent` (which determines which processes to profile) to update the `comm_lpm_trie` independently of the `ProfilerAgent`'s main loop. By duplicating the FD, we avoid complex borrow-checking issues where multiple components would otherwise need to hold a reference to the entire BPF skeleton.
 
 The maps themselves are treated as the "source of truth" and the primary communication bus. The `pid_filter_map` is a persistent control plane, while the ring buffers are the data plane.
 
@@ -36,7 +36,7 @@ The LPM trie is the standard tool for this in the kernel. It allows us to store 
 
 ## Batch Updates & Performance
 
-To keep the probe overhead low, we avoid performing complex logic inside the BPF program attached to the perf event. The `handle_perf` program is the most frequently executed code path in our system. 
+To keep the probe overhead low, we avoid performing complex logic inside the BPF program attached to the perf event. The `handle_perf` program is the most frequently executed code path in our system.
 
 We've optimized this by moving the filtering logic to the `pid_filter_map`. When the userspace agent decides to "monitor" a PID, it performs a single map update. The BPF side then performs a single map lookup. We've considered batching these updates for high-churn environments, but given our "trigger-based" philosophy, the rate of change in the filter map is typically low enough that individual updates are sufficient and provide lower latency between a trigger event and the start of profiling.
 
@@ -54,7 +54,7 @@ In userspace, these are caught, decoded, and logged. This allows us to distingui
 
 The lifecycle of the agent is managed through a strict sequence of loading, attaching, and polling. We use Rust's ownership model to ensure that BPF links (which keep the programs attached) are not dropped prematurely.
 
-```mermaid
+```{mermaid}
 state_machine
     [*] --> Unloaded: ProfilerAgentBuilder::build()
     Unloaded --> Loaded: load()
