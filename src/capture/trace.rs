@@ -59,6 +59,7 @@ impl StackSample {
 mod tests {
     use super::*;
     use crate::agent::profiler::{MAX_STACK_DEPTH, TASK_COMM_LEN};
+    use rstest::rstest;
 
     fn make_event(kernel_depth: usize, user_depth: usize) -> StackTraceEvent {
         let mut event = StackTraceEvent {
@@ -82,35 +83,59 @@ mod tests {
         event
     }
 
-    #[test]
-    fn from_event_trims_to_actual_depth() {
-        let event = make_event(3, 5);
-        let trace = StackTrace::from_event(&event);
+    // -----------------------------------------------------------------------
+    // Frame trimming — rstest table
+    // -----------------------------------------------------------------------
 
-        assert_eq!(trace.kernel_frames.len(), 3);
-        assert_eq!(trace.user_frames.len(), 5);
+    #[rstest]
+    #[case::both_populated(3, 5, 3, 5)]
+    #[case::kernel_only(4, 0, 4, 0)]
+    #[case::user_only(0, 7, 0, 7)]
+    #[case::both_empty(0, 0, 0, 0)]
+    #[case::single_frame_each(1, 1, 1, 1)]
+    #[case::max_depth(127, 127, 127, 127)]
+    fn from_event_trims_to_actual_depth(
+        #[case] kernel_depth: usize,
+        #[case] user_depth: usize,
+        #[case] expected_kernel: usize,
+        #[case] expected_user: usize,
+    ) {
+        let event = make_event(kernel_depth, user_depth);
+        let trace = StackTrace::from_event(&event);
+        assert_eq!(trace.kernel_frames.len(), expected_kernel);
+        assert_eq!(trace.user_frames.len(), expected_user);
+    }
+
+    #[test]
+    fn from_event_preserves_frame_addresses() {
+        let event = make_event(3, 2);
+        let trace = StackTrace::from_event(&event);
         assert_eq!(trace.kernel_frames[0], 0xdead_0000);
-        assert_eq!(trace.user_frames[4], 0xbeef_0004);
+        assert_eq!(trace.kernel_frames[2], 0xdead_0002);
+        assert_eq!(trace.user_frames[1], 0xbeef_0001);
     }
 
-    #[test]
-    fn negative_stack_sz_yields_empty_frames() {
+    // -----------------------------------------------------------------------
+    // Negative stack_sz (BPF fetch failure) — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::both_negative(-14, -14)]
+    #[case::kernel_negative_only(-2, 0)]
+    #[case::user_negative_only(0, -2)]
+    fn negative_stack_sz_yields_empty_frames(#[case] kernel_sz: i32, #[case] user_sz: i32) {
         let mut event = make_event(0, 0);
-        event.kernel_stack_sz = -14; // bpf_get_stack failure code
-        event.user_stack_sz = -14;
+        event.kernel_stack_sz = kernel_sz;
+        event.user_stack_sz = user_sz;
 
         let trace = StackTrace::from_event(&event);
         assert!(trace.kernel_frames.is_empty());
         assert!(trace.user_frames.is_empty());
     }
 
-    #[test]
-    fn zero_stack_sz_yields_empty_frames() {
-        let event = make_event(0, 0);
-        let trace = StackTrace::from_event(&event);
-        assert!(trace.kernel_frames.is_empty());
-        assert!(trace.user_frames.is_empty());
-    }
+    // -----------------------------------------------------------------------
+    // Hash/Eq contract
+    // -----------------------------------------------------------------------
 
     #[test]
     fn identical_traces_have_equal_hash() {
@@ -137,6 +162,10 @@ mod tests {
         let b = StackTrace::from_event(&make_event(4, 2));
         assert_ne!(a, b);
     }
+
+    // -----------------------------------------------------------------------
+    // StackSample
+    // -----------------------------------------------------------------------
 
     #[test]
     fn stack_sample_extracts_pid() {

@@ -17,7 +17,8 @@ use psi::{PsiRegisterResult, PsiRegistry};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use trie::BpfTrie;
@@ -49,20 +50,6 @@ pub(super) enum TriggerControl {
     /// Hot-reload with a new configuration. Nukes PSI watchers, rebuilds matcher
     /// and proc_walk from scratch.
     Reload(Arc<TriggerConfig>),
-}
-
-/// Returned by `TriggerAgent::start` to give the caller handles for lifecycle management.
-pub(crate) struct TriggerAgentHandle {
-    pub(crate) task_handle: tokio::task::JoinHandle<()>,
-    shutdown_tx: oneshot::Sender<()>,
-}
-
-impl TriggerAgentHandle {
-    /// Signals the event loop to stop and returns the task handle for the caller to await.
-    pub(crate) fn shutdown(self) -> tokio::task::JoinHandle<()> {
-        let _ = self.shutdown_tx.send(());
-        self.task_handle
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,31 +129,37 @@ impl PreparedTriggerAgent {
         self.event_tx.clone()
     }
 
-    /// Phase 2: Consume self, inject BPF handle and capture channel, start the event loop.
+    /// Phase 2: Consume self, inject BPF handle, capture channel, and
+    /// cancellation token, then start the event loop.
     pub(crate) async fn start(
         mut self,
         comm_lpm_trie_handle: libbpf_rs::MapHandle,
         capture_tx: mpsc::Sender<CaptureRequest>,
-    ) -> Result<TriggerAgentHandle> {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        cancel: CancellationToken,
+    ) -> Result<JoinHandle<()>> {
         let (control_tx, control_rx) = mpsc::channel::<TriggerControl>(8);
 
         let matcher = CommMatcher::new(&self.config);
         let mut bpf_trie = BpfTrie::new(comm_lpm_trie_handle);
         bpf_trie.repopulate(&self.config)?;
-        let cancel_token = CancellationToken::new();
+
+        // proc_walk uses a child token: the parent (daemon) cancel reaches it,
+        // but config reload can also cancel just the walk independently.
+        let proc_walk_cancel = cancel.child_token();
 
         let proc_handle = TriggerAgent::spawn_proc_walk(
             &self.config,
             Arc::clone(&self.cache),
             self.event_tx.clone(),
-            cancel_token.clone(),
+            proc_walk_cancel.clone(),
         );
 
-        // Spawn config file watcher — sends Reload messages on config changes.
-        // Watcher setup failures are fatal: hot-reload is an inherent part of the system.
-        let watcher_handle =
-            TriggerAgent::spawn_config_watcher(self.config_path.clone(), control_tx);
+        // Spawn config file watcher with the daemon's cancel token.
+        let watcher_handle = TriggerAgent::spawn_config_watcher(
+            self.config_path.clone(),
+            control_tx,
+            cancel.clone(),
+        );
 
         let event_rx = self
             .event_rx
@@ -181,21 +174,18 @@ impl PreparedTriggerAgent {
             psi_registry: PsiRegistry::new(capture_tx),
             proc_handle: Some(proc_handle),
             watcher_handle: Some(watcher_handle),
-            cancel_token,
+            cancel,
+            proc_walk_cancel,
             event_tx: self.event_tx,
             event_rx,
             control_rx,
-            shutdown_rx,
         };
 
         let task_handle = tokio::spawn(async move {
             agent.run().await;
         });
 
-        Ok(TriggerAgentHandle {
-            task_handle,
-            shutdown_tx,
-        })
+        Ok(task_handle)
     }
 }
 
@@ -211,20 +201,22 @@ struct TriggerAgent {
     psi_registry: PsiRegistry,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
-    cancel_token: CancellationToken,
+    /// Daemon-level cancel token — triggers full shutdown.
+    cancel: CancellationToken,
+    /// Child token for proc_walk — cancelled on reload AND on daemon shutdown.
+    proc_walk_cancel: CancellationToken,
     event_tx: mpsc::Sender<ProcessMatchEvent>,
     event_rx: mpsc::Receiver<ProcessMatchEvent>,
     control_rx: mpsc::Receiver<TriggerControl>,
-    shutdown_rx: oneshot::Receiver<()>,
 }
 
 impl TriggerAgent {
-    /// Main event loop — processes events and control messages until shutdown.
+    /// Main event loop — processes events and control messages until cancelled.
     async fn run(&mut self) {
         loop {
             tokio::select! {
                 biased;
-                _ = &mut self.shutdown_rx => break,
+                _ = self.cancel.cancelled() => break,
                 ctrl = self.control_rx.recv() => match ctrl {
                     Some(TriggerControl::Reload(new_config)) => self.reload(new_config).await,
                     None => break,
@@ -235,7 +227,7 @@ impl TriggerAgent {
                 },
             }
         }
-        self.shutdown();
+        self.cleanup();
     }
 
     fn handle_process_event(&mut self, event: ProcessMatchEvent) {
@@ -278,41 +270,44 @@ impl TriggerAgent {
 
         let target = self.config.target_for_rule(event.rule_id);
 
-        match self.psi_registry.register(
-            cgroup_id,
-            &cgroup_path,
-            target.resource,
-            target.threshold,
-            event.pid,
-            event.comm.clone(),
-        ) {
-            PsiRegisterResult::Registered => {
-                info!(
-                    rule_id = event.rule_id,
-                    comm = %event.comm,
-                    resource = ?target.resource,
-                    threshold = target.threshold,
-                    cgroup = %cgroup_path.display(),
-                    "registered PSI trigger",
-                );
-            }
-            PsiRegisterResult::AlreadyExists => {
-                debug!(
-                    rule_id = event.rule_id,
-                    comm = %event.comm,
-                    cgroup_id = cgroup_id,
-                    resource = ?target.resource,
-                    "PSI watcher already registered for this cgroup+resource, skipping",
-                );
-                metrics::counter!(METRIC_DUPLICATE_PSI_SKIPS).increment(1);
-            }
-            PsiRegisterResult::BuildFailed => {
-                debug!(
-                    cgroup = %cgroup_path.display(),
-                    rule_id = event.rule_id,
-                    "failed to build PSI fd, skipping",
-                );
-                metrics::counter!(METRIC_PSI_FD_BUILD_FAILURES).increment(1);
+        for res_cfg in &target.resources {
+            match self.psi_registry.register(
+                cgroup_id,
+                &cgroup_path,
+                res_cfg.resource,
+                res_cfg.threshold,
+                event.pid,
+                event.comm.clone(),
+            ) {
+                PsiRegisterResult::Registered => {
+                    info!(
+                        rule_id = event.rule_id,
+                        comm = %event.comm,
+                        resource = ?res_cfg.resource,
+                        threshold = res_cfg.threshold,
+                        cgroup = %cgroup_path.display(),
+                        "registered PSI trigger",
+                    );
+                }
+                PsiRegisterResult::AlreadyExists => {
+                    debug!(
+                        rule_id = event.rule_id,
+                        comm = %event.comm,
+                        cgroup_id = cgroup_id,
+                        resource = ?res_cfg.resource,
+                        "PSI watcher already registered for this cgroup+resource, skipping",
+                    );
+                    metrics::counter!(METRIC_DUPLICATE_PSI_SKIPS).increment(1);
+                }
+                PsiRegisterResult::BuildFailed => {
+                    debug!(
+                        cgroup = %cgroup_path.display(),
+                        rule_id = event.rule_id,
+                        resource = ?res_cfg.resource,
+                        "failed to build PSI fd, skipping",
+                    );
+                    metrics::counter!(METRIC_PSI_FD_BUILD_FAILURES).increment(1);
+                }
             }
         }
     }
@@ -326,8 +321,8 @@ impl TriggerAgent {
     /// Moving this to a background task would require `Arc<Mutex<>>` on the PSI
     /// registry for no measurable benefit.
     async fn reload(&mut self, new_config: Arc<TriggerConfig>) {
-        // 1. Cancel running proc_walk
-        self.cancel_token.cancel();
+        // 1. Cancel running proc_walk via child token
+        self.proc_walk_cancel.cancel();
         if let Some(handle) = self.proc_handle.take() {
             let _ = handle.await;
         }
@@ -356,13 +351,13 @@ impl TriggerAgent {
             metrics::counter!(METRIC_CONFIG_RELOADS).increment(1);
         }
 
-        // 4. Spawn new proc_walk with whatever config we ended up with.
-        self.cancel_token = CancellationToken::new();
+        // 4. Spawn new proc_walk with a fresh child token.
+        self.proc_walk_cancel = self.cancel.child_token();
         let handle = Self::spawn_proc_walk(
             &self.config,
             Arc::clone(&self.cache),
             self.event_tx.clone(),
-            self.cancel_token.clone(),
+            self.proc_walk_cancel.clone(),
         );
         self.proc_handle = Some(handle);
     }
@@ -382,7 +377,11 @@ impl TriggerAgent {
             // First tick fires immediately; subsequent ticks maintain cadence
             // even if a walk overruns (Delay is the default, no ticks are skipped).
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {},
+                }
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -402,15 +401,23 @@ impl TriggerAgent {
     fn spawn_config_watcher(
         config_path: PathBuf,
         control_tx: mpsc::Sender<TriggerControl>,
+        cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(e) = watcher::config_watcher_task(config_path, control_tx).await {
-                error!(error = %e, "config watcher failed");
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {},
+                result = watcher::config_watcher_task(config_path, control_tx) => {
+                    if let Err(e) = result {
+                        error!(error = %e, "config watcher failed");
+                    }
+                },
             }
         })
     }
 
-    fn shutdown(&mut self) {
+    /// Cleanup on shutdown — abort PSI watchers and config watcher.
+    fn cleanup(&mut self) {
         self.psi_registry.shutdown();
         if let Some(handle) = self.watcher_handle.take() {
             handle.abort();

@@ -44,6 +44,11 @@ external symbolizer service for analysis.
 - Safety: Minimize the use of unsafe. When unsafe is strictly required
   (often the case when dealing with raw pointers from libbpf-rs or
   libc), strictly document the safety invariants being upheld.
+- Testing: Favor the `rstest` crate with the table-test pattern
+  (`#[rstest]` + `#[case]`) for parametrized tests. This makes it
+  trivial to add coverage for newly discovered edge cases — just add a
+  new `#[case]` line. Use standalone `#[test]` only for complex
+  lifecycle tests that don't fit a table structure.
 
 ### 2. eBPF Specific Guidelines
 

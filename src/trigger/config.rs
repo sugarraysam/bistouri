@@ -1,5 +1,6 @@
 use crate::trigger::error::{Result, TriggerError};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{error, warn};
@@ -11,6 +12,15 @@ pub(crate) enum MatchRule {
     Prefix { comm: String },
 }
 
+impl MatchRule {
+    pub(crate) fn comm(&self) -> &str {
+        match self {
+            MatchRule::Exact { comm } => comm,
+            MatchRule::Prefix { comm } => comm,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PsiResource {
@@ -19,13 +29,19 @@ pub(crate) enum PsiResource {
     Io,
 }
 
+/// Per-resource trigger configuration within a target rule.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct TargetConfig {
-    pub(crate) rule: MatchRule,
+pub(crate) struct ResourceConfig {
     pub(crate) resource: PsiResource,
     /// PSI stall threshold as a percentage of the 1 000 ms time window.
     /// Must be in the range (0.0, 100.0) exclusive.
     pub(crate) threshold: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TargetConfig {
+    pub(crate) rule: MatchRule,
+    pub(crate) resources: Vec<ResourceConfig>,
     /// Unique identifier assigned during construction.
     /// Not user-facing — derived from the target's position in the Vec.
     #[serde(skip)]
@@ -80,24 +96,22 @@ impl TriggerConfig {
     /// Minimal default config: watch the bistouri process itself for
     /// Memory and CPU pressure at 10% threshold.
     pub(crate) fn default_config() -> Self {
-        Self::try_new(vec![
-            TargetConfig {
-                rule: MatchRule::Exact {
-                    comm: "bistouri".to_string(),
-                },
-                resource: PsiResource::Memory,
-                threshold: 10.0,
-                rule_id: 0,
+        Self::try_new(vec![TargetConfig {
+            rule: MatchRule::Exact {
+                comm: "bistouri".to_string(),
             },
-            TargetConfig {
-                rule: MatchRule::Exact {
-                    comm: "bistouri".to_string(),
+            resources: vec![
+                ResourceConfig {
+                    resource: PsiResource::Memory,
+                    threshold: 10.0,
                 },
-                resource: PsiResource::Cpu,
-                threshold: 10.0,
-                rule_id: 0,
-            },
-        ])
+                ResourceConfig {
+                    resource: PsiResource::Cpu,
+                    threshold: 10.0,
+                },
+            ],
+            rule_id: 0,
+        }])
         // Safe: we control these inputs and they are known-valid.
         .expect("default config must be valid")
     }
@@ -113,19 +127,39 @@ impl TriggerConfig {
         if self.targets.is_empty() {
             return Err(TriggerError::EmptyTargets);
         }
+
+        // Global duplicate detection: (comm, resource) must be unique across
+        // all targets. Duplicate pairs would produce conflicting PSI watchers
+        // for the same cgroup — the second would be silently dropped.
+        let mut seen_pairs: HashSet<(&str, PsiResource)> = HashSet::new();
+
         for target in &self.targets {
-            let comm = match &target.rule {
-                MatchRule::Exact { comm } => comm,
-                MatchRule::Prefix { comm } => comm,
-            };
+            let comm = target.rule.comm();
+
             if comm.len() > 15 {
-                return Err(TriggerError::CommTooLong { comm: comm.clone() });
+                return Err(TriggerError::CommTooLong { comm: comm.into() });
             }
-            if target.threshold <= 0.0 || target.threshold >= 100.0 {
-                return Err(TriggerError::InvalidThreshold {
-                    threshold: target.threshold,
-                    comm: comm.clone(),
+
+            if target.resources.is_empty() {
+                return Err(TriggerError::EmptyResources {
+                    rule_id: target.rule_id,
                 });
+            }
+
+            for res_cfg in &target.resources {
+                if res_cfg.threshold <= 0.0 || res_cfg.threshold >= 100.0 {
+                    return Err(TriggerError::InvalidThreshold {
+                        threshold: res_cfg.threshold,
+                        comm: comm.into(),
+                    });
+                }
+
+                if !seen_pairs.insert((comm, res_cfg.resource)) {
+                    return Err(TriggerError::DuplicateCommResource {
+                        comm: comm.into(),
+                        resource: res_cfg.resource,
+                    });
+                }
             }
         }
         Ok(())
@@ -179,11 +213,43 @@ impl TriggerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn parse_yaml(yaml: &str) -> std::result::Result<TriggerConfig, TriggerError> {
         let raw: TriggerConfig = serde_yml::from_str(yaml).map_err(TriggerError::ConfigParse)?;
         TriggerConfig::try_new(raw.targets)
     }
+
+    fn exact_target(comm: &str, resources: Vec<ResourceConfig>) -> TargetConfig {
+        TargetConfig {
+            rule: MatchRule::Exact {
+                comm: comm.to_string(),
+            },
+            resources,
+            rule_id: 0,
+        }
+    }
+
+    fn prefix_target(comm: &str, resources: Vec<ResourceConfig>) -> TargetConfig {
+        TargetConfig {
+            rule: MatchRule::Prefix {
+                comm: comm.to_string(),
+            },
+            resources,
+            rule_id: 0,
+        }
+    }
+
+    fn res(resource: PsiResource, threshold: f64) -> ResourceConfig {
+        ResourceConfig {
+            resource,
+            threshold,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // YAML parsing
+    // -----------------------------------------------------------------------
 
     #[test]
     fn parse_valid_exact_and_prefix() {
@@ -192,21 +258,104 @@ targets:
   - rule:
       type: Exact
       comm: node
-    resource: memory
-    threshold: 10
+    resources:
+      - resource: memory
+        threshold: 10
   - rule:
       type: Prefix
       comm: "worker-"
-    resource: cpu
-    threshold: 50
+    resources:
+      - resource: cpu
+        threshold: 50
 "#;
         let config = parse_yaml(yaml).unwrap();
         assert_eq!(config.targets.len(), 2);
         assert!(matches!(&config.targets[0].rule, MatchRule::Exact { comm } if comm == "node"));
         assert!(matches!(&config.targets[1].rule, MatchRule::Prefix { comm } if comm == "worker-"));
-        assert_eq!(config.targets[0].resource, PsiResource::Memory);
-        assert_eq!(config.targets[1].resource, PsiResource::Cpu);
+        assert_eq!(config.targets[0].resources[0].resource, PsiResource::Memory);
+        assert_eq!(config.targets[1].resources[0].resource, PsiResource::Cpu);
     }
+
+    #[test]
+    fn parse_multi_resource_target() {
+        let yaml = r#"
+targets:
+  - rule:
+      type: Exact
+      comm: bistouri
+    resources:
+      - resource: memory
+        threshold: 10
+      - resource: cpu
+        threshold: 20
+"#;
+        let config = parse_yaml(yaml).unwrap();
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(config.targets[0].resources.len(), 2);
+        assert_eq!(config.targets[0].resources[0].resource, PsiResource::Memory);
+        assert_eq!(config.targets[0].resources[1].resource, PsiResource::Cpu);
+        assert_eq!(config.targets[0].resources[0].threshold, 10.0);
+        assert_eq!(config.targets[0].resources[1].threshold, 20.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Threshold validation — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::zero(0.0, true)]
+    #[case::negative(-5.0, true)]
+    #[case::just_above_zero(0.001, false)]
+    #[case::boundary_one(1.0, false)]
+    #[case::valid_fifty(50.0, false)]
+    #[case::boundary_99(99.0, false)]
+    #[case::hundred(100.0, true)]
+    #[case::over_hundred(150.0, true)]
+    fn threshold_validation(#[case] threshold: f64, #[case] should_fail: bool) {
+        let result = TriggerConfig::try_new(vec![exact_target(
+            "node",
+            vec![res(PsiResource::Memory, threshold)],
+        )]);
+        assert_eq!(
+            result.is_err(),
+            should_fail,
+            "threshold={threshold}, expected fail={should_fail}, got {:?}",
+            result,
+        );
+        if should_fail {
+            assert!(matches!(
+                result.unwrap_err(),
+                TriggerError::InvalidThreshold { .. }
+            ));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Comm length validation — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::at_limit("123456789012345", false)] // 15 chars — max allowed
+    #[case::over_limit("1234567890123456", true)] // 16 chars — exceeds kernel TASK_COMM_LEN - 1
+    #[case::short("node", false)]
+    #[case::empty("", false)] // empty comm is valid syntactically
+    fn comm_length_validation(#[case] comm: &str, #[case] should_fail: bool) {
+        let result = TriggerConfig::try_new(vec![exact_target(
+            comm,
+            vec![res(PsiResource::Memory, 10.0)],
+        )]);
+        assert_eq!(result.is_err(), should_fail);
+        if should_fail {
+            assert!(matches!(
+                result.unwrap_err(),
+                TriggerError::CommTooLong { .. }
+            ));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty targets / resources validation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn empty_targets_fails() {
@@ -216,160 +365,160 @@ targets:
     }
 
     #[test]
-    fn threshold_zero_fails() {
-        let yaml = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: node
-    resource: memory
-    threshold: 0
-"#;
-        let result = parse_yaml(yaml);
-        assert!(matches!(result, Err(TriggerError::InvalidThreshold { .. })));
+    fn empty_resources_fails() {
+        let result = TriggerConfig::try_new(vec![exact_target("node", vec![])]);
+        assert!(matches!(result, Err(TriggerError::EmptyResources { .. })));
     }
 
-    #[test]
-    fn threshold_hundred_fails() {
-        let yaml = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: node
-    resource: memory
-    threshold: 100
-"#;
-        let result = parse_yaml(yaml);
-        assert!(matches!(result, Err(TriggerError::InvalidThreshold { .. })));
+    // -----------------------------------------------------------------------
+    // Duplicate (comm, resource) validation — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::same_target_dup_resource(
+        vec![exact_target("node", vec![
+            res(PsiResource::Memory, 10.0),
+            res(PsiResource::Memory, 20.0),
+        ])],
+        true,
+        "same resource listed twice within one target"
+    )]
+    #[case::cross_target_dup_resource(
+        vec![
+            exact_target("node", vec![res(PsiResource::Cpu, 10.0)]),
+            exact_target("node", vec![res(PsiResource::Cpu, 20.0)]),
+        ],
+        true,
+        "same (comm, resource) across two separate targets"
+    )]
+    #[case::different_resources_ok(
+        vec![exact_target("node", vec![
+            res(PsiResource::Memory, 10.0),
+            res(PsiResource::Cpu, 20.0),
+        ])],
+        false,
+        "different resources for same comm is valid"
+    )]
+    #[case::different_comms_same_resource_ok(
+        vec![
+            exact_target("node", vec![res(PsiResource::Memory, 10.0)]),
+            exact_target("python", vec![res(PsiResource::Memory, 10.0)]),
+        ],
+        false,
+        "same resource for different comms is valid"
+    )]
+    #[case::all_three_resources_ok(
+        vec![exact_target("app", vec![
+            res(PsiResource::Memory, 10.0),
+            res(PsiResource::Cpu, 20.0),
+            res(PsiResource::Io, 30.0),
+        ])],
+        false,
+        "all three resources for one comm is valid"
+    )]
+    fn duplicate_comm_resource_validation(
+        #[case] targets: Vec<TargetConfig>,
+        #[case] should_fail: bool,
+        #[case] description: &str,
+    ) {
+        let result = TriggerConfig::try_new(targets);
+        assert_eq!(result.is_err(), should_fail, "case: {description}");
+        if should_fail {
+            assert!(matches!(
+                result.unwrap_err(),
+                TriggerError::DuplicateCommResource { .. }
+            ));
+        }
     }
 
-    #[test]
-    fn threshold_boundary_valid() {
-        let yaml_1 = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: node
-    resource: memory
-    threshold: 1
-"#;
-        let yaml_99 = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: node
-    resource: memory
-    threshold: 99
-"#;
-        assert!(parse_yaml(yaml_1).is_ok());
-        assert!(parse_yaml(yaml_99).is_ok());
-    }
-
-    #[test]
-    fn comm_exceeds_kernel_limit() {
-        let yaml = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: "1234567890123456"
-    resource: memory
-    threshold: 10
-"#;
-        let result = parse_yaml(yaml);
-        assert!(matches!(result, Err(TriggerError::CommTooLong { .. })));
-    }
-
-    #[test]
-    fn comm_at_kernel_limit() {
-        let yaml = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: "123456789012345"
-    resource: memory
-    threshold: 10
-"#;
-        assert!(parse_yaml(yaml).is_ok());
-    }
+    // -----------------------------------------------------------------------
+    // Rule ID assignment
+    // -----------------------------------------------------------------------
 
     #[test]
     fn rule_ids_assigned_sequentially() {
-        let yaml = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: node
-    resource: memory
-    threshold: 10
-  - rule:
-      type: Exact
-      comm: python
-    resource: cpu
-    threshold: 20
-  - rule:
-      type: Prefix
-      comm: "go-"
-    resource: io
-    threshold: 30
-"#;
-        let config = parse_yaml(yaml).unwrap();
+        let config = TriggerConfig::try_new(vec![
+            exact_target("node", vec![res(PsiResource::Memory, 10.0)]),
+            exact_target("python", vec![res(PsiResource::Cpu, 20.0)]),
+            prefix_target("go-", vec![res(PsiResource::Io, 30.0)]),
+        ])
+        .unwrap();
         assert_eq!(config.targets[0].rule_id, 1);
         assert_eq!(config.targets[1].rule_id, 2);
         assert_eq!(config.targets[2].rule_id, 3);
     }
 
-    #[test]
-    fn unknown_resource_fails() {
-        let yaml = r#"
+    // -----------------------------------------------------------------------
+    // Serde error cases — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::unknown_resource(
+        r#"
 targets:
   - rule:
       type: Exact
       comm: node
-    resource: disk
-    threshold: 10
-"#;
+    resources:
+      - resource: disk
+        threshold: 10
+"#,
+        "unknown resource"
+    )]
+    #[case::missing_threshold(
+        r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+    resources:
+      - resource: memory
+"#,
+        "missing threshold"
+    )]
+    #[case::missing_resources_field(
+        r#"
+targets:
+  - rule:
+      type: Exact
+      comm: node
+"#,
+        "missing resources field"
+    )]
+    fn serde_parse_failures(#[case] yaml: &str, #[case] description: &str) {
         let result = parse_yaml(yaml);
-        assert!(matches!(result, Err(TriggerError::ConfigParse(_))));
+        assert!(
+            matches!(result, Err(TriggerError::ConfigParse(_))),
+            "case '{description}' should fail with ConfigParse, got: {:?}",
+            result,
+        );
     }
 
-    #[test]
-    fn missing_threshold_fails() {
-        let yaml = r#"
-targets:
-  - rule:
-      type: Exact
-      comm: node
-    resource: memory
-"#;
-        let result = parse_yaml(yaml);
-        assert!(matches!(result, Err(TriggerError::ConfigParse(_))));
-    }
+    // -----------------------------------------------------------------------
+    // Default config
+    // -----------------------------------------------------------------------
 
     #[test]
     fn default_config_is_valid() {
         let config = TriggerConfig::default_config();
-        assert_eq!(config.targets.len(), 2);
+        assert_eq!(config.targets.len(), 1);
+        assert_eq!(config.targets[0].resources.len(), 2);
         assert_eq!(config.targets[0].rule_id, 1);
-        assert_eq!(config.targets[1].rule_id, 2);
-        assert!(config.validate().is_ok());
+        assert_eq!(config.targets[0].resources[0].resource, PsiResource::Memory);
+        assert_eq!(config.targets[0].resources[1].resource, PsiResource::Cpu);
     }
+
+    // -----------------------------------------------------------------------
+    // Overlapping prefix warning (not an error)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn overlapping_prefixes_does_not_error() {
-        let config =
-            TriggerConfig::try_new(vec![prefix_target("work", 0), prefix_target("worker-", 0)]);
+        let config = TriggerConfig::try_new(vec![
+            prefix_target("work", vec![res(PsiResource::Cpu, 10.0)]),
+            prefix_target("worker-", vec![res(PsiResource::Memory, 10.0)]),
+        ]);
         // Overlapping prefixes are valid — just a warning, not an error.
         assert!(config.is_ok());
-    }
-
-    fn prefix_target(comm: &str, _unused: u32) -> TargetConfig {
-        TargetConfig {
-            rule: MatchRule::Prefix {
-                comm: comm.to_string(),
-            },
-            resource: PsiResource::Cpu,
-            threshold: 10.0,
-            rule_id: 0,
-        }
     }
 }

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tokio_util::time::DelayQueue;
 use tracing::{debug, info, warn};
 
@@ -82,6 +83,7 @@ pub(crate) struct CaptureOrchestrator<F: PidFilter> {
 
     pid_filter: F,
     capture_duration: Duration,
+    cancel: CancellationToken,
 
     sessions: HashMap<SessionId, CaptureSession>,
     /// Reverse index: pid → active session IDs monitoring that pid.
@@ -104,6 +106,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         session_tx: mpsc::Sender<CompletedSession>,
         pid_filter: F,
         capture_duration: Duration,
+        cancel: CancellationToken,
     ) -> Self {
         describe_metrics();
         Self {
@@ -112,6 +115,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             session_tx,
             pid_filter,
             capture_duration,
+            cancel,
             sessions: HashMap::new(),
             pid_sessions: HashMap::new(),
             inflight_guard: HashSet::new(),
@@ -126,6 +130,8 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         loop {
             tokio::select! {
                 biased;
+                // 0. Shutdown — cancellation token from daemon.
+                _ = self.cancel.cancelled() => break,
                 // 1. Finalize expired sessions — frees resources before accumulating more.
                 Some(expired) = self.timers.next() => {
                     let session_id = expired.into_inner();
@@ -308,11 +314,11 @@ const COMPLETED_SESSION_CHANNEL_SIZE: usize = 64;
 /// Returned by `CaptureOrchestrator::start()`. Provides channel endpoints
 /// for wiring to PSI watchers and the downstream consumer (symbolizer).
 pub(crate) struct CaptureOrchestratorHandle {
-    task_handle: tokio::task::JoinHandle<()>,
+    pub(crate) task_handle: tokio::task::JoinHandle<()>,
     /// Send `CaptureRequest`s here (from PSI watchers).
-    pub capture_tx: mpsc::Sender<CaptureRequest>,
+    pub(crate) capture_tx: mpsc::Sender<CaptureRequest>,
     /// Receive `CompletedSession`s here (downstream symbolizer).
-    pub completed_rx: mpsc::Receiver<CompletedSession>,
+    pub(crate) completed_rx: mpsc::Receiver<CompletedSession>,
 }
 
 impl CaptureOrchestratorHandle {
@@ -337,6 +343,7 @@ impl CaptureOrchestrator<BpfPidFilter> {
         pid_filter_handle: libbpf_rs::MapHandle,
         capture_duration_secs: u64,
         stack_rx: mpsc::Receiver<StackSample>,
+        cancel: CancellationToken,
     ) -> CaptureOrchestratorHandle {
         let pid_filter = BpfPidFilter::new(pid_filter_handle);
         let capture_duration = Duration::from_secs(capture_duration_secs);
@@ -350,6 +357,7 @@ impl CaptureOrchestrator<BpfPidFilter> {
             session_tx,
             pid_filter,
             capture_duration,
+            cancel,
         );
         let task_handle = tokio::spawn(async move { orch.run().await });
 
@@ -430,6 +438,7 @@ mod tests {
             session_tx,
             MockPidFilter::new(),
             capture_duration,
+            CancellationToken::new(),
         );
 
         (orch, req_tx, stack_tx, session_rx)

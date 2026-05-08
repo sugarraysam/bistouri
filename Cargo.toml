@@ -28,3 +28,6 @@ metrics-exporter-prometheus = "0.18"
 libbpf-cargo = "0.26"
 # Checkout for kernel 6.19
 vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "5c36ac2080a8d3c1216470ce97e6502ed50272e5" }
+
+[dev-dependencies]
+rstest = "0.26"

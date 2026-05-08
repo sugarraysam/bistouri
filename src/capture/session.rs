@@ -145,6 +145,7 @@ pub(crate) struct CompletedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn make_trace(kernel: &[u64], user: &[u64]) -> StackTrace {
         StackTrace {
@@ -153,34 +154,65 @@ mod tests {
         }
     }
 
-    #[test]
-    fn record_deduplicates_identical_traces() {
+    // -----------------------------------------------------------------------
+    // Deduplication — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::all_identical(
+        vec![
+            make_trace(&[0x1000, 0x2000], &[0x3000]),
+            make_trace(&[0x1000, 0x2000], &[0x3000]),
+            make_trace(&[0x1000, 0x2000], &[0x3000]),
+        ],
+        1,  // unique traces
+        3,  // total samples
+        "three identical traces dedup to one entry"
+    )]
+    #[case::all_distinct(
+        vec![
+            make_trace(&[0x1000], &[0x2000]),
+            make_trace(&[0x1000], &[0x3000]),
+            make_trace(&[0x4000], &[0x2000]),
+        ],
+        3,  // unique traces
+        3,  // total samples
+        "three distinct traces stored separately"
+    )]
+    #[case::mixed(
+        vec![
+            make_trace(&[0xA], &[0xB]),
+            make_trace(&[0xC], &[0xD]),
+            make_trace(&[0xA], &[0xB]),
+        ],
+        2,  // unique traces
+        3,  // total samples
+        "mixed unique and duplicate traces"
+    )]
+    fn deduplication(
+        #[case] traces: Vec<StackTrace>,
+        #[case] expected_unique: usize,
+        #[case] expected_total: u64,
+        #[case] description: &str,
+    ) {
         let mut session = CaptureSession::new(42, "test".into(), PsiResource::Memory);
-        let trace = make_trace(&[0x1000, 0x2000], &[0x3000]);
-
-        session.record(trace.clone());
-        session.record(trace.clone());
-        session.record(trace);
-
-        assert_eq!(session.traces.len(), 1, "only one unique trace stored");
-        assert_eq!(session.counts[0], 3, "count reflects all samples");
-        assert_eq!(session.total_samples, 3);
+        for trace in traces {
+            session.record(trace);
+        }
+        assert_eq!(
+            session.traces.len(),
+            expected_unique,
+            "{description}: unique trace count"
+        );
+        assert_eq!(
+            session.total_samples, expected_total,
+            "{description}: total sample count"
+        );
     }
 
-    #[test]
-    fn record_distinguishes_different_traces() {
-        let mut session = CaptureSession::new(42, "test".into(), PsiResource::Cpu);
-        let trace_a = make_trace(&[0x1000], &[0x2000]);
-        let trace_b = make_trace(&[0x1000], &[0x3000]);
-
-        session.record(trace_a);
-        session.record(trace_b);
-
-        assert_eq!(session.traces.len(), 2);
-        assert_eq!(session.counts[0], 1);
-        assert_eq!(session.counts[1], 1);
-        assert_eq!(session.total_samples, 2);
-    }
+    // -----------------------------------------------------------------------
+    // Finalize lifecycle
+    // -----------------------------------------------------------------------
 
     #[test]
     fn finalize_produces_correct_profile() {

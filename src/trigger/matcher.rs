@@ -60,88 +60,87 @@ impl CommMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trigger::config::{PsiResource, TargetConfig, TriggerConfig};
+    use crate::trigger::config::{PsiResource, ResourceConfig, TargetConfig, TriggerConfig};
+    use rstest::rstest;
 
     fn make_config(targets: Vec<TargetConfig>) -> TriggerConfig {
         TriggerConfig::try_new(targets).unwrap()
     }
 
-    fn exact_target(comm: &str, rule_id: u32) -> TargetConfig {
+    fn exact_target(comm: &str) -> TargetConfig {
         TargetConfig {
             rule: MatchRule::Exact {
                 comm: comm.to_string(),
             },
-            resource: PsiResource::Memory,
-            threshold: 10.0,
-            rule_id,
+            resources: vec![ResourceConfig {
+                resource: PsiResource::Memory,
+                threshold: 10.0,
+            }],
+            rule_id: 0,
         }
     }
 
-    fn prefix_target(comm: &str, rule_id: u32) -> TargetConfig {
+    fn prefix_target(comm: &str) -> TargetConfig {
         TargetConfig {
             rule: MatchRule::Prefix {
                 comm: comm.to_string(),
             },
-            resource: PsiResource::Cpu,
-            threshold: 10.0,
-            rule_id,
+            resources: vec![ResourceConfig {
+                resource: PsiResource::Cpu,
+                threshold: 10.0,
+            }],
+            rule_id: 0,
         }
     }
 
-    #[test]
-    fn exact_match_succeeds() {
-        let config = make_config(vec![exact_target("node", 1)]);
+    // -----------------------------------------------------------------------
+    // Exact match — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::exact_hit("node", "node", true)]
+    #[case::longer_string("node", "nodejs", false)]
+    #[case::shorter_string("node", "nod", false)]
+    #[case::completely_different("node", "python", false)]
+    #[case::empty_input("node", "", false)]
+    fn exact_match(#[case] pattern: &str, #[case] input: &str, #[case] should_match: bool) {
+        let config = make_config(vec![exact_target(pattern)]);
         let matcher = CommMatcher::new(&config);
-        assert_eq!(matcher.match_comm("node"), vec![1]);
+        assert_eq!(
+            !matcher.match_comm(input).is_empty(),
+            should_match,
+            "exact pattern='{pattern}', input='{input}'",
+        );
     }
 
-    #[test]
-    fn exact_match_rejects_longer_string() {
-        let config = make_config(vec![exact_target("node", 1)]);
+    // -----------------------------------------------------------------------
+    // Prefix match — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::prefix_extends("worker-", "worker-1", true)]
+    #[case::prefix_extends_long("worker-", "worker-abc", true)]
+    #[case::prefix_exact_pattern("worker-", "worker-", true)]
+    #[case::shorter_than_prefix("worker-", "work", false)]
+    #[case::one_char_short("worker-", "worker", false)]
+    #[case::completely_different("worker-", "python", false)]
+    fn prefix_match(#[case] pattern: &str, #[case] input: &str, #[case] should_match: bool) {
+        let config = make_config(vec![prefix_target(pattern)]);
         let matcher = CommMatcher::new(&config);
-        assert!(matcher.match_comm("nodejs").is_empty());
+        assert_eq!(
+            !matcher.match_comm(input).is_empty(),
+            should_match,
+            "prefix pattern='{pattern}', input='{input}'",
+        );
     }
 
-    #[test]
-    fn exact_match_rejects_shorter_string() {
-        let config = make_config(vec![exact_target("node", 1)]);
-        let matcher = CommMatcher::new(&config);
-        assert!(matcher.match_comm("nod").is_empty());
-    }
-
-    #[test]
-    fn prefix_match_succeeds() {
-        let config = make_config(vec![prefix_target("worker-", 0)]);
-        let matcher = CommMatcher::new(&config);
-        assert_eq!(matcher.match_comm("worker-1"), vec![1]);
-        assert_eq!(matcher.match_comm("worker-abc"), vec![1]);
-    }
-
-    #[test]
-    fn prefix_match_exact_pattern_succeeds() {
-        let config = make_config(vec![prefix_target("worker-", 0)]);
-        let matcher = CommMatcher::new(&config);
-        assert_eq!(matcher.match_comm("worker-"), vec![1]);
-    }
-
-    #[test]
-    fn prefix_match_rejects_non_prefix() {
-        let config = make_config(vec![prefix_target("worker-", 0)]);
-        let matcher = CommMatcher::new(&config);
-        assert!(matcher.match_comm("work").is_empty());
-        assert!(matcher.match_comm("worker").is_empty());
-    }
-
-    #[test]
-    fn no_match_returns_empty() {
-        let config = make_config(vec![exact_target("node", 1)]);
-        let matcher = CommMatcher::new(&config);
-        assert!(matcher.match_comm("python").is_empty());
-    }
+    // -----------------------------------------------------------------------
+    // Multi-rule matching
+    // -----------------------------------------------------------------------
 
     #[test]
     fn multiple_rules_exact_and_prefix() {
-        let config = make_config(vec![exact_target("node", 0), prefix_target("worker-", 0)]);
+        let config = make_config(vec![exact_target("node"), prefix_target("worker-")]);
         let matcher = CommMatcher::new(&config);
         assert_eq!(matcher.match_comm("node"), vec![1]);
         assert!(matcher.match_comm("nodejs").is_empty());
@@ -157,16 +156,27 @@ mod tests {
     }
 
     #[test]
-    fn same_comm_multiple_rules() {
+    fn same_comm_multiple_targets() {
         let config = make_config(vec![
-            exact_target("bistouri", 1),
             TargetConfig {
                 rule: MatchRule::Exact {
                     comm: "bistouri".to_string(),
                 },
-                resource: PsiResource::Cpu,
-                threshold: 10.0,
-                rule_id: 2,
+                resources: vec![ResourceConfig {
+                    resource: PsiResource::Memory,
+                    threshold: 10.0,
+                }],
+                rule_id: 0,
+            },
+            TargetConfig {
+                rule: MatchRule::Exact {
+                    comm: "bistouri".to_string(),
+                },
+                resources: vec![ResourceConfig {
+                    resource: PsiResource::Cpu,
+                    threshold: 10.0,
+                }],
+                rule_id: 0,
             },
         ]);
         let matcher = CommMatcher::new(&config);

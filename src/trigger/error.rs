@@ -1,4 +1,5 @@
 use crate::sys::cgroup::error::CgroupError;
+use crate::trigger::config::PsiResource;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -27,6 +28,12 @@ pub(crate) enum TriggerError {
 
     #[error("At least one target rule is required")]
     EmptyTargets,
+
+    #[error("Target rule {rule_id} has no resources defined")]
+    EmptyResources { rule_id: u32 },
+
+    #[error("Duplicate (comm, resource) pair: comm '{comm}', resource {resource:?}")]
+    DuplicateCommResource { comm: String, resource: PsiResource },
 
     #[error("Comm string '{comm}' exceeds 15 characters kernel limit")]
     CommTooLong { comm: String },
