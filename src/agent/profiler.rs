@@ -1,15 +1,13 @@
 use crate::agent::error::{AgentError, Result};
+use crate::agent::ringbuf::AsyncRingBuffer;
 use crate::trigger::ProcessMatchEvent;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::MapCore;
 use perf_event::{events::Software, Builder, Counter};
 use std::os::fd::AsRawFd;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use tokio::sync::mpsc::Sender;
-use tracing::warn;
+use tokio::sync::mpsc::{self, Sender};
+use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/profiler.skel.rs"));
@@ -20,10 +18,15 @@ const DEFAULT_SAMPLING_FREQ_HZ: u64 = 19;
 pub(crate) const MAX_STACK_DEPTH: usize = 127;
 pub(crate) const TASK_COMM_LEN: usize = 16;
 
+const METRIC_STACK_RINGBUF_FULL: &str = "bistouri_profiler_stack_ringbuf_full";
+const METRIC_STACK_FETCH_ERRORS: &str = "bistouri_profiler_stack_fetch_errors";
+const METRIC_TRIGGER_RINGBUF_FULL: &str = "bistouri_profiler_trigger_ringbuf_full";
+const METRIC_TRIGGER_CHANNEL_FULL: &str = "bistouri_profiler_trigger_channel_full";
+pub(super) const METRIC_RINGBUF_POLL_ERRORS: &str = "bistouri_profiler_ringbuf_poll_errors";
+
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub(crate) struct BpfPerfEvent {
-    pub tgid: u32,
+pub(crate) struct StackTraceEvent {
     pub pid: u32,
     pub comm: [u8; TASK_COMM_LEN],
     pub kernel_stack_sz: i32,
@@ -32,7 +35,7 @@ pub(crate) struct BpfPerfEvent {
     pub user_stack: [u64; MAX_STACK_DEPTH],
 }
 
-impl BpfPerfEvent {
+impl StackTraceEvent {
     fn from_bytes(data: &[u8]) -> Option<&Self> {
         if data.len() == std::mem::size_of::<Self>() {
             Some(unsafe { &*data.as_ptr().cast::<Self>() })
@@ -44,14 +47,14 @@ impl BpfPerfEvent {
 
 #[repr(C)]
 #[derive(Debug, Clone)]
-struct BpfProcessMatchEvent {
+struct ProcessMatchBpfEvent {
     rule_id: u32,
     pid: u32,
     cgroup_id: u64,
     comm: [u8; TASK_COMM_LEN],
 }
 
-impl BpfProcessMatchEvent {
+impl ProcessMatchBpfEvent {
     fn from_bytes(data: &[u8]) -> Option<&Self> {
         if data.len() == std::mem::size_of::<Self>() {
             Some(unsafe { &*data.as_ptr().cast::<Self>() })
@@ -61,8 +64,8 @@ impl BpfProcessMatchEvent {
     }
 }
 
-impl From<&BpfProcessMatchEvent> for ProcessMatchEvent {
-    fn from(bpf: &BpfProcessMatchEvent) -> Self {
+impl From<&ProcessMatchBpfEvent> for ProcessMatchEvent {
+    fn from(bpf: &ProcessMatchBpfEvent) -> Self {
         let comm = String::from_utf8_lossy(&bpf.comm)
             .trim_matches(char::from(0))
             .to_string();
@@ -92,17 +95,19 @@ impl std::fmt::Display for SpaceKind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BPF error structs — tagged union matching profiler.h's error_event.
+// ---------------------------------------------------------------------------
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct ErrReserveStackRingbuf {
-    tgid: u32,
     pid: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct ErrStackFetch {
-    tgid: u32,
     pid: u32,
     ret_code: i32,
     space: SpaceKind,
@@ -130,11 +135,10 @@ struct ErrorEvent {
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum ProfilerError {
-    #[error("Failed to reserve stack ringbuffer for tgid: {tgid}, pid: {pid}")]
-    ReserveStackRingbuf { tgid: u32, pid: u32 },
-    #[error("Failed to fetch {space} stack for tgid: {tgid}, pid: {pid}. Code: {ret_code}")]
+    #[error("Failed to reserve stack ringbuffer for pid: {pid}")]
+    ReserveStackRingbuf { pid: u32 },
+    #[error("Failed to fetch {space} stack for pid: {pid}. Code: {ret_code}")]
     StackFetch {
-        tgid: u32,
         pid: u32,
         ret_code: i32,
         space: SpaceKind,
@@ -153,16 +157,12 @@ impl ProfilerError {
                 1 => {
                     // SAFETY: We verify the tag `kind == 1` before accessing the union field.
                     let reserve = unsafe { event.data.stack_reserve_err };
-                    Some(ProfilerError::ReserveStackRingbuf {
-                        tgid: reserve.tgid,
-                        pid: reserve.pid,
-                    })
+                    Some(ProfilerError::ReserveStackRingbuf { pid: reserve.pid })
                 }
                 2 => {
                     // SAFETY: We verify the tag `kind == 2` before accessing the union field.
                     let fetch = unsafe { event.data.stack_fetch_err };
                     Some(ProfilerError::StackFetch {
-                        tgid: fetch.tgid,
                         pid: fetch.pid,
                         ret_code: fetch.ret_code,
                         space: fetch.space,
@@ -182,10 +182,29 @@ impl ProfilerError {
             None
         }
     }
+
+    /// Increments the appropriate Prometheus counter for this error kind.
+    /// BPF errors are never fatal — they indicate transient kernel-side
+    /// resource contention. Operators monitor these via Prometheus alerts.
+    fn record_metric(&self) {
+        match self {
+            ProfilerError::ReserveStackRingbuf { .. } => {
+                metrics::counter!(METRIC_STACK_RINGBUF_FULL).increment(1);
+            }
+            ProfilerError::StackFetch { .. } => {
+                metrics::counter!(METRIC_STACK_FETCH_ERRORS).increment(1);
+            }
+            ProfilerError::ReserveTriggerRingbuf { .. } => {
+                metrics::counter!(METRIC_TRIGGER_RINGBUF_FULL).increment(1);
+            }
+            ProfilerError::Unknown(_) => {}
+        }
+    }
 }
 
-struct RingBufferRunner(libbpf_rs::RingBuffer<'static>);
-unsafe impl Send for RingBufferRunner {}
+// ---------------------------------------------------------------------------
+// ProfilerAgent — build → load → attach → poll lifecycle.
+// ---------------------------------------------------------------------------
 
 pub(crate) struct ProfilerAgent {
     freq: u64,
@@ -253,23 +272,34 @@ pub(crate) struct LoadedProfilerAgent {
 }
 
 impl LoadedProfilerAgent {
+    /// Registers callbacks for each BPF ring buffer map.
+    ///
+    /// **Design constraint:** Callbacks run inline during `consume()` on the
+    /// async event loop. Keep them to O(1) operations (pointer casts, `try_send`).
+    /// Heavy processing (symbolization, batching, network IO) belongs on a
+    /// separate task fed via a channel.
     fn setup_ringbuffers(&mut self, trigger_tx: Option<Sender<ProcessMatchEvent>>) -> Result<()> {
         let mut builder = libbpf_rs::RingBufferBuilder::new();
 
         builder
-            .add(&self.skel.maps.perf_events, |data| {
-                if let Some(event) = BpfPerfEvent::from_bytes(data) {
+            .add(&self.skel.maps.stack_events, |data| {
+                if let Some(event) = StackTraceEvent::from_bytes(data) {
                     // TODO: process stacktrace
                     let _ = event;
                 }
                 0
             })
-            .map_err(|e| AgentError::Bpf("failed to add perf_events ringbuffer".into(), e))?;
+            .map_err(|e| AgentError::Bpf("failed to add stack_events ringbuffer".into(), e))?;
 
         builder
             .add(&self.skel.maps.errors, |data| {
                 if let Some(err) = ProfilerError::from_bytes(data) {
-                    warn!(error = %err, "BPF error event received");
+                    // BPF errors are never fatal — they indicate transient
+                    // kernel-side resource contention (ring buffer full, stack
+                    // fetch failure). We increment Prometheus counters for
+                    // operators to alert on externally and log at debug level.
+                    debug!(error = %err, "BPF error event");
+                    err.record_metric();
                 }
                 0
             })
@@ -278,8 +308,16 @@ impl LoadedProfilerAgent {
         if let Some(tx) = trigger_tx {
             builder
                 .add(&self.skel.maps.trigger_events, move |data| {
-                    if let Some(bpf_event) = BpfProcessMatchEvent::from_bytes(data) {
-                        let _ = tx.blocking_send(bpf_event.into());
+                    if let Some(bpf_event) = ProcessMatchBpfEvent::from_bytes(data) {
+                        // Trigger events are best-effort: dropping on channel-full
+                        // is safe because proc_walk provides the completeness
+                        // guarantee — all matching processes are discovered within
+                        // one scan interval (eventual consistency).
+                        if let Err(mpsc::error::TrySendError::Full(_)) =
+                            tx.try_send(bpf_event.into())
+                        {
+                            metrics::counter!(METRIC_TRIGGER_CHANNEL_FULL).increment(1);
+                        }
                     }
                     0
                 })
@@ -325,35 +363,51 @@ impl LoadedProfilerAgent {
             .map_err(|e| AgentError::PerfEvent("failed to build perf event".into(), e))
     }
 
-    /// Starts polling the ringbuffers on a blocking Tokio thread.
-    /// Returns a JoinHandle and an AtomicBool flag to signal shutdown.
+    /// Registers metric descriptions for all profiler counters.
+    fn describe_metrics() {
+        metrics::describe_counter!(
+            METRIC_STACK_RINGBUF_FULL,
+            "BPF stack ring buffer reservation failures (64MB buffer full)"
+        );
+        metrics::describe_counter!(
+            METRIC_STACK_FETCH_ERRORS,
+            "BPF bpf_get_stack() failures (transient, process likely exited)"
+        );
+        metrics::describe_counter!(
+            METRIC_TRIGGER_RINGBUF_FULL,
+            "BPF trigger ring buffer reservation failures (256KB buffer full)"
+        );
+        metrics::describe_counter!(
+            METRIC_TRIGGER_CHANNEL_FULL,
+            "Trigger events dropped due to full channel (proc_walk provides completeness)"
+        );
+        metrics::describe_counter!(
+            METRIC_RINGBUF_POLL_ERRORS,
+            "Epoll errors on ring buffer fd (unrecoverable, polling stops)"
+        );
+    }
+
+    /// Starts asynchronous ring buffer polling using tokio's IO reactor.
+    ///
+    /// Wraps the ring buffer in `AsyncRingBuffer` which registers the internal
+    /// epoll fd with tokio. Runs as a regular async task — no blocking thread needed.
     pub(crate) fn start_polling(
         &mut self,
-    ) -> Result<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> {
+        cancel: CancellationToken,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        Self::describe_metrics();
+
         let rb = self.ring_buffer.take().ok_or_else(|| {
             AgentError::InvalidState("ringbuffer not initialized or already polling".into())
         })?;
-        let runner = RingBufferRunner(rb);
 
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let flag_clone = Arc::clone(&stop_flag);
+        let mut async_rb = AsyncRingBuffer::new(rb)?;
 
-        let handle = tokio::task::spawn_blocking(move || {
-            // Note on epoll vs poll(): `libbpf_rs::RingBuffer` uses a single epoll FD internally
-            // to listen to all registered BPF maps. The `poll()` call executes `epoll_wait`
-            // under the hood, blocking until an event arrives or the timeout hits.
-            // Using `spawn_blocking` is the idiomatic way to handle this without
-            // starving Tokio's async reactor.
-            while !flag_clone.load(Ordering::Relaxed) {
-                if let Err(e) = runner.0.poll(std::time::Duration::from_millis(100)) {
-                    // Only log the error but don't exit the loop.
-                    // EINTR or timeout shouldn't crash the polling thread.
-                    warn!(error = %e, "ringbuffer poll error");
-                }
-            }
+        let handle = tokio::spawn(async move {
+            async_rb.run(cancel).await;
         });
 
-        Ok((handle, stop_flag))
+        Ok(handle)
     }
 
     /// Returns a standalone handle to the BPF `comm_lpm_trie` map.
@@ -364,27 +418,27 @@ impl LoadedProfilerAgent {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn monitor_pid(&self, tgid: u32) -> Result<()> {
+    pub(crate) fn monitor_pid(&self, pid: u32) -> Result<()> {
         let active: u8 = 1;
         self.skel
             .maps
             .pid_filter_map
             .update(
-                &tgid.to_ne_bytes(),
+                &pid.to_ne_bytes(),
                 &active.to_ne_bytes(),
                 libbpf_rs::MapFlags::ANY,
             )
-            .map_err(|e| AgentError::Bpf("failed to add tgid to filter map".into(), e))?;
+            .map_err(|e| AgentError::Bpf("failed to add pid to filter map".into(), e))?;
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub(crate) fn unmonitor_pid(&self, tgid: u32) -> Result<()> {
+    pub(crate) fn unmonitor_pid(&self, pid: u32) -> Result<()> {
         self.skel
             .maps
             .pid_filter_map
-            .delete(&tgid.to_ne_bytes())
-            .map_err(|e| AgentError::Bpf("failed to remove tgid from filter map".into(), e))?;
+            .delete(&pid.to_ne_bytes())
+            .map_err(|e| AgentError::Bpf("failed to remove pid from filter map".into(), e))?;
         Ok(())
     }
 }

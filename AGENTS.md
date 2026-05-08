@@ -55,6 +55,11 @@ external symbolizer service for analysis.
   `#[repr(C)]` in Rust.
 - Map Interactions: Prefer eBPF ring buffers over perf buffers for
   high-throughput event streaming from kernel to user-space.
+- Naming: The `bpf_` prefix is reserved for Linux kernel BPF helper
+  functions (e.g. `bpf_get_current_pid_tgid`, `bpf_ringbuf_reserve`).
+  Never use it for user-space types, map names, or variables. Use
+  descriptive domain names instead (e.g. `stack_trace_event` not
+  `bpf_perf_event`).
 
 ### 3. Workflow & Building
 

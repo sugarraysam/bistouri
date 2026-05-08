@@ -8,8 +8,7 @@
 
 #define MAX_STACK_SIZE (MAX_STACK_DEPTH * 8)
 
-struct bpf_perf_event {
-    __u32 tgid;
+struct stack_trace_event {
     __u32 pid;
     __u8 comm[TASK_COMM_LEN];
     __s32 kernel_stack_sz;
@@ -30,12 +29,10 @@ enum space_kind {
 };
 
 struct err_reserve_stack_ringbuf {
-    __u32 tgid;
     __u32 pid;
 };
 
 struct err_stack_fetch {
-    __u32 tgid;
     __u32 pid;
     __s32 ret_code;
     __u32 space;

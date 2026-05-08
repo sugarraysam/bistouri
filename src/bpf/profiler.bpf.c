@@ -16,7 +16,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 64 * 1024 * 1024); // 64 MB
-} perf_events SEC(".maps");
+} stack_events SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -40,27 +40,24 @@ SEC("perf_event")
 int handle_perf(void *ctx)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tgid = pid_tgid >> 32;
-    __u32 pid = pid_tgid & 0xFFFFFFFF;
+    __u32 pid = pid_tgid >> 32; // tgid in kernel terms = pid in user-space
 
-    __u8 *active = bpf_map_lookup_elem(&pid_filter_map, &tgid);
+    __u8 *active = bpf_map_lookup_elem(&pid_filter_map, &pid);
     if (!active) {
         return 0;
     }
 
-    struct bpf_perf_event *event = bpf_ringbuf_reserve(&perf_events, sizeof(*event), 0);
+    struct stack_trace_event *event = bpf_ringbuf_reserve(&stack_events, sizeof(*event), 0);
     if (!event) {
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_RESERVE_STACK_RINGBUF;
-            err->data.stack_reserve_err.tgid = tgid;
             err->data.stack_reserve_err.pid = pid;
             bpf_ringbuf_submit(err, 0);
         }
         return 0;
     }
 
-    event->tgid = tgid;
     event->pid = pid;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
@@ -69,7 +66,6 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_STACK_FETCH;
-            err->data.stack_fetch_err.tgid = tgid;
             err->data.stack_fetch_err.pid = pid;
             err->data.stack_fetch_err.ret_code = event->kernel_stack_sz;
             err->data.stack_fetch_err.space = SPACE_KERNEL;
@@ -82,7 +78,6 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_STACK_FETCH;
-            err->data.stack_fetch_err.tgid = tgid;
             err->data.stack_fetch_err.pid = pid;
             err->data.stack_fetch_err.ret_code = event->user_stack_sz;
             err->data.stack_fetch_err.space = SPACE_USER;

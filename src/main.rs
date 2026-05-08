@@ -8,6 +8,7 @@ use args::Args;
 use clap::Parser;
 use std::sync::Arc;
 use sys::cgroup::{cgroup_watcher_task, CgroupCache, SharedCgroupCache};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -61,7 +62,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
     let comm_lpm_trie_handle = loaded_agent.comm_lpm_trie_handle()?;
 
-    let (poll_handle, stop_flag) = loaded_agent.start_polling()?;
+    let poll_cancel = CancellationToken::new();
+    let poll_handle = loaded_agent.start_polling(poll_cancel.clone())?;
 
     // Phase 3: Start TriggerAgent with the BPF trie handle from phase 2.
     let trigger_handle = prepared.start(comm_lpm_trie_handle).await?;
@@ -74,10 +76,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     info!("received Ctrl-C, shutting down");
 
-    // Signal the ringbuffers polling thread to stop
-    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    // Wait for the polling thread to exit cleanly
+    // Cancel the async ring buffer polling task
+    poll_cancel.cancel();
     let _ = poll_handle.await;
 
     // Signal TriggerAgent event loop to stop and await its task

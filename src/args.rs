@@ -29,10 +29,9 @@ pub(crate) struct Args {
 
     /// Max threads in the spawn_blocking pool.
     ///
-    /// The ring buffer poller permanently occupies one blocking thread, so
-    /// the minimum is 2: one for polling, one for transient work like /proc
-    /// walking and config file parsing.
-    #[arg(long, default_value_t = 2)]
+    /// Used for transient synchronous work like /proc walking and config
+    /// file parsing. These tasks are serialized in practice, so 1 is sufficient.
+    #[arg(long, default_value_t = 1)]
     pub blocking_threads: usize,
 
     /// Log level filter (e.g. "bistouri=debug", "bistouri=info,tokio=warn").

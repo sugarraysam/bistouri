@@ -52,6 +52,12 @@ WRITING PHILOSOPHY:
   implementation.
 - Use mermaid diagrams for data flow and state machines — they should clarify
   relationships that prose alone cannot.
+- CRITICAL: Quarto requires mermaid blocks to use curly-brace syntax:
+  ```{mermaid}
+  graph TD
+      A --> B
+  ```
+  Do NOT use ```mermaid (without curly braces) — it will NOT render.
 - A reader should finish each chapter able to explain the design to someone
   else without looking at the code.
 - If a chapter is not interesting — if it does not teach something surprising
@@ -133,7 +139,7 @@ CHAPTERS = [
 ## What is Bistouri?
 ## Why eBPF for Profiling?
 ## Architecture at a Glance
-## Component Map (use a ```mermaid``` flowchart)
+## Component Map (use a ```{mermaid}``` flowchart)
 ## The Event Pipeline
 ## Design Principles
 ## Key Tradeoffs"""
@@ -152,7 +158,7 @@ CHAPTERS = [
 ## The proc_walk Loop
 ## Hot Reload Without Downtime
 ## Eventual Consistency Model
-## Data Flow (use a ```mermaid``` diagram)"""
+## Data Flow (use a ```{mermaid}``` diagram)"""
         ),
     },
     {
@@ -167,7 +173,7 @@ CHAPTERS = [
 ## LPM Trie for Cgroup Matching
 ## Batch Updates & Performance
 ## Error Recovery
-## Agent Lifecycle (use a ```mermaid``` diagram)"""
+## Agent Lifecycle (use a ```{mermaid}``` diagram)"""
         ),
     },
     {
@@ -182,7 +188,7 @@ CHAPTERS = [
 ## Satisfying the Verifier
 ## Build Pipeline (libbpf-cargo)
 ## Memory Layout & repr(C)
-## Program Flow (use a ```mermaid``` diagram)"""
+## Program Flow (use a ```{mermaid}``` diagram)"""
         ),
     },
 ]
