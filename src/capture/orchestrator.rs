@@ -335,12 +335,6 @@ pub(crate) struct CaptureOrchestratorHandle {
     pub(crate) completed_rx: mpsc::Receiver<CompletedSession>,
 }
 
-impl CaptureOrchestratorHandle {
-    pub(crate) fn shutdown(self) {
-        self.task_handle.abort();
-    }
-}
-
 impl CaptureOrchestrator<BpfPidFilter> {
     /// Production entry point: creates channels, spawns the event loop.
     ///

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-#[allow(dead_code)]
 pub(crate) enum TriggerError {
     #[error("Failed to build PSI file descriptor for cgroup {path:?}: {source}")]
     PsiFdBuild {
@@ -14,9 +13,6 @@ pub(crate) enum TriggerError {
 
     #[error("Failed to register PSI fd with async reactor: {0}")]
     AsyncFd(#[source] std::io::Error),
-
-    #[error("Proc walk task panicked: {0}")]
-    ProcWalk(String),
 
     #[error("At least one target rule is required")]
     EmptyTargets,

@@ -132,12 +132,14 @@ pub(crate) struct CompletedSession {
     /// Stable, human-readable process identifier. Unlike PID, meaningful
     /// across hosts running the same binary.
     pub comm: String,
+    #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub started_at: Instant,
     // TODO: build_id (ELF .note.gnu.build-id) — needed by symbolizer for
     //       cross-host correlation. Requires ELF parser crate. Separate follow-up.
     // TODO: stall_total_usec delta — PSI violation severity.
     pub stack_traces: Vec<StackTrace>,
     /// Dictionary-encoded profile: stack_traces index → sample count.
+    #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub profile: HashMap<usize, u64>,
     pub total_samples: u64,
 }

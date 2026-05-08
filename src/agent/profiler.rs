@@ -3,7 +3,6 @@ use crate::agent::ringbuf::AsyncRingBuffer;
 use crate::capture::trace::StackSample;
 use crate::trigger::ProcessMatchEvent;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::MapCore;
 use perf_event::{events::Software, Builder, Counter};
 use std::os::fd::AsRawFd;
 use tokio::sync::mpsc::{self, Sender};
@@ -450,31 +449,6 @@ impl LoadedProfilerAgent {
         libbpf_rs::MapHandle::try_from(&self.skel.maps.pid_filter_map)
             .map_err(|e| AgentError::Bpf("failed to create pid_filter MapHandle".into(), e))
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn monitor_pid(&self, pid: u32) -> Result<()> {
-        let active: u8 = 1;
-        self.skel
-            .maps
-            .pid_filter_map
-            .update(
-                &pid.to_ne_bytes(),
-                &active.to_ne_bytes(),
-                libbpf_rs::MapFlags::ANY,
-            )
-            .map_err(|e| AgentError::Bpf("failed to add pid to filter map".into(), e))?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn unmonitor_pid(&self, pid: u32) -> Result<()> {
-        self.skel
-            .maps
-            .pid_filter_map
-            .delete(&pid.to_ne_bytes())
-            .map_err(|e| AgentError::Bpf("failed to remove pid from filter map".into(), e))?;
-        Ok(())
-    }
 }
 
 pub(crate) struct ProfilerAgentBuilder {
@@ -496,12 +470,6 @@ impl Default for ProfilerAgentBuilder {
 impl ProfilerAgentBuilder {
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn with_freq(mut self, freq: u64) -> Self {
-        self.freq = freq;
-        self
     }
 
     pub(crate) fn with_trigger_tx(mut self, tx: Sender<ProcessMatchEvent>) -> Self {
