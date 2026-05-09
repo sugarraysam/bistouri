@@ -119,23 +119,22 @@ impl CaptureSession {
 /// Finalized capture result, ready for downstream delivery (symbolizer, storage).
 ///
 /// Contains dictionary-encoded stack traces: `stack_traces[i]` holds the unique
-/// trace, and `profile[i]` holds how many times it was sampled. Kernel and user
-/// frames are stored separately within each `StackTrace` (different symbol
-/// sources: kallsyms for kernel, ELF for user).
+/// trace, and `profile[i]` holds how many times it was sampled. Kernel frames
+/// are raw IPs (symbolized via /proc/kallsyms). User frames carry per-frame
+/// `(build_id, file_offset)` from `BPF_F_USER_BUILD_ID` — the symbolizer uses
+/// these for cross-host correlation and symbol lookup without /proc/pid/maps.
 pub(crate) struct CompletedSession {
     pub session_id: SessionId,
     pub resource: PsiResource,
-    /// PID is host-local and ephemeral, but needed for local correlation
-    /// (/proc/<pid>/exe, /proc/<pid>/maps). For cross-host correlation,
-    /// use `build_id` (TODO) and `comm`.
+    /// PID is host-local and ephemeral, but needed for local correlation.
+    /// For cross-host correlation, the symbolizer groups by build_id
+    /// (embedded per-frame in user stack entries).
     pub pid: u32,
     /// Stable, human-readable process identifier. Unlike PID, meaningful
     /// across hosts running the same binary.
     pub comm: String,
     #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub started_at: Instant,
-    // TODO: build_id (ELF .note.gnu.build-id) — needed by symbolizer for
-    //       cross-host correlation. Requires ELF parser crate. Separate follow-up.
     // TODO: stall_total_usec delta — PSI violation severity.
     pub stack_traces: Vec<StackTrace>,
     /// Dictionary-encoded profile: stack_traces index → sample count.
@@ -147,12 +146,27 @@ pub(crate) struct CompletedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::profiler::BUILD_ID_SIZE;
+    use crate::capture::trace::UserFrame;
     use rstest::rstest;
 
-    fn make_trace(kernel: &[u64], user: &[u64]) -> StackTrace {
+    /// Convenience: build_id filled with a single repeated byte.
+    fn bid(byte: u8) -> [u8; BUILD_ID_SIZE] {
+        [byte; BUILD_ID_SIZE]
+    }
+
+    fn make_trace(kernel: &[u64], user: &[UserFrame]) -> StackTrace {
         StackTrace {
             kernel_frames: kernel.to_vec(),
             user_frames: user.to_vec(),
+        }
+    }
+
+    /// Shorthand for a resolved user frame.
+    fn frame(bid_byte: u8, offset: u64) -> UserFrame {
+        UserFrame {
+            build_id: bid(bid_byte),
+            file_offset: offset,
         }
     }
 
@@ -163,9 +177,9 @@ mod tests {
     #[rstest]
     #[case::all_identical(
         vec![
-            make_trace(&[0x1000, 0x2000], &[0x3000]),
-            make_trace(&[0x1000, 0x2000], &[0x3000]),
-            make_trace(&[0x1000, 0x2000], &[0x3000]),
+            make_trace(&[0x1000, 0x2000], &[frame(0xAA, 0x3000)]),
+            make_trace(&[0x1000, 0x2000], &[frame(0xAA, 0x3000)]),
+            make_trace(&[0x1000, 0x2000], &[frame(0xAA, 0x3000)]),
         ],
         1,  // unique traces
         3,  // total samples
@@ -173,9 +187,9 @@ mod tests {
     )]
     #[case::all_distinct(
         vec![
-            make_trace(&[0x1000], &[0x2000]),
-            make_trace(&[0x1000], &[0x3000]),
-            make_trace(&[0x4000], &[0x2000]),
+            make_trace(&[0x1000], &[frame(0xAA, 0x2000)]),
+            make_trace(&[0x1000], &[frame(0xBB, 0x3000)]),
+            make_trace(&[0x4000], &[frame(0xAA, 0x2000)]),
         ],
         3,  // unique traces
         3,  // total samples
@@ -183,9 +197,9 @@ mod tests {
     )]
     #[case::mixed(
         vec![
-            make_trace(&[0xA], &[0xB]),
-            make_trace(&[0xC], &[0xD]),
-            make_trace(&[0xA], &[0xB]),
+            make_trace(&[0xA], &[frame(0x01, 0xB)]),
+            make_trace(&[0xC], &[frame(0x02, 0xD)]),
+            make_trace(&[0xA], &[frame(0x01, 0xB)]),
         ],
         2,  // unique traces
         3,  // total samples
@@ -219,8 +233,8 @@ mod tests {
     #[test]
     fn finalize_produces_correct_profile() {
         let mut session = CaptureSession::new(42, "myapp".into(), PsiResource::Io);
-        let hot_path = make_trace(&[0xA], &[0xB]);
-        let cold_path = make_trace(&[0xC], &[0xD]);
+        let hot_path = make_trace(&[0xA], &[frame(0x01, 0xB)]);
+        let cold_path = make_trace(&[0xC], &[frame(0x02, 0xD)]);
 
         for _ in 0..10 {
             session.record(hot_path.clone());

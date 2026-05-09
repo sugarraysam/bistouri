@@ -61,7 +61,7 @@ int handle_perf(void *ctx)
     event->pid = pid;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
-    event->kernel_stack_sz = bpf_get_stack(ctx, event->kernel_stack, MAX_STACK_SIZE, 0);
+    event->kernel_stack_sz = bpf_get_stack(ctx, event->kernel_stack, KERNEL_STACK_SIZE, 0);
     if (event->kernel_stack_sz < 0) {
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
@@ -73,7 +73,8 @@ int handle_perf(void *ctx)
         }
     }
 
-    event->user_stack_sz = bpf_get_stack(ctx, event->user_stack, MAX_STACK_SIZE, BPF_F_USER_STACK);
+    event->user_stack_sz = bpf_get_stack(ctx, event->user_stack, USER_STACK_SIZE,
+                                          BPF_F_USER_STACK | BPF_F_USER_BUILD_ID);
     if (event->user_stack_sz < 0) {
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {

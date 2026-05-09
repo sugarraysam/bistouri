@@ -379,8 +379,9 @@ impl CaptureOrchestrator<BpfPidFilter> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::trace::StackTrace;
+    use super::super::trace::{StackTrace, UserFrame};
     use super::*;
+    use crate::agent::profiler::BUILD_ID_SIZE;
     use tokio::time;
 
     /// Mock PID filter that records add/remove operations for assertion.
@@ -415,7 +416,10 @@ mod tests {
             pid,
             trace: StackTrace {
                 kernel_frames: vec![trace_id],
-                user_frames: vec![trace_id + 1],
+                user_frames: vec![UserFrame {
+                    build_id: [trace_id as u8; BUILD_ID_SIZE],
+                    file_offset: trace_id + 1,
+                }],
             },
         }
     }

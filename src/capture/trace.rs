@@ -1,14 +1,56 @@
-use crate::agent::profiler::StackTraceEvent;
+use crate::agent::profiler::{StackTraceEvent, UserStackFrame, BUILD_ID_SIZE};
+use tracing::error;
+
+const METRIC_USER_FRAMES_FALLBACK: &str = "bistouri_profiler_user_frames_fallback";
+
+/// Kernel `bpf_stack_build_id_status` enum values.
+/// Parsed from the raw `i32` status field in `UserStackFrame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildIdStatus {
+    Empty,
+    Valid,
+    FallbackIp,
+}
+
+impl TryFrom<i32> for BuildIdStatus {
+    type Error = i32;
+
+    fn try_from(value: i32) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Empty),
+            1 => Ok(Self::Valid),
+            2 => Ok(Self::FallbackIp),
+            other => Err(other),
+        }
+    }
+}
+
+/// A resolved user-space frame with build_id and file offset.
+/// The kernel computed the file offset from the VMA — ASLR is already handled.
+/// The symbolizer adjusts by `(p_vaddr - p_offset)` for symbol table lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UserFrame {
+    pub build_id: [u8; BUILD_ID_SIZE],
+    pub file_offset: u64,
+}
 
 /// A unique stack trace (kernel + user frames), trimmed to actual depth.
 ///
+/// Kernel frames are raw instruction pointers (symbolized via /proc/kallsyms).
+/// User frames carry per-frame build_id and file offset from `BPF_F_USER_BUILD_ID`,
+/// enabling the symbolizer to attribute frames to specific DSOs without needing
+/// /proc/pid/maps.
+///
+/// Frames where the kernel could not resolve a build_id (`BPF_STACK_BUILD_ID_IP`)
+/// are dropped — they require /proc/pid/maps de-ASLR which is not yet implemented.
+/// A metric counter tracks their frequency for future prioritization.
+///
 /// Derives `Hash` and `Eq` so it can be used as a `HashMap` key for
-/// per-session deduplication. Rust's `HashMap` handles hashing internally
-/// via SipHash — no explicit hashing code needed.
+/// per-session deduplication.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct StackTrace {
     pub kernel_frames: Vec<u64>,
-    pub user_frames: Vec<u64>,
+    pub user_frames: Vec<UserFrame>,
 }
 
 impl StackTrace {
@@ -16,6 +58,12 @@ impl StackTrace {
     /// arrays to actual depth. Negative `stack_sz` indicates a BPF fetch
     /// failure — treated as an empty stack (not an error here; the BPF error
     /// ringbuffer already recorded it).
+    ///
+    /// User frames are parsed from `UserStackFrame` structs returned by
+    /// `bpf_get_stack` with `BPF_F_USER_BUILD_ID`. Each frame has a status:
+    /// - `Valid` (1): build_id + file_offset resolved by kernel → stored
+    /// - `FallbackIp` (2): raw IP fallback (JIT, vDSO) → logged, metriced, dropped
+    /// - `Empty` (0): end-of-trace sentinel → stops parsing
     pub(crate) fn from_event(event: &StackTraceEvent) -> Self {
         let kernel_frames = if event.kernel_stack_sz > 0 {
             let count = event.kernel_stack_sz as usize / std::mem::size_of::<u64>();
@@ -25,8 +73,8 @@ impl StackTrace {
         };
 
         let user_frames = if event.user_stack_sz > 0 {
-            let count = event.user_stack_sz as usize / std::mem::size_of::<u64>();
-            event.user_stack[..count].to_vec()
+            let count = event.user_stack_sz as usize / std::mem::size_of::<UserStackFrame>();
+            Self::parse_user_frames(&event.user_stack[..count])
         } else {
             Vec::new()
         };
@@ -35,6 +83,41 @@ impl StackTrace {
             kernel_frames,
             user_frames,
         }
+    }
+
+    fn parse_user_frames(raw: &[UserStackFrame]) -> Vec<UserFrame> {
+        let mut frames = Vec::with_capacity(raw.len());
+        for frame in raw {
+            let status = match BuildIdStatus::try_from(frame.status) {
+                Ok(s) => s,
+                Err(unknown) => {
+                    error!(
+                        status = unknown,
+                        "unknown user_stack_frame status, skipping frame",
+                    );
+                    continue;
+                }
+            };
+
+            match status {
+                BuildIdStatus::Empty => break,
+                BuildIdStatus::Valid => {
+                    frames.push(UserFrame {
+                        build_id: frame.build_id,
+                        file_offset: frame.offset_or_ip,
+                    });
+                }
+                BuildIdStatus::FallbackIp => {
+                    error!(
+                        ip = format_args!("{:#x}", frame.offset_or_ip),
+                        "user frame has no build_id (BPF_STACK_BUILD_ID_IP), \
+                         de-ASLR for fallback frames not yet implemented",
+                    );
+                    metrics::counter!(METRIC_USER_FRAMES_FALLBACK).increment(1);
+                }
+            }
+        }
+        frames
     }
 }
 
@@ -61,58 +144,131 @@ mod tests {
     use crate::agent::profiler::{MAX_STACK_DEPTH, TASK_COMM_LEN};
     use rstest::rstest;
 
-    fn make_event(kernel_depth: usize, user_depth: usize) -> StackTraceEvent {
+    /// Status constants for test readability (mirror BuildIdStatus discriminants).
+    const VALID: i32 = 1;
+    const FALLBACK_IP: i32 = 2;
+    const EMPTY: i32 = 0;
+
+    /// Helper: builds a zero-initialized event, then populates kernel frames
+    /// (raw IPs) and user frames (UserStackFrame with status/build_id/offset).
+    fn make_event(
+        kernel_depth: usize,
+        user_frames: &[(i32, [u8; BUILD_ID_SIZE], u64)],
+    ) -> StackTraceEvent {
         let mut event = StackTraceEvent {
             pid: 42,
             comm: [0u8; TASK_COMM_LEN],
             kernel_stack_sz: 0,
             user_stack_sz: 0,
             kernel_stack: [0u64; MAX_STACK_DEPTH],
-            user_stack: [0u64; MAX_STACK_DEPTH],
+            user_stack: [UserStackFrame {
+                status: 0,
+                build_id: [0u8; BUILD_ID_SIZE],
+                offset_or_ip: 0,
+            }; MAX_STACK_DEPTH],
         };
+
         for i in 0..kernel_depth {
             event.kernel_stack[i] = 0xdead_0000 + i as u64;
         }
         event.kernel_stack_sz = (kernel_depth * 8) as i32;
 
-        for i in 0..user_depth {
-            event.user_stack[i] = 0xbeef_0000 + i as u64;
+        for (i, (status, build_id, offset_or_ip)) in user_frames.iter().enumerate() {
+            event.user_stack[i] = UserStackFrame {
+                status: *status,
+                build_id: *build_id,
+                offset_or_ip: *offset_or_ip,
+            };
         }
-        event.user_stack_sz = (user_depth * 8) as i32;
+        event.user_stack_sz = (user_frames.len() * std::mem::size_of::<UserStackFrame>()) as i32;
 
         event
     }
 
+    /// Convenience: build_id filled with a single repeated byte.
+    fn bid(byte: u8) -> [u8; BUILD_ID_SIZE] {
+        [byte; BUILD_ID_SIZE]
+    }
+
     // -----------------------------------------------------------------------
-    // Frame trimming — rstest table
+    // Kernel frame trimming — rstest table
     // -----------------------------------------------------------------------
 
     #[rstest]
-    #[case::both_populated(3, 5, 3, 5)]
-    #[case::kernel_only(4, 0, 4, 0)]
-    #[case::user_only(0, 7, 0, 7)]
-    #[case::both_empty(0, 0, 0, 0)]
-    #[case::single_frame_each(1, 1, 1, 1)]
-    #[case::max_depth(127, 127, 127, 127)]
-    fn from_event_trims_to_actual_depth(
-        #[case] kernel_depth: usize,
-        #[case] user_depth: usize,
-        #[case] expected_kernel: usize,
-        #[case] expected_user: usize,
-    ) {
-        let event = make_event(kernel_depth, user_depth);
+    #[case::populated(3, 3)]
+    #[case::empty(0, 0)]
+    #[case::single(1, 1)]
+    #[case::max_depth(127, 127)]
+    fn kernel_frame_trimming(#[case] depth: usize, #[case] expected: usize) {
+        let event = make_event(depth, &[]);
         let trace = StackTrace::from_event(&event);
-        assert_eq!(trace.kernel_frames.len(), expected_kernel);
-        assert_eq!(trace.user_frames.len(), expected_user);
+        assert_eq!(trace.kernel_frames.len(), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // User frame parsing — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::single_valid(
+        &[(VALID, bid(0xAA), 0x1000)],
+        1,
+        "single valid frame stored"
+    )]
+    #[case::multiple_valid(
+        &[(VALID, bid(0xAA), 0x1000), (VALID, bid(0xBB), 0x2000)],
+        2,
+        "multiple valid frames stored"
+    )]
+    #[case::fallback_dropped(
+        &[(FALLBACK_IP, [0; BUILD_ID_SIZE], 0xFFFF_CAFE)],
+        0,
+        "fallback IP frame is dropped"
+    )]
+    #[case::empty_terminates(
+        &[(VALID, bid(0xAA), 0x1000), (EMPTY, [0; BUILD_ID_SIZE], 0), (VALID, bid(0xCC), 0x3000)],
+        1,
+        "EMPTY status terminates parsing, trailing VALID is not reached"
+    )]
+    #[case::mixed_valid_and_fallback(
+        &[(VALID, bid(0xAA), 0x100), (FALLBACK_IP, [0; BUILD_ID_SIZE], 0xDEAD), (VALID, bid(0xBB), 0x200)],
+        2,
+        "fallback frame dropped, both valid frames stored"
+    )]
+    #[case::all_fallback(
+        &[(FALLBACK_IP, [0; BUILD_ID_SIZE], 0x1), (FALLBACK_IP, [0; BUILD_ID_SIZE], 0x2)],
+        0,
+        "all-fallback trace yields zero user frames"
+    )]
+    #[case::unknown_status_skipped(
+        &[(99, [0; BUILD_ID_SIZE], 0x42), (VALID, bid(0xAA), 0x100)],
+        1,
+        "unknown status code skipped, subsequent valid frame stored"
+    )]
+    fn user_frame_parsing(
+        #[case] raw_frames: &[(i32, [u8; BUILD_ID_SIZE], u64)],
+        #[case] expected_count: usize,
+        #[case] description: &str,
+    ) {
+        let event = make_event(0, raw_frames);
+        let trace = StackTrace::from_event(&event);
+        assert_eq!(trace.user_frames.len(), expected_count, "{description}");
     }
 
     #[test]
-    fn from_event_preserves_frame_addresses() {
-        let event = make_event(3, 2);
+    fn valid_frame_preserves_build_id_and_offset() {
+        let event = make_event(0, &[(VALID, bid(0xAA), 0x1000)]);
+        let trace = StackTrace::from_event(&event);
+        assert_eq!(trace.user_frames[0].build_id, bid(0xAA));
+        assert_eq!(trace.user_frames[0].file_offset, 0x1000);
+    }
+
+    #[test]
+    fn kernel_frames_preserve_addresses() {
+        let event = make_event(3, &[]);
         let trace = StackTrace::from_event(&event);
         assert_eq!(trace.kernel_frames[0], 0xdead_0000);
         assert_eq!(trace.kernel_frames[2], 0xdead_0002);
-        assert_eq!(trace.user_frames[1], 0xbeef_0001);
     }
 
     // -----------------------------------------------------------------------
@@ -124,7 +280,7 @@ mod tests {
     #[case::kernel_negative_only(-2, 0)]
     #[case::user_negative_only(0, -2)]
     fn negative_stack_sz_yields_empty_frames(#[case] kernel_sz: i32, #[case] user_sz: i32) {
-        let mut event = make_event(0, 0);
+        let mut event = make_event(0, &[]);
         event.kernel_stack_sz = kernel_sz;
         event.user_stack_sz = user_sz;
 
@@ -134,33 +290,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hash/Eq contract
+    // Hash/Eq contract — rstest table
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn identical_traces_have_equal_hash() {
+    #[rstest]
+    #[case::same_build_id_same_offset(
+        &[(VALID, bid(0xAA), 0x1000)],
+        &[(VALID, bid(0xAA), 0x1000)],
+        true,
+        "identical frames are equal"
+    )]
+    #[case::different_build_id(
+        &[(VALID, bid(0xAA), 0x1000)],
+        &[(VALID, bid(0xBB), 0x1000)],
+        false,
+        "different build_ids are not equal"
+    )]
+    #[case::different_offset(
+        &[(VALID, bid(0xAA), 0x1000)],
+        &[(VALID, bid(0xAA), 0x2000)],
+        false,
+        "different offsets are not equal"
+    )]
+    fn hash_eq_contract(
+        #[case] frames_a: &[(i32, [u8; BUILD_ID_SIZE], u64)],
+        #[case] frames_b: &[(i32, [u8; BUILD_ID_SIZE], u64)],
+        #[case] expected_equal: bool,
+        #[case] description: &str,
+    ) {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let event = make_event(3, 2);
-        let a = StackTrace::from_event(&event);
-        let b = StackTrace::from_event(&event);
+        let a = StackTrace::from_event(&make_event(1, frames_a));
+        let b = StackTrace::from_event(&make_event(1, frames_b));
 
-        let hash = |t: &StackTrace| {
-            let mut h = DefaultHasher::new();
-            t.hash(&mut h);
-            h.finish()
-        };
+        assert_eq!(a == b, expected_equal, "{description}");
 
-        assert_eq!(a, b);
-        assert_eq!(hash(&a), hash(&b));
-    }
-
-    #[test]
-    fn different_traces_are_not_equal() {
-        let a = StackTrace::from_event(&make_event(3, 2));
-        let b = StackTrace::from_event(&make_event(4, 2));
-        assert_ne!(a, b);
+        if expected_equal {
+            let hash = |t: &StackTrace| {
+                let mut h = DefaultHasher::new();
+                t.hash(&mut h);
+                h.finish()
+            };
+            assert_eq!(hash(&a), hash(&b), "{description}: hash mismatch");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -169,9 +342,40 @@ mod tests {
 
     #[test]
     fn stack_sample_extracts_pid() {
-        let event = make_event(1, 1);
+        let event = make_event(1, &[(VALID, bid(0xFF), 0x42)]);
         let sample = StackSample::from_event(&event);
         assert_eq!(sample.pid, 42);
         assert_eq!(sample.trace.kernel_frames.len(), 1);
+        assert_eq!(sample.trace.user_frames.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // BuildIdStatus enum
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::empty(0, Ok(BuildIdStatus::Empty))]
+    #[case::valid(1, Ok(BuildIdStatus::Valid))]
+    #[case::fallback(2, Ok(BuildIdStatus::FallbackIp))]
+    #[case::unknown_3(3, Err(3))]
+    #[case::unknown_neg(-1, Err(-1))]
+    fn build_id_status_try_from(
+        #[case] raw: i32,
+        #[case] expected: std::result::Result<BuildIdStatus, i32>,
+    ) {
+        assert_eq!(BuildIdStatus::try_from(raw), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Layout sanity — ensure Rust and C agree on UserStackFrame size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn user_stack_frame_size_matches_c() {
+        assert_eq!(
+            std::mem::size_of::<UserStackFrame>(),
+            32,
+            "UserStackFrame must be 32 bytes to match C struct user_stack_frame"
+        );
     }
 }

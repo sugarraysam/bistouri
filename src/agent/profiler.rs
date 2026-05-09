@@ -17,6 +17,7 @@ const DEFAULT_SAMPLING_FREQ_HZ: u64 = 19;
 
 pub(crate) const MAX_STACK_DEPTH: usize = 127;
 pub(crate) const TASK_COMM_LEN: usize = 16;
+pub(crate) const BUILD_ID_SIZE: usize = 20;
 
 const METRIC_STACK_RINGBUF_FULL: &str = "bistouri_profiler_stack_ringbuf_full";
 const METRIC_STACK_FETCH_ERRORS: &str = "bistouri_profiler_stack_fetch_errors";
@@ -24,6 +25,17 @@ const METRIC_TRIGGER_RINGBUF_FULL: &str = "bistouri_profiler_trigger_ringbuf_ful
 const METRIC_TRIGGER_CHANNEL_FULL: &str = "bistouri_profiler_trigger_channel_full";
 const METRIC_STACK_CHANNEL_FULL: &str = "bistouri_profiler_stack_channel_full";
 pub(super) const METRIC_RINGBUF_POLL_ERRORS: &str = "bistouri_profiler_ringbuf_poll_errors";
+const METRIC_USER_FRAMES_FALLBACK: &str = "bistouri_profiler_user_frames_fallback";
+
+/// Mirrors C `struct user_stack_frame` / kernel `struct bpf_stack_build_id`.
+/// Layout: status (4) + build_id (20) + offset_or_ip (8) = 32 bytes per frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UserStackFrame {
+    pub status: i32,
+    pub build_id: [u8; BUILD_ID_SIZE],
+    pub offset_or_ip: u64,
+}
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -33,7 +45,7 @@ pub(crate) struct StackTraceEvent {
     pub kernel_stack_sz: i32,
     pub user_stack_sz: i32,
     pub kernel_stack: [u64; MAX_STACK_DEPTH],
-    pub user_stack: [u64; MAX_STACK_DEPTH],
+    pub user_stack: [UserStackFrame; MAX_STACK_DEPTH],
 }
 
 impl StackTraceEvent {
@@ -410,6 +422,10 @@ impl LoadedProfilerAgent {
         metrics::describe_counter!(
             METRIC_RINGBUF_POLL_ERRORS,
             "Epoll errors on ring buffer fd (unrecoverable, polling stops)"
+        );
+        metrics::describe_counter!(
+            METRIC_USER_FRAMES_FALLBACK,
+            "User stack frames where kernel could not resolve build_id (JIT, vDSO, anonymous)"
         );
     }
 
