@@ -44,8 +44,9 @@ pub(crate) struct CaptureSession {
     resource: PsiResource,
     started_at: Instant,
     traces: Vec<StackTrace>,
-    /// Maps trace content → index in `traces` vec. Uses derived `Hash`+`Eq`
-    /// on `StackTrace` — Rust's HashMap handles hashing internally (SipHash).
+    /// Maps trace content → index in `traces` vec. Uses pre-computed hash:
+    /// `StackTrace` caches its content hash at construction, so HashMap lookups
+    /// cost one `u64` hash instead of re-hashing all frames.
     dedup: HashMap<StackTrace, usize>,
     counts: Vec<u64>,
     total_samples: u64,
@@ -96,13 +97,6 @@ impl CaptureSession {
     /// Consumes the session and produces a `CompletedSession` ready for
     /// downstream delivery.
     pub(crate) fn finalize(self) -> CompletedSession {
-        let profile: HashMap<usize, u64> = self
-            .counts
-            .into_iter()
-            .enumerate()
-            .filter(|(_, count)| *count > 0)
-            .collect();
-
         CompletedSession {
             session_id: self.id,
             resource: self.resource,
@@ -110,7 +104,7 @@ impl CaptureSession {
             comm: self.comm,
             started_at: self.started_at,
             stack_traces: self.traces,
-            profile,
+            counts: self.counts,
             total_samples: self.total_samples,
         }
     }
@@ -137,9 +131,9 @@ pub(crate) struct CompletedSession {
     pub started_at: Instant,
     // TODO: stall_total_usec delta — PSI violation severity.
     pub stack_traces: Vec<StackTrace>,
-    /// Dictionary-encoded profile: stack_traces index → sample count.
+    /// Dictionary-encoded profile: `counts[i]` = sample count for `stack_traces[i]`.
     #[allow(dead_code)] // consumed by symbolizer (TODO)
-    pub profile: HashMap<usize, u64>,
+    pub counts: Vec<u64>,
     pub total_samples: u64,
 }
 
@@ -156,10 +150,7 @@ mod tests {
     }
 
     fn make_trace(kernel: &[u64], user: &[UserFrame]) -> StackTrace {
-        StackTrace {
-            kernel_frames: kernel.to_vec(),
-            user_frames: user.to_vec(),
-        }
+        StackTrace::new(kernel.to_vec(), user.to_vec())
     }
 
     /// Shorthand for a resolved user frame.
@@ -245,8 +236,8 @@ mod tests {
 
         assert_eq!(completed.total_samples, 11);
         assert_eq!(completed.stack_traces.len(), 2);
-        assert_eq!(completed.profile[&0], 10, "hot path count");
-        assert_eq!(completed.profile[&1], 1, "cold path count");
+        assert_eq!(completed.counts[0], 10, "hot path count");
+        assert_eq!(completed.counts[1], 1, "cold path count");
         assert_eq!(completed.pid, 42);
         assert_eq!(completed.comm, "myapp");
         assert_eq!(completed.resource, PsiResource::Io);
@@ -259,7 +250,7 @@ mod tests {
 
         assert_eq!(completed.total_samples, 0);
         assert!(completed.stack_traces.is_empty());
-        assert!(completed.profile.is_empty());
+        assert!(completed.counts.is_empty());
     }
 
     #[test]

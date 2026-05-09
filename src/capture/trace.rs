@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use crate::agent::profiler::{StackTraceEvent, UserStackFrame, BUILD_ID_SIZE};
 use tracing::error;
 
@@ -45,15 +47,57 @@ pub(crate) struct UserFrame {
 /// are dropped — they require /proc/pid/maps de-ASLR which is not yet implemented.
 /// A metric counter tracks their frequency for future prioritization.
 ///
-/// Derives `Hash` and `Eq` so it can be used as a `HashMap` key for
-/// per-session deduplication.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Uses pre-computed hashing: the content hash is computed once during
+/// construction and cached in `cached_hash`. The `Hash` impl feeds only
+/// this `u64`, eliminating repeated ~400-byte hashing on every `HashMap`
+/// lookup during deduplication.
+#[derive(Debug, Clone)]
 pub(crate) struct StackTrace {
+    cached_hash: u64,
     pub kernel_frames: Vec<u64>,
     pub user_frames: Vec<UserFrame>,
 }
 
+impl PartialEq for StackTrace {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast-reject: if pre-computed hashes differ, frames definitely differ.
+        // Avoids the expensive Vec comparison for non-matching traces.
+        self.cached_hash == other.cached_hash
+            && self.kernel_frames == other.kernel_frames
+            && self.user_frames == other.user_frames
+    }
+}
+
+impl Eq for StackTrace {}
+
+impl Hash for StackTrace {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.cached_hash.hash(state);
+    }
+}
+
 impl StackTrace {
+    /// Computes the content hash from frames using the standard hasher.
+    /// Called once during construction — the result is cached for all
+    /// subsequent `HashMap` lookups.
+    fn compute_content_hash(kernel_frames: &[u64], user_frames: &[UserFrame]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        kernel_frames.hash(&mut hasher);
+        user_frames.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Constructs a `StackTrace` from pre-built frame vectors, computing
+    /// the content hash once at construction time.
+    pub(crate) fn new(kernel_frames: Vec<u64>, user_frames: Vec<UserFrame>) -> Self {
+        let cached_hash = Self::compute_content_hash(&kernel_frames, &user_frames);
+        Self {
+            cached_hash,
+            kernel_frames,
+            user_frames,
+        }
+    }
+
     /// Constructs a `StackTrace` from a raw BPF event, trimming fixed-size
     /// arrays to actual depth. Negative `stack_sz` indicates a BPF fetch
     /// failure — treated as an empty stack (not an error here; the BPF error
@@ -79,10 +123,7 @@ impl StackTrace {
             Vec::new()
         };
 
-        Self {
-            kernel_frames,
-            user_frames,
-        }
+        Self::new(kernel_frames, user_frames)
     }
 
     fn parse_user_frames(raw: &[UserStackFrame]) -> Vec<UserFrame> {

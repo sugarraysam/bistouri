@@ -414,13 +414,13 @@ mod tests {
     fn make_sample(pid: u32, trace_id: u64) -> StackSample {
         StackSample {
             pid,
-            trace: StackTrace {
-                kernel_frames: vec![trace_id],
-                user_frames: vec![UserFrame {
+            trace: StackTrace::new(
+                vec![trace_id],
+                vec![UserFrame {
                     build_id: [trace_id as u8; BUILD_ID_SIZE],
                     file_offset: trace_id + 1,
                 }],
-            },
+            ),
         }
     }
 
