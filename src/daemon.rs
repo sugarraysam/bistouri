@@ -3,6 +3,7 @@ use crate::args::Args;
 use crate::capture::orchestrator::{CaptureOrchestrator, STACK_SAMPLE_CHANNEL_SIZE};
 use crate::capture::session::CompletedSession;
 use crate::capture::trace::StackSample;
+use crate::sys;
 use crate::trigger::PreparedTriggerAgent;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -52,6 +53,9 @@ impl BistouriDaemon {
         // the orchestrator exists. All other channels are internal to start().
         let (stack_tx, stack_rx) = mpsc::channel::<StackSample>(STACK_SAMPLE_CHANNEL_SIZE);
 
+        // Phase 0: Collect and validate kernel metadata for symbolization.
+        let kernel_meta = sys::preflight::run_preflight_checks().await?;
+
         // Phase 1: Prepare TriggerAgent (loads config, creates event channel,
         // resolves cgroup2 mount point).
         let prepared =
@@ -59,6 +63,7 @@ impl BistouriDaemon {
 
         // Phase 2: Build ProfilerAgent with trigger + stack sample senders.
         let agent_builder = ProfilerAgentBuilder::new()
+            .with_freq(args.freq)
             .with_trigger_tx(prepared.trigger_tx())
             .with_stack_tx(stack_tx);
         let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
@@ -73,6 +78,7 @@ impl BistouriDaemon {
             args.capture_duration_secs,
             stack_rx,
             cancel.clone(),
+            kernel_meta,
         );
 
         let capture_tx = orch_handle.capture_tx.clone();

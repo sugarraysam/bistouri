@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use uuid::Uuid;
 
 use super::trace::StackTrace;
+use crate::sys::kernel::KernelMeta;
 use crate::trigger::config::PsiResource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +44,7 @@ pub(crate) struct CaptureSession {
     pid: u32,
     comm: String,
     resource: PsiResource,
+    kernel_meta: Arc<KernelMeta>,
     started_at: Instant,
     traces: Vec<StackTrace>,
     /// Maps trace content → index in `traces` vec. Uses pre-computed hash:
@@ -53,12 +56,18 @@ pub(crate) struct CaptureSession {
 }
 
 impl CaptureSession {
-    pub(crate) fn new(pid: u32, comm: String, resource: PsiResource) -> Self {
+    pub(crate) fn new(
+        pid: u32,
+        comm: String,
+        resource: PsiResource,
+        kernel_meta: Arc<KernelMeta>,
+    ) -> Self {
         Self {
             id: SessionId::new(),
             pid,
             comm,
             resource,
+            kernel_meta,
             started_at: Instant::now(),
             traces: Vec::new(),
             dedup: HashMap::new(),
@@ -102,6 +111,7 @@ impl CaptureSession {
             resource: self.resource,
             pid: self.pid,
             comm: self.comm,
+            kernel_meta: self.kernel_meta,
             started_at: self.started_at,
             stack_traces: self.traces,
             counts: self.counts,
@@ -127,6 +137,10 @@ pub(crate) struct CompletedSession {
     /// Stable, human-readable process identifier. Unlike PID, meaningful
     /// across hosts running the same binary.
     pub comm: String,
+    /// Host kernel metadata for kernel stack symbolization.
+    /// Shared across all sessions on this host (Arc = pointer bump).
+    #[allow(dead_code)] // consumed by symbolizer (TODO)
+    pub kernel_meta: Arc<KernelMeta>,
     #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub started_at: Instant,
     // TODO: stall_total_usec delta — PSI violation severity.
@@ -143,6 +157,14 @@ mod tests {
     use crate::agent::profiler::BUILD_ID_SIZE;
     use crate::capture::trace::UserFrame;
     use rstest::rstest;
+
+    fn mock_kernel_meta() -> Arc<KernelMeta> {
+        Arc::new(KernelMeta {
+            build_id: [0xAA; 20],
+            kaslr_offset: 0xffffffff81000000,
+            release: "6.8.0-test".into(),
+        })
+    }
 
     /// Convenience: build_id filled with a single repeated byte.
     fn bid(byte: u8) -> [u8; BUILD_ID_SIZE] {
@@ -202,7 +224,8 @@ mod tests {
         #[case] expected_total: u64,
         #[case] description: &str,
     ) {
-        let mut session = CaptureSession::new(42, "test".into(), PsiResource::Memory);
+        let mut session =
+            CaptureSession::new(42, "test".into(), PsiResource::Memory, mock_kernel_meta());
         for trace in traces {
             session.record(trace);
         }
@@ -223,7 +246,8 @@ mod tests {
 
     #[test]
     fn finalize_produces_correct_profile() {
-        let mut session = CaptureSession::new(42, "myapp".into(), PsiResource::Io);
+        let mut session =
+            CaptureSession::new(42, "myapp".into(), PsiResource::Io, mock_kernel_meta());
         let hot_path = make_trace(&[0xA], &[frame(0x01, 0xB)]);
         let cold_path = make_trace(&[0xC], &[frame(0x02, 0xD)]);
 
@@ -245,7 +269,8 @@ mod tests {
 
     #[test]
     fn empty_session_finalizes_cleanly() {
-        let session = CaptureSession::new(1, "idle".into(), PsiResource::Memory);
+        let session =
+            CaptureSession::new(1, "idle".into(), PsiResource::Memory, mock_kernel_meta());
         let completed = session.finalize();
 
         assert_eq!(completed.total_samples, 0);

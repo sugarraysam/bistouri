@@ -63,6 +63,8 @@ struct err_reserve_trigger_ringbuf {
 
 struct error_event {
     __u32 kind;
+    __u32 _pad;             // explicit padding for u64 alignment
+    __u64 timestamp_ns;     // bpf_ktime_get_ns() — nanoseconds since boot
     union {
         struct err_reserve_stack_ringbuf stack_reserve_err;
         struct err_stack_fetch stack_fetch_err;

@@ -76,6 +76,17 @@ pub(crate) struct Args {
     /// Prometheus will scrape this endpoint for operational metrics.
     #[arg(long, env = "BISTOURI_METRICS_PORT", default_value_t = 9464)]
     pub metrics_port: u16,
+
+    /// Sampling frequency in Hz for the perf event profiler.
+    ///
+    /// Uses a prime number (default 19) to avoid aliasing with periodic
+    /// workloads that run at power-of-two frequencies. Higher values
+    /// increase CPU overhead linearly — each sample invokes bpf_get_stack()
+    /// with VMA walks for build_id resolution.
+    ///
+    /// Must be a prime number between 2 and 1009 (inclusive).
+    #[arg(long, env = "BISTOURI_FREQ", default_value_t = 19, value_parser = parse_prime_freq)]
+    pub freq: u64,
 }
 
 // Define your custom color palette
@@ -108,4 +119,79 @@ fn my_styles() -> Styles {
                 .bold()
                 .fg_color(Some(Color::Ansi(AnsiColor::Yellow))),
         )
+}
+
+fn parse_prime_freq(s: &str) -> std::result::Result<u64, String> {
+    let n: u64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !(2..=1009).contains(&n) {
+        return Err("frequency must be between 2 and 1009 Hz".into());
+    }
+    if !is_prime(n) {
+        return Err(format!(
+            "{n} is not prime — use a prime frequency to avoid aliasing \
+             with periodic workloads (e.g. 19, 47, 97, 199, 499, 997)"
+        ));
+    }
+    Ok(n)
+}
+
+fn is_prime(n: u64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n < 4 {
+        return true;
+    }
+    if n.is_multiple_of(2) || n.is_multiple_of(3) {
+        return false;
+    }
+    let mut i = 5;
+    while i * i <= n {
+        if n.is_multiple_of(i) || n.is_multiple_of(i + 2) {
+            return false;
+        }
+        i += 6;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::zero(0, false)]
+    #[case::one(1, false)]
+    #[case::two(2, true)]
+    #[case::three(3, true)]
+    #[case::four(4, false)]
+    #[case::five(5, true)]
+    #[case::six(6, false)]
+    #[case::nineteen(19, true)]
+    #[case::twenty(20, false)]
+    #[case::ninety_seven(97, true)]
+    #[case::hundred(100, false)]
+    #[case::nine_ninety_seven(997, true)]
+    #[case::thousand_nine(1009, true)]
+    fn is_prime_cases(#[case] n: u64, #[case] expected: bool) {
+        assert_eq!(is_prime(n), expected, "is_prime({n})");
+    }
+
+    #[rstest]
+    #[case::valid_default("19", true)]
+    #[case::valid_large_prime("997", true)]
+    #[case::zero("0", false)]
+    #[case::one("1", false)]
+    #[case::composite("20", false)]
+    #[case::too_large("1013", false)]
+    #[case::not_a_number("abc", false)]
+    fn parse_prime_freq_cases(#[case] input: &str, #[case] should_succeed: bool) {
+        let result = parse_prime_freq(input);
+        assert_eq!(
+            result.is_ok(),
+            should_succeed,
+            "parse_prime_freq({input:?})"
+        );
+    }
 }

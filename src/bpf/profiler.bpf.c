@@ -52,6 +52,7 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_RESERVE_STACK_RINGBUF;
+            err->timestamp_ns = bpf_ktime_get_ns();
             err->data.stack_reserve_err.pid = pid;
             bpf_ringbuf_submit(err, 0);
         }
@@ -66,6 +67,7 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_STACK_FETCH;
+            err->timestamp_ns = bpf_ktime_get_ns();
             err->data.stack_fetch_err.pid = pid;
             err->data.stack_fetch_err.ret_code = event->kernel_stack_sz;
             err->data.stack_fetch_err.space = SPACE_KERNEL;
@@ -79,6 +81,7 @@ int handle_perf(void *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_STACK_FETCH;
+            err->timestamp_ns = bpf_ktime_get_ns();
             err->data.stack_fetch_err.pid = pid;
             err->data.stack_fetch_err.ret_code = event->user_stack_sz;
             err->data.stack_fetch_err.space = SPACE_USER;
@@ -113,6 +116,7 @@ int match_comm_on_exec(struct trace_event_raw_sched_process_exec *ctx)
         struct error_event *err = bpf_ringbuf_reserve(&errors, sizeof(*err), 0);
         if (err) {
             err->kind = ERR_RESERVE_TRIGGER_RINGBUF;
+            err->timestamp_ns = bpf_ktime_get_ns();
             err->data.trigger_reserve_err.rule_id = *rule_id_ptr;
             err->data.trigger_reserve_err.pid = pid;
             bpf_ringbuf_submit(err, 0);

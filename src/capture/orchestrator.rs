@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -11,6 +12,7 @@ use super::error::Result;
 use super::pid_filter::BpfPidFilter;
 use super::session::{CaptureRequest, CaptureSession, CompletedSession, SessionId};
 use super::trace::StackSample;
+use crate::sys::kernel::KernelMeta;
 use crate::trigger::config::PsiResource;
 
 const METRIC_SESSIONS_STARTED: &str = "bistouri_capture_sessions_started";
@@ -84,6 +86,7 @@ pub(crate) struct CaptureOrchestrator<F: PidFilter> {
     pid_filter: F,
     capture_duration: Duration,
     cancel: CancellationToken,
+    kernel_meta: Arc<KernelMeta>,
 
     sessions: HashMap<SessionId, CaptureSession>,
     /// Reverse index: pid → active session IDs monitoring that pid.
@@ -107,6 +110,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         pid_filter: F,
         capture_duration: Duration,
         cancel: CancellationToken,
+        kernel_meta: Arc<KernelMeta>,
     ) -> Self {
         describe_metrics();
         Self {
@@ -116,6 +120,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             pid_filter,
             capture_duration,
             cancel,
+            kernel_meta,
             sessions: HashMap::new(),
             pid_sessions: HashMap::new(),
             inflight_guard: HashSet::new(),
@@ -182,7 +187,12 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         let resource_label = request.resource.to_string();
         let comm_label = request.comm.clone();
 
-        let session = CaptureSession::new(request.pid, request.comm, request.resource);
+        let session = CaptureSession::new(
+            request.pid,
+            request.comm,
+            request.resource,
+            self.kernel_meta.clone(),
+        );
         let session_id = session.id();
 
         self.inflight_guard.insert(guard_key);
@@ -352,6 +362,7 @@ impl CaptureOrchestrator<BpfPidFilter> {
         capture_duration_secs: u64,
         stack_rx: mpsc::Receiver<StackSample>,
         cancel: CancellationToken,
+        kernel_meta: Arc<KernelMeta>,
     ) -> CaptureOrchestratorHandle {
         let pid_filter = BpfPidFilter::new(pid_filter_handle);
         let capture_duration = Duration::from_secs(capture_duration_secs);
@@ -366,6 +377,7 @@ impl CaptureOrchestrator<BpfPidFilter> {
             pid_filter,
             capture_duration,
             cancel,
+            kernel_meta,
         );
         let task_handle = tokio::spawn(async move { orch.run().await });
 
@@ -432,6 +444,14 @@ mod tests {
         }
     }
 
+    fn mock_kernel_meta() -> Arc<KernelMeta> {
+        Arc::new(KernelMeta {
+            build_id: [0xAA; 20],
+            kaslr_offset: 0xffffffff81000000,
+            release: "6.8.0-test".into(),
+        })
+    }
+
     fn setup(
         capture_duration: Duration,
     ) -> (
@@ -451,6 +471,7 @@ mod tests {
             MockPidFilter::new(),
             capture_duration,
             CancellationToken::new(),
+            mock_kernel_meta(),
         );
 
         (orch, req_tx, stack_tx, session_rx)

@@ -7,7 +7,7 @@ use perf_event::{events::Software, Builder, Counter};
 use std::os::fd::AsRawFd;
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::error;
 
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/profiler.skel.rs"));
@@ -26,6 +26,14 @@ const METRIC_TRIGGER_CHANNEL_FULL: &str = "bistouri_profiler_trigger_channel_ful
 const METRIC_STACK_CHANNEL_FULL: &str = "bistouri_profiler_stack_channel_full";
 pub(super) const METRIC_RINGBUF_POLL_ERRORS: &str = "bistouri_profiler_ringbuf_poll_errors";
 const METRIC_USER_FRAMES_FALLBACK: &str = "bistouri_profiler_user_frames_fallback";
+
+/// Mirrors `max_entries` from `stack_events` map in profiler.bpf.c.
+/// Update both if the ring buffer size changes.
+const STACK_RINGBUF_SIZE_MB: usize = 64;
+
+/// Mirrors `max_entries` from `trigger_events` map in profiler.bpf.c.
+/// Update both if the ring buffer size changes.
+const TRIGGER_RINGBUF_SIZE_KB: usize = 256;
 
 /// Mirrors C `struct user_stack_frame` / kernel `struct bpf_stack_build_id`.
 /// Layout: status (4) + build_id (20) + offset_or_ip (8) = 32 bytes per frame.
@@ -143,21 +151,28 @@ union ErrorData {
 #[repr(C)]
 struct ErrorEvent {
     kind: u32,
+    _pad: u32,
+    timestamp_ns: u64,
     data: ErrorData,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum ProfilerError {
     #[error("Failed to reserve stack ringbuffer for pid: {pid}")]
-    ReserveStackRingbuf { pid: u32 },
+    ReserveStackRingbuf { pid: u32, timestamp_ns: u64 },
     #[error("Failed to fetch {space} stack for pid: {pid}. Code: {ret_code}")]
     StackFetch {
         pid: u32,
         ret_code: i32,
         space: SpaceKind,
+        timestamp_ns: u64,
     },
     #[error("Failed to reserve trigger ringbuffer for rule: {rule_id}, pid: {pid}")]
-    ReserveTriggerRingbuf { rule_id: u32, pid: u32 },
+    ReserveTriggerRingbuf {
+        rule_id: u32,
+        pid: u32,
+        timestamp_ns: u64,
+    },
     #[error("Unknown error kind: {0}")]
     Unknown(u32),
 }
@@ -166,11 +181,15 @@ impl ProfilerError {
     fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() == std::mem::size_of::<ErrorEvent>() {
             let event = unsafe { &*data.as_ptr().cast::<ErrorEvent>() };
+            let ts = event.timestamp_ns;
             match event.kind {
                 1 => {
                     // SAFETY: We verify the tag `kind == 1` before accessing the union field.
                     let reserve = unsafe { event.data.stack_reserve_err };
-                    Some(ProfilerError::ReserveStackRingbuf { pid: reserve.pid })
+                    Some(ProfilerError::ReserveStackRingbuf {
+                        pid: reserve.pid,
+                        timestamp_ns: ts,
+                    })
                 }
                 2 => {
                     // SAFETY: We verify the tag `kind == 2` before accessing the union field.
@@ -179,6 +198,7 @@ impl ProfilerError {
                         pid: fetch.pid,
                         ret_code: fetch.ret_code,
                         space: fetch.space,
+                        timestamp_ns: ts,
                     })
                 }
                 3 => {
@@ -187,6 +207,7 @@ impl ProfilerError {
                     Some(ProfilerError::ReserveTriggerRingbuf {
                         rule_id: trigger.rule_id,
                         pid: trigger.pid,
+                        timestamp_ns: ts,
                     })
                 }
                 k => Some(ProfilerError::Unknown(k)),
@@ -196,21 +217,77 @@ impl ProfilerError {
         }
     }
 
-    /// Increments the appropriate Prometheus counter for this error kind.
+    /// Logs the error at `error!` level with actionable operator guidance
+    /// and increments the appropriate Prometheus counter.
+    ///
     /// BPF errors are never fatal — they indicate transient kernel-side
-    /// resource contention. Operators monitor these via Prometheus alerts.
-    fn record_metric(&self) {
+    /// resource contention. Operators monitor via logs and Prometheus alerts.
+    fn log_and_record(&self) {
         match self {
-            ProfilerError::ReserveStackRingbuf { .. } => {
+            ProfilerError::ReserveStackRingbuf { pid, timestamp_ns } => {
+                error!(
+                    pid = pid,
+                    at_ns = timestamp_ns,
+                    "BPF stack ring buffer full — samples for pid {} are being \
+                     dropped. Increase stack_events ring buffer size (currently \
+                     {}MB) or reduce the number of concurrently monitored PIDs.",
+                    pid,
+                    STACK_RINGBUF_SIZE_MB,
+                );
                 metrics::counter!(METRIC_STACK_RINGBUF_FULL).increment(1);
             }
-            ProfilerError::StackFetch { .. } => {
+            ProfilerError::StackFetch {
+                pid,
+                ret_code,
+                space,
+                timestamp_ns,
+            } => {
+                error!(
+                    pid = pid,
+                    ret_code = ret_code,
+                    space = %space,
+                    at_ns = timestamp_ns,
+                    "BPF bpf_get_stack() failed for {} stack — the target process \
+                     likely exited during sampling. Return code {} indicates: {}.",
+                    space,
+                    ret_code,
+                    Self::decode_stack_error(*ret_code),
+                );
                 metrics::counter!(METRIC_STACK_FETCH_ERRORS).increment(1);
             }
-            ProfilerError::ReserveTriggerRingbuf { .. } => {
+            ProfilerError::ReserveTriggerRingbuf {
+                rule_id,
+                pid,
+                timestamp_ns,
+            } => {
+                error!(
+                    rule_id = rule_id,
+                    pid = pid,
+                    at_ns = timestamp_ns,
+                    "BPF trigger ring buffer full — process match event for \
+                     rule {} pid {} was dropped. Increase trigger_events ring \
+                     buffer size (currently {}KB) if this persists.",
+                    rule_id,
+                    pid,
+                    TRIGGER_RINGBUF_SIZE_KB,
+                );
                 metrics::counter!(METRIC_TRIGGER_RINGBUF_FULL).increment(1);
             }
-            ProfilerError::Unknown(_) => {}
+            ProfilerError::Unknown(kind) => {
+                error!(
+                    kind = kind,
+                    "Unknown BPF error kind — agent/BPF version mismatch?",
+                );
+            }
+        }
+    }
+
+    fn decode_stack_error(code: i32) -> &'static str {
+        match code {
+            -14 => "EFAULT (bad address — process memory unmapped)",
+            -12 => "ENOMEM (insufficient buffer space)",
+            -22 => "EINVAL (invalid arguments to bpf_get_stack)",
+            _ => "unknown error code",
         }
     }
 }
@@ -328,12 +405,7 @@ impl LoadedProfilerAgent {
         builder
             .add(&self.skel.maps.errors, |data| {
                 if let Some(err) = ProfilerError::from_bytes(data) {
-                    // BPF errors are never fatal — they indicate transient
-                    // kernel-side resource contention (ring buffer full, stack
-                    // fetch failure). We increment Prometheus counters for
-                    // operators to alert on externally and log at debug level.
-                    debug!(error = %err, "BPF error event");
-                    err.record_metric();
+                    err.log_and_record();
                 }
                 0
             })
@@ -486,6 +558,11 @@ impl Default for ProfilerAgentBuilder {
 impl ProfilerAgentBuilder {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_freq(mut self, freq: u64) -> Self {
+        self.freq = freq;
+        self
     }
 
     pub(crate) fn with_trigger_tx(mut self, tx: Sender<ProcessMatchEvent>) -> Self {
