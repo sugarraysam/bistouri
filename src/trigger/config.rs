@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -91,7 +91,15 @@ impl TriggerConfig {
         })
         .await
         {
-            Ok(Ok(config)) => Arc::new(config),
+            Ok(Ok(config)) => {
+                let comms: Vec<&str> = config.targets.iter().map(|t| t.rule.comm()).collect();
+                info!(
+                    target_count = config.targets.len(),
+                    ?comms,
+                    "loaded trigger config",
+                );
+                Arc::new(config)
+            }
             Ok(Err(e)) => {
                 warn!(error = %e, "failed to load config, using default");
                 Arc::new(Self::default_config())

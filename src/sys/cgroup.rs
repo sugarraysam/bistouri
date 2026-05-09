@@ -2,11 +2,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Discovers the cgroup2 mount point by parsing `/proc/mounts`.
+/// Discovers the cgroup2 mount point by parsing `<host_proc>/mounts`.
 /// Called once at startup — the mount point is stable for the lifetime
 /// of the process.
-pub(crate) fn find_cgroup2_mount() -> io::Result<PathBuf> {
-    let mounts = fs::read_to_string("/proc/mounts")?;
+///
+/// `host_proc` should point to the host's procfs mount (e.g. `/host/proc`
+/// in container deployments, or `/proc` on baremetal).
+pub(crate) fn find_cgroup2_mount(host_proc: &Path) -> io::Result<PathBuf> {
+    let mounts_path = host_proc.join("mounts");
+    let mounts = fs::read_to_string(&mounts_path)?;
     for line in mounts.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3 && parts[2] == "cgroup2" {
@@ -20,26 +24,35 @@ pub(crate) fn find_cgroup2_mount() -> io::Result<PathBuf> {
 }
 
 /// Resolves the cgroup filesystem path for a given PID by reading
-/// `/proc/<pid>/cgroup`. This is an inline read (~10-50µs) suitable
-/// for the async event loop — procfs is a kernel virtual filesystem
-/// backed by in-memory data structures, not disk I/O.
+/// `<host_proc>/<pid>/cgroup`.
+///
+/// Reading from the host's procfs mount (rather than the container's
+/// `/proc`) eliminates cgroup namespace escapes — the kernel returns
+/// absolute paths from the host's perspective. This makes resolution
+/// a simple O(1) string join.
 ///
 /// Returns the full path under the cgroup2 mount (e.g.
 /// `/sys/fs/cgroup/kubepods.slice/…/cri-containerd-abc123.scope`).
-pub(crate) fn resolve_cgroup_path(mount_point: &Path, pid: u32) -> io::Result<PathBuf> {
-    let cgroup_file = format!("/proc/{}/cgroup", pid);
+pub(crate) fn resolve_cgroup_path(
+    cgroup_mount: &Path,
+    host_proc: &Path,
+    pid: u32,
+) -> io::Result<PathBuf> {
+    let cgroup_file = host_proc.join(format!("{}/cgroup", pid));
     let contents = fs::read_to_string(&cgroup_file)?;
 
     for line in contents.lines() {
         if let Some(rel_path) = line.strip_prefix("0::") {
-            let rel_path = rel_path.trim_start_matches('/');
-            return Ok(mount_point.join(rel_path));
+            let candidate = cgroup_mount.join(rel_path.trim_start_matches('/'));
+            if candidate.is_dir() {
+                return Ok(candidate);
+            }
         }
     }
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        format!("no cgroup2 entry found in {}", cgroup_file),
+        format!("no cgroup2 entry found in {}", cgroup_file.display()),
     ))
 }
 

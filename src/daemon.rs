@@ -54,7 +54,8 @@ impl BistouriDaemon {
 
         // Phase 1: Prepare TriggerAgent (loads config, creates event channel,
         // resolves cgroup2 mount point).
-        let prepared = PreparedTriggerAgent::prepare(args.config).await?;
+        let prepared =
+            PreparedTriggerAgent::prepare(args.config, args.host_proc, args.host_cgroup).await?;
 
         // Phase 2: Build ProfilerAgent with trigger + stack sample senders.
         let agent_builder = ProfilerAgentBuilder::new()

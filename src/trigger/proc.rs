@@ -12,19 +12,21 @@ use tracing::debug;
 pub(crate) struct ProcWalker {
     matcher: CommMatcher,
     cgroup2_mount: Box<Path>,
+    host_proc: Box<Path>,
 }
 
 impl ProcWalker {
-    pub(crate) fn new(config: &TriggerConfig, cgroup2_mount: &Path) -> Self {
+    pub(crate) fn new(config: &TriggerConfig, cgroup2_mount: &Path, host_proc: &Path) -> Self {
         Self {
             matcher: CommMatcher::new(config),
             cgroup2_mount: cgroup2_mount.into(),
+            host_proc: host_proc.into(),
         }
     }
 
     /// Walks all processes and sends matching events. Checks cancellation between PIDs.
     pub(crate) fn walk(&self, tx: &mpsc::Sender<ProcessMatchEvent>, cancel: &CancellationToken) {
-        let pids = Self::pids();
+        let pids = self.pids();
         debug!(pid_count = pids.len(), "proc_walk started");
 
         for pid in pids {
@@ -32,7 +34,7 @@ impl ProcWalker {
                 return;
             }
 
-            let Some(comm) = Self::comm(pid) else {
+            let Some(comm) = self.comm(pid) else {
                 continue;
             };
 
@@ -41,7 +43,7 @@ impl ProcWalker {
                 continue;
             }
 
-            let cgroup_path = match resolve_cgroup_path(&self.cgroup2_mount, pid) {
+            let cgroup_path = match resolve_cgroup_path(&self.cgroup2_mount, &self.host_proc, pid) {
                 Ok(path) => path,
                 Err(e) => {
                     // Non-fatal: process likely exited between /proc scan and
@@ -75,8 +77,8 @@ impl ProcWalker {
         debug!("proc_walk completed");
     }
 
-    fn pids() -> Vec<u32> {
-        let Ok(entries) = fs::read_dir("/proc") else {
+    fn pids(&self) -> Vec<u32> {
+        let Ok(entries) = fs::read_dir(&self.host_proc) else {
             return Vec::new();
         };
         entries
@@ -85,8 +87,8 @@ impl ProcWalker {
             .collect()
     }
 
-    fn comm(pid: u32) -> Option<String> {
-        fs::read_to_string(format!("/proc/{}/comm", pid))
+    fn comm(&self, pid: u32) -> Option<String> {
+        fs::read_to_string(self.host_proc.join(format!("{}/comm", pid)))
             .ok()
             .map(|s| s.trim_end().to_string())
     }

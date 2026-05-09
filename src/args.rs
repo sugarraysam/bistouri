@@ -19,6 +19,27 @@ pub(crate) struct Args {
     #[arg(short, long, env = "BISTOURI_CONFIG", default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
+    /// Path to the host's procfs mount.
+    ///
+    /// Container deployments should mount the host's /proc to a path like
+    /// /host/proc and set this flag. Eliminates cgroup namespace escapes
+    /// (../ components) that occur when reading /proc/<pid>/cgroup from
+    /// inside a container's cgroup namespace.
+    ///
+    /// When running directly on the host, the default /proc works as-is.
+    #[arg(long, env = "BISTOURI_HOST_PROC", default_value = "/proc")]
+    pub host_proc: PathBuf,
+
+    /// Path to the host's cgroup2 filesystem mount.
+    ///
+    /// Container deployments should mount the host's /sys/fs/cgroup to a
+    /// path like /host/sys/fs/cgroup and set this flag. When set, skips
+    /// mount-table auto-detection and uses this path directly.
+    ///
+    /// When omitted, auto-detected from <host_proc>/mounts.
+    #[arg(long, env = "BISTOURI_HOST_CGROUP")]
+    pub host_cgroup: Option<PathBuf>,
+
     /// Number of async IO worker threads for the tokio runtime.
     ///
     /// Controls how many threads service the async event loop (PSI watchers,

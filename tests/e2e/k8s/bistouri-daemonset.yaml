@@ -27,6 +27,8 @@ spec:
         args:
         - "--config"
         - "/etc/bistouri/trigger.yaml"
+        - "--host-proc"
+        - "/host/proc"
         - "--log-level"
         - "bistouri=debug"
         ports:
@@ -48,6 +50,11 @@ spec:
           seccompProfile:
             type: Unconfined
         volumeMounts:
+        # Host procfs — read from the host's perspective to eliminate
+        # cgroup namespace escapes (../ components in /proc/<pid>/cgroup).
+        - name: host-proc
+          mountPath: /host/proc
+          readOnly: true
         # Tracing filesystem — read-only, used by BPF tracepoint attachment.
         - name: sys-kernel-tracing
           mountPath: /sys/kernel/tracing
@@ -63,6 +70,9 @@ spec:
         - name: config
           mountPath: /etc/bistouri
       volumes:
+      - name: host-proc
+        hostPath:
+          path: /proc
       - name: sys-kernel-tracing
         hostPath:
           path: /sys/kernel/tracing

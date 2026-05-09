@@ -1,22 +1,39 @@
 /*
- * mem-hog: lightweight memory-bound workload for PSI integration tests.
+ * mem-hog: memory-bound workload for PSI integration tests.
  *
- * Allocates a 16 MB chunk, touches every page (forces physical allocation),
- * then frees it — in a loop. With a tight Kubernetes memory limit (32Mi),
- * the kernel aggressively reclaims pages, which it records as
+ * Allocates anonymous memory pages via mmap until near the cgroup limit,
+ * holds them all simultaneously, then releases them and repeats. This
+ * forces the kernel into page reclaim on every cycle, generating
  * memory.pressure.
+ *
+ * With a 64Mi cgroup limit, allocating ~56 MB in 1 MB chunks creates
+ * sustained memory pressure without triggering the OOM killer.
  */
-#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+
+#define CHUNK_SIZE (1024 * 1024)  /* 1 MB per chunk */
+#define MAX_CHUNKS 56             /* ~56 MB total, within 64Mi limit */
 
 int main(void) {
-    const size_t chunk = 16 * 1024 * 1024; /* 16 MB */
+    void *chunks[MAX_CHUNKS];
+
     for (;;) {
-        char *p = malloc(chunk);
-        if (!p)
-            continue;
-        memset(p, 0xAA, chunk);
-        free(p);
+        int n = 0;
+        /* Allocate chunks until limit or failure. */
+        for (; n < MAX_CHUNKS; n++) {
+            void *p = mmap(NULL, CHUNK_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+            if (p == MAP_FAILED)
+                break;
+            /* Touch every page to force physical allocation. */
+            memset(p, 0xAA, CHUNK_SIZE);
+            chunks[n] = p;
+        }
+        /* Release all at once — forces kernel page reclaim. */
+        for (int i = 0; i < n; i++) {
+            munmap(chunks[i], CHUNK_SIZE);
+        }
     }
     return 0;
 }

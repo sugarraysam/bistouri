@@ -60,10 +60,11 @@ docker-run:
 		--cap-add=SYS_RESOURCE  `# Create PSI trigger FDs with sub-2s windows` \
 		--security-opt seccomp=unconfined `# Allow bpf() and perf_event_open() syscalls` \
 		--pid=host              `# Access /proc for all host processes` \
+		-v /proc:/host/proc:ro            `# Host procfs for cgroup namespace resolution` \
 		-v /sys/kernel/tracing:/sys/kernel/tracing:ro `# BPF tracepoint attachment` \
 		-v /sys/fs/bpf:/sys/fs/bpf                    `# BPF map pinning` \
 		-v /sys/fs/cgroup:/sys/fs/cgroup               `# Cgroup info + PSI trigger FD writes` \
-		bistouri-agent:latest
+		bistouri-agent:latest --host-proc /host/proc
 
 # Run E2E integration tests in a Kind cluster
 integration-tests:

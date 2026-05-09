@@ -58,8 +58,8 @@ spec:
 
 ---
 # ── mem-hog ────────────────────────────────────────────────────────
-# Tight memory limit (32Mi) forces the kernel to aggressively reclaim
-# pages as the workload continuously allocates and touches 16MB chunks,
+# Tight memory limit (64Mi) forces the kernel to aggressively reclaim
+# pages as the workload continuously allocates ~56 MB via mmap,
 # generating memory.pressure.
 apiVersion: v1
 kind: Pod
@@ -78,7 +78,7 @@ spec:
     resources:
       requests:
         cpu: "500m"
-        memory: "32Mi"
+        memory: "64Mi"
       limits:
         cpu: "500m"
-        memory: "32Mi"
+        memory: "64Mi"
