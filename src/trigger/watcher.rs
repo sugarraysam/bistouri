@@ -29,11 +29,11 @@ pub(crate) async fn config_watcher_task(
         .watches()
         .add(
             &parent_dir,
-            WatchMask::CREATE
-                | WatchMask::MOVED_TO
-                | WatchMask::CLOSE_WRITE
-                | WatchMask::DELETE
-                | WatchMask::MODIFY,
+            // k8s ConfigMap reload moves
+            WatchMask::MOVED_TO
+            // Support standard file edits
+            | WatchMask::CLOSE_WRITE
+            | WatchMask::MODIFY,
         )
         .map_err(TriggerError::ConfigWatcher)?;
 
@@ -76,8 +76,15 @@ pub(crate) async fn config_watcher_task(
                 // When the directory activity settles, check our target file
                 let current_hash = content_hash(&config_path);
 
+                if current_hash == 0 {
+                    debug!("config watcher: read failed (likely mid-swap), re-arming debounce");
+                    sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS));
+                    debounce_active = true;
+                    continue; // Skip the rest of the block
+                }
+
                 // Ignore hash of 0 (file missing during hard swap) or unchanged hash (metadata noise)
-                if current_hash != last_hash && current_hash != 0 {
+                if current_hash != last_hash {
                     debug!("config watcher: file content change verified");
                     last_hash = current_hash;
                     trigger_reload(&config_path, &control_tx).await;
