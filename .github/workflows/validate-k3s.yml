@@ -39,7 +39,8 @@ jobs:
           --write-kubeconfig-mode=644 \
           > /tmp/k3s.log 2>&1 &
 
-        echo "Waiting for k3s to be ready..."
+        # Phase 1: Wait for the API server to accept connections.
+        echo "Waiting for k3s API server..."
         for i in $(seq 1 30); do
           if sudo k3s kubectl get node > /dev/null 2>&1; then
             echo "k3s API server responding after ~$((i * 2))s"
@@ -48,7 +49,19 @@ jobs:
           sleep 2
         done
 
-        # Wait for node Ready
+        # Phase 2: Wait for the kubelet to register the node.
+        # `kubectl wait --all` returns "no matching resources found" when
+        # zero nodes exist, so we must poll for node existence first.
+        echo "Waiting for node to register..."
+        for i in $(seq 1 30); do
+          if sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -q .; then
+            echo "Node registered after ~$((i * 2))s"
+            break
+          fi
+          sleep 2
+        done
+
+        # Phase 3: Wait for the node to become Ready.
         sudo k3s kubectl wait --for=condition=Ready node --all --timeout=60s
         sudo k3s kubectl get nodes -o wide
 
