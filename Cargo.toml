@@ -31,3 +31,9 @@ vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "5c36ac2080a8
 
 [dev-dependencies]
 rstest = "0.26"
+reqwest = "0.13"
+prometheus-parse = "0.2"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"

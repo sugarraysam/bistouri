@@ -107,27 +107,27 @@ pub(crate) struct PreparedTriggerAgent {
     event_tx: mpsc::Sender<ProcessMatchEvent>,
     event_rx: Option<mpsc::Receiver<ProcessMatchEvent>>,
     cgroup2_mount: PathBuf,
-    host_proc: PathBuf,
+    proc_path: PathBuf,
 }
 
 impl PreparedTriggerAgent {
     /// Phase 1: Load config, create channel, resolve cgroup2 mount. No BPF dependency yet.
     ///
-    /// `host_proc` should point to the host's procfs mount (e.g. `/host/proc`
-    /// in container deployments). `host_cgroup` overrides auto-detection from
-    /// the mount table when set.
+    /// `proc_path` should point to procfs (e.g. `/host/proc` in container
+    /// deployments). `cgroup_path` overrides auto-detection from the mount
+    /// table when set.
     pub(crate) async fn prepare(
         config_path: PathBuf,
-        host_proc: PathBuf,
-        host_cgroup: Option<PathBuf>,
+        proc_path: PathBuf,
+        cgroup_path: Option<PathBuf>,
     ) -> Result<Self> {
         describe_metrics();
         let config = TriggerConfig::load_or_default(&config_path).await;
         let (event_tx, event_rx) = mpsc::channel::<ProcessMatchEvent>(TRIGGER_CHANNEL_SIZE);
 
-        let cgroup2_mount = match host_cgroup {
+        let cgroup2_mount = match cgroup_path {
             Some(path) => path,
-            None => find_cgroup2_mount(&host_proc).map_err(|e| {
+            None => find_cgroup2_mount(&proc_path).map_err(|e| {
                 error!(
                     error = %e,
                 "cgroup2 is not mounted — bistouri requires cgroup2 for PSI triggers. \
@@ -138,9 +138,9 @@ impl PreparedTriggerAgent {
         };
 
         info!(
-            host_proc = %host_proc.display(),
+            proc_path = %proc_path.display(),
             cgroup2_mount = %cgroup2_mount.display(),
-            "resolved host filesystem paths",
+            "resolved filesystem paths",
         );
 
         Ok(Self {
@@ -149,7 +149,7 @@ impl PreparedTriggerAgent {
             event_tx,
             event_rx: Some(event_rx),
             cgroup2_mount,
-            host_proc,
+            proc_path,
         })
     }
 
@@ -179,7 +179,7 @@ impl PreparedTriggerAgent {
         let proc_handle = TriggerAgent::spawn_proc_walk(
             &self.config,
             &self.cgroup2_mount,
-            &self.host_proc,
+            &self.proc_path,
             self.event_tx.clone(),
             proc_walk_cancel.clone(),
         );
@@ -201,7 +201,7 @@ impl PreparedTriggerAgent {
             matcher,
             bpf_trie,
             cgroup2_mount: self.cgroup2_mount,
-            host_proc: self.host_proc,
+            proc_path: self.proc_path,
             psi_registry: PsiRegistry::new(capture_tx),
             proc_handle: Some(proc_handle),
             watcher_handle: Some(watcher_handle),
@@ -229,7 +229,7 @@ struct TriggerAgent {
     matcher: CommMatcher,
     bpf_trie: BpfTrie,
     cgroup2_mount: PathBuf,
-    host_proc: PathBuf,
+    proc_path: PathBuf,
     psi_registry: PsiRegistry,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
@@ -267,7 +267,7 @@ impl TriggerAgent {
             // proc_walk already resolved the path.
             Some(path) => path,
             // BPF event: inline /proc/<pid>/cgroup read (~10-50µs).
-            None => match resolve_cgroup_path(&self.cgroup2_mount, &self.host_proc, event.pid) {
+            None => match resolve_cgroup_path(&self.cgroup2_mount, &self.proc_path, event.pid) {
                 Ok(path) => path,
                 Err(e) => {
                     error!(
@@ -387,7 +387,7 @@ impl TriggerAgent {
         let handle = Self::spawn_proc_walk(
             &self.config,
             &self.cgroup2_mount,
-            &self.host_proc,
+            &self.proc_path,
             self.event_tx.clone(),
             self.proc_walk_cancel.clone(),
         );
@@ -400,13 +400,13 @@ impl TriggerAgent {
     fn spawn_proc_walk(
         config: &Arc<TriggerConfig>,
         cgroup2_mount: &Path,
-        host_proc: &Path,
+        proc_path: &Path,
         tx: mpsc::Sender<ProcessMatchEvent>,
         cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let config = Arc::clone(config);
         let mount = cgroup2_mount.to_path_buf();
-        let proc_path = host_proc.to_path_buf();
+        let proc_path = proc_path.to_path_buf();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PROC_WALK_INTERVAL);
             // First tick fires immediately; subsequent ticks maintain cadence

@@ -1,7 +1,0 @@
-# Single-node Kind cluster for Bistouri E2E tests.
-# One node is sufficient: Bistouri runs as a DaemonSet (one pod per node)
-# and PSI is per-cgroup, so multi-node adds no test coverage.
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-- role: control-plane

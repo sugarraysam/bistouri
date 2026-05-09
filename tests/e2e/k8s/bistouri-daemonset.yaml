@@ -27,46 +27,31 @@ spec:
         args:
         - "--config"
         - "/etc/bistouri/trigger.yaml"
-        - "--host-proc"
+        - "--proc-path"
         - "/host/proc"
         - "--log-level"
         - "bistouri=debug"
         ports:
         - containerPort: 9464
+          hostPort: 9464
           name: metrics
           protocol: TCP
         securityContext:
-          capabilities:
-            add:
-            # Load BPF programs and create BPF maps (kernel ≥ 5.8).
-            - BPF
-            # Attach to perf events for stack sampling via perf_event_open().
-            - PERFMON
-            # Create PSI trigger file descriptors with sub-2s windows.
-            # Without this, the kernel restricts PSI windows to multiples of 2s.
-            - SYS_RESOURCE
-          # Allow bpf() and perf_event_open() syscalls which are blocked
-          # by the default container seccomp profile.
-          seccompProfile:
-            type: Unconfined
+          privileged: true
         volumeMounts:
-        # Host procfs — read from the host's perspective to eliminate
-        # cgroup namespace escapes (../ components in /proc/<pid>/cgroup).
         - name: host-proc
           mountPath: /host/proc
           readOnly: true
-        # Tracing filesystem — read-only, used by BPF tracepoint attachment.
         - name: sys-kernel-tracing
           mountPath: /sys/kernel/tracing
           readOnly: true
-        # BPF filesystem — BPF map pinning.
+          mountPropagation: HostToContainer
         - name: sys-fs-bpf
           mountPath: /sys/fs/bpf
-        # Cgroup filesystem — read cgroup info + write PSI trigger FDs.
-        # Must be read-write: PSI trigger creation writes to <cgroup>/cpu.pressure etc.
+          mountPropagation: Bidirectional
         - name: sys-fs-cgroup
           mountPath: /sys/fs/cgroup
-        # Trigger config file, mounted from ConfigMap.
+          mountPropagation: HostToContainer
         - name: config
           mountPath: /etc/bistouri
       volumes:

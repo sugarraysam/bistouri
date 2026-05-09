@@ -17,8 +17,8 @@ help:
 	@echo "  clean                   Clean the project"
 	@echo "  docker-build            Build the Docker image"
 	@echo "  docker-run              Run the Docker image locally"
-	@echo "  integration-tests       Run E2E integration tests in a Kind cluster"
-	@echo "  integration-tests-debug Run E2E tests, keep cluster alive for debugging"
+	@echo "  integration-tests       Run E2E integration tests in a k3s cluster"
+	@echo "  integration-tests-debug Run E2E tests, skip image rebuild"
 
 # Format the code
 fmt:
@@ -34,13 +34,13 @@ build:
 
 # Run the tests
 test:
-	cargo +nightly test --all-targets --all-features
+	cargo +nightly test --all-targets --all-features -- --skip bistouri_e2e
 
 # Run all CI checks locally
 ci:
 	cargo +nightly fmt --all
 	cargo +nightly clippy --fix --allow-dirty --all-targets --all-features -- -D warnings
-	cargo +nightly test --all-targets --all-features
+	cargo +nightly test --all-targets --all-features -- --skip bistouri_e2e
 	cargo +nightly build --all-targets --all-features
 
 # Clean the project
@@ -64,13 +64,13 @@ docker-run:
 		-v /sys/kernel/tracing:/sys/kernel/tracing:ro `# BPF tracepoint attachment` \
 		-v /sys/fs/bpf:/sys/fs/bpf                    `# BPF map pinning` \
 		-v /sys/fs/cgroup:/sys/fs/cgroup               `# Cgroup info + PSI trigger FD writes` \
-		bistouri-agent:latest --host-proc /host/proc
+		bistouri-agent:latest --proc-path /host/proc
 
-# Run E2E integration tests in a Kind cluster
+# Run E2E integration tests in a k3s cluster
 integration-tests:
-	./tests/e2e/run-e2e.sh
+	./tests/e2e/run-e2e-wrapper.sh
 
-# Run E2E tests with debug settings (keep cluster alive, longer timeouts)
+# Run E2E tests, skip image rebuild (reuse existing images)
 integration-tests-debug:
-	SKIP_CLEANUP=true PHASE1_TIMEOUT=120 PHASE2_TIMEOUT=120 ./tests/e2e/run-e2e.sh
+	SKIP_BUILD=true ./tests/e2e/run-e2e-wrapper.sh
 

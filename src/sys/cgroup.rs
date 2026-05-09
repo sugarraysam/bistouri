@@ -2,14 +2,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Discovers the cgroup2 mount point by parsing `<host_proc>/mounts`.
+/// Discovers the cgroup2 mount point by parsing `<proc_path>/mounts`.
 /// Called once at startup — the mount point is stable for the lifetime
 /// of the process.
 ///
-/// `host_proc` should point to the host's procfs mount (e.g. `/host/proc`
-/// in container deployments, or `/proc` on baremetal).
-pub(crate) fn find_cgroup2_mount(host_proc: &Path) -> io::Result<PathBuf> {
-    let mounts_path = host_proc.join("mounts");
+/// `proc_path` should point to procfs (e.g. `/host/proc` in container
+/// deployments, or `/proc` on baremetal).
+pub(crate) fn find_cgroup2_mount(proc_path: &Path) -> io::Result<PathBuf> {
+    let mounts_path = proc_path.join("mounts");
     let mounts = fs::read_to_string(&mounts_path)?;
     for line in mounts.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -24,7 +24,7 @@ pub(crate) fn find_cgroup2_mount(host_proc: &Path) -> io::Result<PathBuf> {
 }
 
 /// Resolves the cgroup filesystem path for a given PID by reading
-/// `<host_proc>/<pid>/cgroup`.
+/// `<proc_path>/<pid>/cgroup`.
 ///
 /// Reading from the host's procfs mount (rather than the container's
 /// `/proc`) eliminates cgroup namespace escapes — the kernel returns
@@ -35,18 +35,15 @@ pub(crate) fn find_cgroup2_mount(host_proc: &Path) -> io::Result<PathBuf> {
 /// `/sys/fs/cgroup/kubepods.slice/…/cri-containerd-abc123.scope`).
 pub(crate) fn resolve_cgroup_path(
     cgroup_mount: &Path,
-    host_proc: &Path,
+    proc_path: &Path,
     pid: u32,
 ) -> io::Result<PathBuf> {
-    let cgroup_file = host_proc.join(format!("{}/cgroup", pid));
+    let cgroup_file = proc_path.join(format!("{}/cgroup", pid));
     let contents = fs::read_to_string(&cgroup_file)?;
 
     for line in contents.lines() {
         if let Some(rel_path) = line.strip_prefix("0::") {
-            let candidate = cgroup_mount.join(rel_path.trim_start_matches('/'));
-            if candidate.is_dir() {
-                return Ok(candidate);
-            }
+            return Ok(cgroup_mount.join(rel_path.trim_start_matches('/')));
         }
     }
 

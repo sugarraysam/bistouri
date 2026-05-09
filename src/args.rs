@@ -19,26 +19,25 @@ pub(crate) struct Args {
     #[arg(short, long, env = "BISTOURI_CONFIG", default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
-    /// Path to the host's procfs mount.
+    /// Path to procfs.
     ///
     /// Container deployments should mount the host's /proc to a path like
-    /// /host/proc and set this flag. Eliminates cgroup namespace escapes
-    /// (../ components) that occur when reading /proc/<pid>/cgroup from
-    /// inside a container's cgroup namespace.
+    /// /host/proc and set this flag. Ensures we see all host PIDs and
+    /// resolve cgroups from the host's perspective.
     ///
-    /// When running directly on the host, the default /proc works as-is.
-    #[arg(long, env = "BISTOURI_HOST_PROC", default_value = "/proc")]
-    pub host_proc: PathBuf,
+    /// Defaults to /proc (correct for baremetal).
+    #[arg(long, env = "BISTOURI_PROC_PATH", default_value = "/proc")]
+    pub proc_path: PathBuf,
 
-    /// Path to the host's cgroup2 filesystem mount.
+    /// Path to the cgroup2 filesystem.
     ///
-    /// Container deployments should mount the host's /sys/fs/cgroup to a
-    /// path like /host/sys/fs/cgroup and set this flag. When set, skips
-    /// mount-table auto-detection and uses this path directly.
+    /// When set, skips auto-detection from <proc_path>/mounts and uses
+    /// this path directly. Useful when the cgroup mount is at a
+    /// non-standard location.
     ///
-    /// When omitted, auto-detected from <host_proc>/mounts.
-    #[arg(long, env = "BISTOURI_HOST_CGROUP")]
-    pub host_cgroup: Option<PathBuf>,
+    /// When omitted, auto-detected from <proc_path>/mounts.
+    #[arg(long, env = "BISTOURI_CGROUP_PATH")]
+    pub cgroup_path: Option<PathBuf>,
 
     /// Number of async IO worker threads for the tokio runtime.
     ///

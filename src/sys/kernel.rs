@@ -75,7 +75,7 @@ impl KernelMeta {
     ///
     /// This performs synchronous file I/O — call from `spawn_blocking`
     /// during startup. All paths use the host's filesystem directly
-    /// (not host_proc) because `/sys/kernel/notes` and
+    /// (not proc_path) because `/sys/kernel/notes` and
     /// `/proc/sys/kernel/osrelease` are host-global and not
     /// namespace-affected.
     pub(crate) fn collect() -> Result<Self, KernelMetaError> {

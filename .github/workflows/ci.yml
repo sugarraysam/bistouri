@@ -44,12 +44,25 @@ jobs:
     name: E2E Integration Tests
     runs-on: ubuntu-latest
     needs: build_and_test
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v6
 
-    - name: Install Kind
-      run: go install sigs.k8s.io/kind@latest
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy, rustfmt
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install build dependencies
+      run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev
+
+    - name: Install k3s (skip systemd)
+      run: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_ENABLE=true sh -
+        k3s --version
 
     - name: Run E2E tests
       run: make integration-tests
-      timeout-minutes: 5

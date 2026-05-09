@@ -12,15 +12,15 @@ use tracing::debug;
 pub(crate) struct ProcWalker {
     matcher: CommMatcher,
     cgroup2_mount: Box<Path>,
-    host_proc: Box<Path>,
+    proc_path: Box<Path>,
 }
 
 impl ProcWalker {
-    pub(crate) fn new(config: &TriggerConfig, cgroup2_mount: &Path, host_proc: &Path) -> Self {
+    pub(crate) fn new(config: &TriggerConfig, cgroup2_mount: &Path, proc_path: &Path) -> Self {
         Self {
             matcher: CommMatcher::new(config),
             cgroup2_mount: cgroup2_mount.into(),
-            host_proc: host_proc.into(),
+            proc_path: proc_path.into(),
         }
     }
 
@@ -43,7 +43,7 @@ impl ProcWalker {
                 continue;
             }
 
-            let cgroup_path = match resolve_cgroup_path(&self.cgroup2_mount, &self.host_proc, pid) {
+            let cgroup_path = match resolve_cgroup_path(&self.cgroup2_mount, &self.proc_path, pid) {
                 Ok(path) => path,
                 Err(e) => {
                     // Non-fatal: process likely exited between /proc scan and
@@ -78,7 +78,7 @@ impl ProcWalker {
     }
 
     fn pids(&self) -> Vec<u32> {
-        let Ok(entries) = fs::read_dir(&self.host_proc) else {
+        let Ok(entries) = fs::read_dir(&self.proc_path) else {
             return Vec::new();
         };
         entries
@@ -88,7 +88,7 @@ impl ProcWalker {
     }
 
     fn comm(&self, pid: u32) -> Option<String> {
-        fs::read_to_string(self.host_proc.join(format!("{}/comm", pid)))
+        fs::read_to_string(self.proc_path.join(format!("{}/comm", pid)))
             .ok()
             .map(|s| s.trim_end().to_string())
     }
