@@ -10,10 +10,9 @@ use tracing::{debug, info, warn};
 
 use super::error::Result;
 use super::pid_filter::BpfPidFilter;
-use super::session::{CaptureRequest, CaptureSession, CompletedSession, SessionId};
+use super::session::{CaptureRequest, CaptureSession, CaptureSource, CompletedSession, SessionId};
 use super::trace::StackSample;
 use crate::sys::kernel::KernelMeta;
-use crate::trigger::config::PsiResource;
 
 const METRIC_SESSIONS_STARTED: &str = "bistouri_capture_sessions_started";
 const METRIC_SESSIONS_COMPLETED: &str = "bistouri_capture_sessions_completed";
@@ -94,7 +93,7 @@ pub(crate) struct CaptureOrchestrator<F: PidFilter> {
     pid_sessions: HashMap<u32, Vec<SessionId>>,
     /// Dedup guard: at most one inflight session per (pid, resource).
     /// Max 3 entries per pid (one per PsiResource variant).
-    inflight_guard: HashSet<(u32, PsiResource)>,
+    inflight_guard: HashSet<(u32, CaptureSource)>,
     /// Ref-counted PID presence in BPF `pid_filter_map`.
     /// Incremented when a session starts, decremented when it finalizes.
     /// PID is removed from BPF map only when refcount reaches zero.
@@ -161,12 +160,12 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
     /// Creates a `CaptureSession` for the requested PID, unless a session
     /// with the same (pid, resource) is already inflight.
     fn start_session(&mut self, request: CaptureRequest) {
-        let guard_key = (request.pid, request.resource);
+        let guard_key = (request.pid, request.source.clone());
 
         if self.inflight_guard.contains(&guard_key) {
             debug!(
                 pid = request.pid,
-                resource = ?request.resource,
+                source = ?request.source,
                 "rejected duplicate capture session",
             );
             metrics::counter!(METRIC_SESSIONS_REJECTED_DUPLICATE).increment(1);
@@ -184,13 +183,15 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         *refcount += 1;
 
         // Extract label values before request.comm is moved into the session.
-        let resource_label = request.resource.to_string();
+        let resource_label = match &request.source {
+            CaptureSource::Psi(res) => res.to_string(),
+        };
         let comm_label = request.comm.clone();
 
         let session = CaptureSession::new(
             request.pid,
             request.comm,
-            request.resource,
+            request.source.clone(),
             self.kernel_meta.clone(),
         );
         let session_id = session.id();
@@ -205,7 +206,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         info!(
             session_id = %session_id,
             pid = session.pid(),
-            resource = ?request.resource,
+            source = ?request.source,
             duration_secs = self.capture_duration.as_secs(),
             "capture session started",
         );
@@ -273,10 +274,10 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         };
 
         let pid = session.pid();
-        let resource = session.resource();
+        let source = session.source().clone();
 
         // Clean up indices
-        self.inflight_guard.remove(&(pid, resource));
+        self.inflight_guard.remove(&(pid, source));
         if let Some(ids) = self.pid_sessions.get_mut(&pid) {
             ids.retain(|id| *id != session_id);
             if ids.is_empty() {
@@ -301,14 +302,14 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             session_id = %completed.session_id,
             pid = completed.pid,
             comm = %completed.comm,
-            resource = ?completed.resource,
+            source = ?completed.source,
             total_samples = completed.total_samples,
             unique_traces = completed.stack_traces.len(),
             "capture session completed",
         );
         metrics::counter!(
             METRIC_SESSIONS_COMPLETED,
-            "resource" => completed.resource.to_string(),
+            "source" => match &completed.source { CaptureSource::Psi(res) => res.to_string() },
             "comm" => completed.comm.clone(),
         )
         .increment(1);
@@ -394,6 +395,7 @@ mod tests {
     use super::super::trace::{StackTrace, UserFrame};
     use super::*;
     use crate::agent::profiler::BUILD_ID_SIZE;
+    use crate::trigger::config::PsiResource;
     use tokio::time;
 
     /// Mock PID filter that records add/remove operations for assertion.
@@ -440,7 +442,7 @@ mod tests {
         CaptureRequest {
             pid,
             comm: format!("test-{}", pid),
-            resource,
+            source: CaptureSource::Psi(resource),
         }
     }
 
@@ -501,7 +503,7 @@ mod tests {
             .expect("should receive completed session");
         assert_eq!(completed.pid, 42);
         assert_eq!(completed.comm, "test-42");
-        assert_eq!(completed.resource, PsiResource::Memory);
+        assert_eq!(completed.source, CaptureSource::Psi(PsiResource::Memory));
         assert_eq!(completed.total_samples, 10);
         assert_eq!(completed.stack_traces.len(), 3);
 
@@ -536,9 +538,9 @@ mod tests {
         assert_eq!(s1.total_samples, 1);
         assert_eq!(s2.total_samples, 1);
 
-        let resources: HashSet<PsiResource> = [s1.resource, s2.resource].into_iter().collect();
-        assert!(resources.contains(&PsiResource::Memory));
-        assert!(resources.contains(&PsiResource::Cpu));
+        let resources: HashSet<CaptureSource> = [s1.source, s2.source].into_iter().collect();
+        assert!(resources.contains(&CaptureSource::Psi(PsiResource::Memory)));
+        assert!(resources.contains(&CaptureSource::Psi(PsiResource::Cpu)));
 
         drop(req_tx);
         drop(stack_tx);

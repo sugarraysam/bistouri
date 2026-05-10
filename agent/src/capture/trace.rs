@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::hash::{Hash, Hasher};
 
 use crate::agent::profiler::{StackTraceEvent, UserStackFrame, BUILD_ID_SIZE};
@@ -30,7 +31,7 @@ impl TryFrom<i32> for BuildIdStatus {
 /// A resolved user-space frame with build_id and file offset.
 /// The kernel computed the file offset from the VMA — ASLR is already handled.
 /// The symbolizer adjusts by `(p_vaddr - p_offset)` for symbol table lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct UserFrame {
     pub build_id: [u8; BUILD_ID_SIZE],
     pub file_offset: u64,
@@ -51,7 +52,7 @@ pub(crate) struct UserFrame {
 /// construction and cached in `cached_hash`. The `Hash` impl feeds only
 /// this `u64`, eliminating repeated ~400-byte hashing on every `HashMap`
 /// lookup during deduplication.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct StackTrace {
     cached_hash: u64,
     pub kernel_frames: Vec<u64>,

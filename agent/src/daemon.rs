@@ -136,7 +136,7 @@ impl BistouriDaemon {
                             session_id = %session.session_id,
                             pid = session.pid,
                             comm = %session.comm,
-                            resource = ?session.resource,
+                            source = ?session.source,
                             total_samples = session.total_samples,
                             unique_traces = session.stack_traces.len(),
                             "completed session ready for symbolization",

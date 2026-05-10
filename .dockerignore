@@ -1,4 +1,4 @@
-# Cargo build directory
+# Build artifacts
 target/
 **/*.rs.bk
 
@@ -10,8 +10,8 @@ target/
 .env
 .env.*
 
-# Docker
-Dockerfile
+# Docker (exclude Dockerfiles from all subdirectories)
+**/Dockerfile
 .dockerignore
 
 # IDEs
@@ -20,9 +20,8 @@ Dockerfile
 *.swp
 *.swo
 
-# Brain / App Data Directory (if run locally)
+# Not needed in agent image
 .gemini/
-
-# E2E test infrastructure (not needed in Bistouri image)
-tests/
+agent/tests/
 docs/
+scripts/

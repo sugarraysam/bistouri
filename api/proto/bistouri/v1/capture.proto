@@ -1,0 +1,40 @@
+syntax = "proto3";
+package bistouri.v1;
+
+message CaptureSource {
+  oneof source {
+    PsiTrigger psi = 1;
+  }
+}
+
+enum PsiResourceType {
+  PSI_RESOURCE_TYPE_UNSPECIFIED = 0;
+  PSI_RESOURCE_TYPE_MEMORY = 1;
+  PSI_RESOURCE_TYPE_CPU = 2;
+  PSI_RESOURCE_TYPE_IO = 3;
+}
+
+message PsiTrigger {
+  PsiResourceType resource = 1;
+}
+
+message Metadata {
+  uint32 pid = 1;
+  string comm = 2;
+  KernelMeta kernel_meta = 3;
+}
+
+message KernelMeta {
+  string release = 1;
+  bytes build_id = 2;
+  uint64 kaslr_offset = 3;
+}
+
+message SessionPayload {
+  string session_id = 1;
+  CaptureSource source = 2;
+  Metadata metadata = 3;
+  
+  bytes traces_payload = 4;
+  bytes counts_payload = 5;
+}

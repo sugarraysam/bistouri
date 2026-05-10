@@ -1,20 +1,33 @@
 # AI Agent Context & Guidelines for Bistouri
 
-Welcome! You are assisting with Bistouri, an eBPF-based profiling agent
-written in Rust.
+Welcome! You are assisting with Bistouri, a workspace containing an
+eBPF-based profiling agent written in Rust and a centralized symbolizer
+service.
 
 ## Project Goal
 
 The goal of Bistouri is to capture stack traces from Linux processes
 dynamically, triggered by Pressure Stall Information (PSI) events
-(Memory, CPU, IO). These captured stack traces are eventually sent to an
-external symbolizer service for analysis.
+(Memory, CPU, IO). These captured stack traces are sent to a centralized
+symbolizer service for cross-host symbol resolution.
+
+## Workspace Structure
+
+- `agent/`: The eBPF profiling agent daemon. Requires Linux kernel
+  headers and libbpf at build time.
+- `api/`: Shared gRPC/Protobuf definitions consumed by both agent and
+  symbolizer. No platform-specific dependencies.
+- `symbolizer/`: The centralized symbolizer service (downstream consumer
+  of agent payloads). No kernel dependencies.
 
 ## Architecture & Tech Stack
 
 - User Space: Rust, using tokio for async operations and libbpf-rs for
-  interacting with the eBPF subsystem.
-- Kernel Space (eBPF): C, compiled to eBPF byte-code using libbpf-cargo.
+  interacting with the eBPF subsystem (agent only).
+- Kernel Space (eBPF): C, compiled to eBPF byte-code using libbpf-cargo
+  (agent only).
+- Network: gRPC (tonic) for agent → symbolizer communication, with
+  Protobuf schemas defined in the `api/` crate.
 
 ## Coding Rules & Guidelines
 
@@ -50,7 +63,7 @@ external symbolizer service for analysis.
   new `#[case]` line. Use standalone `#[test]` only for complex
   lifecycle tests that don't fit a table structure.
 
-### 2. eBPF Specific Guidelines
+### 2. eBPF Specific Guidelines (agent/ crate only)
 
 - eBPF Verifier: Keep eBPF programs simple to satisfy the Linux kernel
   verifier. Avoid unbound loops and ensure memory accesses are
@@ -68,14 +81,16 @@ external symbolizer service for analysis.
 
 ### 3. Workflow & Building
 
-- EBPF compilation is integrated into cargo build via build.rs and
-  libbpf-cargo.
-- Running the resulting binary requires root privileges (or appropriate
-  capabilities like `CAP_SYS_ADMIN`, `CAP_BPF`, `CAP_PERFMON`) to load
+- The workspace is built from the repository root via `make ci`, which
+  runs `cargo fmt`, `cargo clippy`, and `cargo test` across all crates.
+- Agent-specific targets (docker-build, integration-tests) live in
+  `agent/Makefile` and are invoked via `make -C agent <target>`.
+- EBPF compilation is integrated into `agent/build.rs` via libbpf-cargo.
+- Running the agent binary requires root privileges (or appropriate
+  capabilities like `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`) to load
   eBPF programs into the kernel.
-- Make Checks: All code modifications must pass the `make` command,
-  which runs `cargo fmt`, `cargo clippy`, and other essential validation
-  steps.
+- Make Checks: All code modifications must pass `make ci` from the
+  workspace root.
 
 ### 4. Eventual Consistency
 

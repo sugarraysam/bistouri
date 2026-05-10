@@ -39,6 +39,7 @@ impl E2eCluster {
             "-f",
             &format!("{}/configmap-phase2.yaml", self.k8s_dir),
         ])?;
+
         info!("Phase 2 config applied");
         Ok(())
     }

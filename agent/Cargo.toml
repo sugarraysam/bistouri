@@ -1,0 +1,41 @@
+[package]
+name = "bistouri-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libbpf-rs = "0.26"
+perf-event = "0.4"
+tokio = { version = "1.52", features = ["full", "test-util"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive", "env", "color"] }
+libc = "0.2"
+thiserror = "2.0.18"
+inotify = "0.11.1"
+futures-util = "0.3.32"
+presutaoru = "0.1.0-alpha.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_yml = "0.0.12"
+radix_trie = "0.2"
+tokio-util = { version = "0.7.18", features = ["time"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+bistouri-api = { path = "../api" }
+bincode = "1.3"
+
+[build-dependencies]
+libbpf-cargo = "0.26"
+# Checkout for kernel 6.19
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "5c36ac2080a8d3c1216470ce97e6502ed50272e5" }
+
+[dev-dependencies]
+rstest = "0.26"
+reqwest = "0.13"
+prometheus-parse = "0.2"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"

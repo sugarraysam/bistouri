@@ -7,6 +7,7 @@ use uuid::Uuid;
 use super::trace::StackTrace;
 use crate::sys::kernel::KernelMeta;
 use crate::trigger::config::PsiResource;
+use bistouri_api::v1 as proto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SessionId(Uuid);
@@ -23,6 +24,11 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum CaptureSource {
+    Psi(PsiResource),
+}
+
 /// Trigger event requesting stack capture for a single PID.
 ///
 /// Intentionally trigger-agnostic: today these come from PSI watchers,
@@ -30,7 +36,7 @@ impl std::fmt::Display for SessionId {
 pub(crate) struct CaptureRequest {
     pub pid: u32,
     pub comm: String,
-    pub resource: PsiResource,
+    pub source: CaptureSource,
     // TODO: stall_total_usec — read from <cgroup>/resource.pressure at trigger
     //       time to quantify PSI violation severity.
 }
@@ -43,7 +49,7 @@ pub(crate) struct CaptureSession {
     id: SessionId,
     pid: u32,
     comm: String,
-    resource: PsiResource,
+    source: CaptureSource,
     kernel_meta: Arc<KernelMeta>,
     started_at: Instant,
     traces: Vec<StackTrace>,
@@ -59,14 +65,14 @@ impl CaptureSession {
     pub(crate) fn new(
         pid: u32,
         comm: String,
-        resource: PsiResource,
+        source: CaptureSource,
         kernel_meta: Arc<KernelMeta>,
     ) -> Self {
         Self {
             id: SessionId::new(),
             pid,
             comm,
-            resource,
+            source,
             kernel_meta,
             started_at: Instant::now(),
             traces: Vec::new(),
@@ -84,8 +90,8 @@ impl CaptureSession {
         self.pid
     }
 
-    pub(crate) fn resource(&self) -> PsiResource {
-        self.resource
+    pub(crate) fn source(&self) -> &CaptureSource {
+        &self.source
     }
 
     /// Records a stack trace sample. Deduplicates: if the same trace was
@@ -108,7 +114,7 @@ impl CaptureSession {
     pub(crate) fn finalize(self) -> CompletedSession {
         CompletedSession {
             session_id: self.id,
-            resource: self.resource,
+            source: self.source,
             pid: self.pid,
             comm: self.comm,
             kernel_meta: self.kernel_meta,
@@ -129,7 +135,7 @@ impl CaptureSession {
 /// these for cross-host correlation and symbol lookup without /proc/pid/maps.
 pub(crate) struct CompletedSession {
     pub session_id: SessionId,
-    pub resource: PsiResource,
+    pub source: CaptureSource,
     /// PID is host-local and ephemeral, but needed for local correlation.
     /// For cross-host correlation, the symbolizer groups by build_id
     /// (embedded per-frame in user stack entries).
@@ -149,6 +155,49 @@ pub(crate) struct CompletedSession {
     #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub counts: Vec<u64>,
     pub total_samples: u64,
+}
+
+impl CompletedSession {
+    #[allow(dead_code)]
+    pub(crate) fn into_grpc_payload(
+        self,
+    ) -> std::result::Result<proto::SessionPayload, bincode::Error> {
+        let traces_payload = bincode::serialize(&self.stack_traces)?;
+        let counts_payload = bincode::serialize(&self.counts)?;
+
+        let source = match self.source {
+            CaptureSource::Psi(res) => {
+                let resource_type = match res {
+                    PsiResource::Memory => proto::PsiResourceType::Memory,
+                    PsiResource::Cpu => proto::PsiResourceType::Cpu,
+                    PsiResource::Io => proto::PsiResourceType::Io,
+                };
+                proto::capture_source::Source::Psi(proto::PsiTrigger {
+                    resource: resource_type as i32,
+                })
+            }
+        };
+
+        let metadata = proto::Metadata {
+            pid: self.pid,
+            comm: self.comm,
+            kernel_meta: Some(proto::KernelMeta {
+                release: self.kernel_meta.release.clone(),
+                build_id: self.kernel_meta.build_id.to_vec(),
+                kaslr_offset: self.kernel_meta.kaslr_offset,
+            }),
+        };
+
+        Ok(proto::SessionPayload {
+            session_id: self.session_id.to_string(),
+            source: Some(proto::CaptureSource {
+                source: Some(source),
+            }),
+            metadata: Some(metadata),
+            traces_payload,
+            counts_payload,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -224,8 +273,12 @@ mod tests {
         #[case] expected_total: u64,
         #[case] description: &str,
     ) {
-        let mut session =
-            CaptureSession::new(42, "test".into(), PsiResource::Memory, mock_kernel_meta());
+        let mut session = CaptureSession::new(
+            42,
+            "test".into(),
+            CaptureSource::Psi(PsiResource::Memory),
+            mock_kernel_meta(),
+        );
         for trace in traces {
             session.record(trace);
         }
@@ -246,8 +299,12 @@ mod tests {
 
     #[test]
     fn finalize_produces_correct_profile() {
-        let mut session =
-            CaptureSession::new(42, "myapp".into(), PsiResource::Io, mock_kernel_meta());
+        let mut session = CaptureSession::new(
+            42,
+            "myapp".into(),
+            CaptureSource::Psi(PsiResource::Io),
+            mock_kernel_meta(),
+        );
         let hot_path = make_trace(&[0xA], &[frame(0x01, 0xB)]);
         let cold_path = make_trace(&[0xC], &[frame(0x02, 0xD)]);
 
@@ -264,13 +321,17 @@ mod tests {
         assert_eq!(completed.counts[1], 1, "cold path count");
         assert_eq!(completed.pid, 42);
         assert_eq!(completed.comm, "myapp");
-        assert_eq!(completed.resource, PsiResource::Io);
+        assert_eq!(completed.source, CaptureSource::Psi(PsiResource::Io));
     }
 
     #[test]
     fn empty_session_finalizes_cleanly() {
-        let session =
-            CaptureSession::new(1, "idle".into(), PsiResource::Memory, mock_kernel_meta());
+        let session = CaptureSession::new(
+            1,
+            "idle".into(),
+            CaptureSource::Psi(PsiResource::Memory),
+            mock_kernel_meta(),
+        );
         let completed = session.finalize();
 
         assert_eq!(completed.total_samples, 0);

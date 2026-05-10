@@ -1,4 +1,4 @@
-use crate::capture::session::CaptureRequest;
+use crate::capture::session::{CaptureRequest, CaptureSource};
 use crate::trigger::config::PsiResource;
 use crate::trigger::error::{Result, TriggerError};
 use std::collections::HashMap;
@@ -149,7 +149,7 @@ impl PsiRegistry {
                 let req = CaptureRequest {
                     pid,
                     comm: comm.clone(),
-                    resource,
+                    source: CaptureSource::Psi(resource),
                 };
                 // Best-effort: if the capture channel is full, the orchestrator's
                 // dedup guard will reject a repeat when the next PSI fires.

@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     make \
     pkg-config \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # libbpf-cargo requires rustfmt to format the generated skeleton
@@ -30,9 +31,9 @@ COPY . .
 # This caches the cargo registry and target directory, making subsequent builds blazingly fast.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release \
+    cargo build --release -p bistouri-agent \
     # Copy the compiled binary out of the cached target directory so it can be picked up by the next stage
-    && cp target/release/bistouri /app/bistouri
+    && cp target/release/bistouri-agent /app/bistouri-agent
 
 # ------------------------------------------------------------------------------
 # Stage 2: Runtime
@@ -49,7 +50,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the compiled binary from the builder stage
-COPY --from=builder /app/bistouri .
+COPY --from=builder /app/bistouri-agent .
 
 # Set the default executable
-ENTRYPOINT ["/app/bistouri"]
+ENTRYPOINT ["/app/bistouri-agent"]

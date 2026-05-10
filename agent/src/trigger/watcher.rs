@@ -29,11 +29,9 @@ pub(crate) async fn config_watcher_task(
         .watches()
         .add(
             &parent_dir,
-            // k8s ConfigMap reload moves
-            WatchMask::MOVED_TO
-            // Support standard file edits
-            | WatchMask::CLOSE_WRITE
-            | WatchMask::MODIFY,
+            // MOVED_TO catches k8s ConfigMap rewrite
+            // CLOSE_WRITE and MODIFY catch standard file edits
+            WatchMask::MOVED_TO | WatchMask::CLOSE_WRITE | WatchMask::MODIFY,
         )
         .map_err(TriggerError::ConfigWatcher)?;
 
@@ -83,7 +81,6 @@ pub(crate) async fn config_watcher_task(
                     continue; // Skip the rest of the block
                 }
 
-                // Ignore hash of 0 (file missing during hard swap) or unchanged hash (metadata noise)
                 if current_hash != last_hash {
                     debug!("config watcher: file content change verified");
                     last_hash = current_hash;
