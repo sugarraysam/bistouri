@@ -31,3 +31,4 @@ TODO.md
 # Quarto build output
 docs/_book/
 docs/.quarto/
+__pycache__

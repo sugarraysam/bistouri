@@ -9,6 +9,7 @@ book:
     - trigger.qmd
     - profiler.qmd
     - ebpf.qmd
+    - symbolizer.qmd
 
 format:
   html:
