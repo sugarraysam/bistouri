@@ -59,6 +59,8 @@ While BPF gives us high-performance, event-driven notifications for *new* proces
 
 To guarantee completeness, we implement a `proc_walk`. Every 30 seconds, the agent scans `/proc`, matches every running process against our userspace trie, and ensures a PSI watcher is active for every matching cgroup. This "belt and braces" approach combines the low latency of BPF with the reliability of a periodic scan.
 
+Additionally, the walk serves as a metadata collection phase. For every matched process, we read `/proc/<pid>/auxv` to resolve its vDSO address range. This information is stored in a shared LRU cache, allowing the profiler to classify stack frames without performing blocking I/O during the high-frequency sampling path.
+
 ## Hot Reload Without Downtime
 
 Bistouri is designed for long-running production use, meaning we must support configuration changes without restarting the agent. The `TriggerAgent` manages this through an internal event loop.
@@ -108,5 +110,5 @@ graph TD
 ```
 
 ---
-_Auto-generated from commit `6703ee0` by Gemini 3.1 Pro.
+_Auto-generated from commit `02320e5` by Gemini 3.1 Pro.
 Last updated: 2026-05-10_

@@ -10,7 +10,7 @@ Bistouri—the French word for a surgical scalpel—is a profiling agent designe
 
 The core premise is that profiling is most valuable when a system is under duress. By listening to Linux Pressure Stall Information (PSI) events, Bistouri identifies exactly when CPU, memory, or I/O pressure exceeds a defined threshold. It then dynamically activates eBPF-based stack capturing for the specific processes causing or suffering from that pressure. 
 
-Furthermore, Bistouri is designed as a distributed system. The agent is a "thin" collector; it captures raw memory addresses from the kernel but does not attempt to resolve them into human-readable symbols locally. Instead, it ships these raw traces to a centralized Symbolizer service. This offloads the memory-intensive task of parsing DWARF and ELF data away from the production host, ensuring the "scalpel" doesn't become a "sledgehammer."
+Furthermore, Bistouri is designed as a distributed system. The agent is a "thin" collector; it captures raw memory addresses and build-id offsets from the kernel but does not attempt to resolve them into human-readable symbols locally. Instead, it ships these raw traces to a centralized Symbolizer service. This offloads the memory-intensive task of parsing DWARF and ELF data away from the production host, ensuring the "scalpel" doesn't become a "sledgehammer."
 
 ## Why eBPF for Profiling?
 
@@ -20,11 +20,12 @@ We chose eBPF because it provides a safe, programmable way to bridge the gap bet
 
 ## Architecture at a Glance
 
-Bistouri is built on a "three-phase" initialization pattern to manage the complex lifecycle of eBPF programs and their dependencies on the host system.
+Bistouri is built on a "multi-phase" initialization pattern to manage the complex lifecycle of eBPF programs and their dependencies on the host system. This ensures that the agent only begins active collection when all dependencies—from kernel metadata to user-space channels—are correctly wired.
 
-1.  **Preparation:** We first parse configurations and initialize the `TriggerAgent`. This stage has no BPF dependencies. It sets up the asynchronous watchers (like PSI file descriptors) and communication channels.
-2.  **Loading:** The `ProfilerAgent` loads the eBPF bytecode into the kernel. At this point, the BPF programs are resident but essentially "blind"—they don't yet know which processes to profile.
-3.  **Activation:** We pass the BPF map handles (specifically a Longest Prefix Match trie) from the `ProfilerAgent` to the `TriggerAgent`. Now, when a PSI event fires, the trigger system can write process identifiers directly into the BPF maps, effectively "arming" the profiler for specific targets.
+1.  **Preflight:** We collect and validate kernel metadata (like the KASLR offset and kernel build ID) and verify host capabilities.
+2.  **Preparation:** We parse configurations and initialize the `TriggerAgent`. This stage sets up the asynchronous watchers (like PSI file descriptors) and resolves filesystem paths for cgroups.
+3.  **Loading:** The `ProfilerAgent` loads the eBPF bytecode. At this point, the BPF programs are resident but essentially "blind"—they don't yet know which processes to profile.
+4.  **Activation:** We pass the BPF map handles (specifically a Longest Prefix Match trie and a PID filter) from the `ProfilerAgent` to the `TriggerAgent` and `CaptureOrchestrator`. Now, the trigger system can "arm" the profiler for specific targets in real-time.
 
 This separation ensures that we don't load heavy BPF objects until we are sure the configuration is valid, and it allows the user-space event loop to remain decoupled from the kernel-space data collection.
 
@@ -35,19 +36,20 @@ The following diagram illustrates how pressure events flow from the kernel, thro
 ```{mermaid}
 graph TD
     subgraph "Kernel Space"
-        PSI["PSI Events (/proc/pressure)"] -->|"Poll/Select"| UA
+        PSI["PSI Events (/proc/pressure)"] -->|"Poll/Select"| UA["Trigger Agent"]
         BPF_PROG["eBPF Profiler"] -->|"Stack Traces"| RB["Ring Buffer"]
         LPM["LPM Trie Map"] -.->|"Filter"| BPF_PROG
     end
 
     subgraph "User Space (Agent)"
-        UA["Trigger Agent"] -->|"Update Filter"| LPM
-        RB -->|"Consume"| PA["Profiler Agent"]
-        CG["Cgroup Watcher"] -->|"Update Cache"| UA
+        UA -->|"Update Filter"| LPM
+        RB -->|"Consume (Async)"| PA["Profiler Agent"]
+        PA -->|"Stream"| CO["Capture Orchestrator"]
+        UA -->|"Request Capture"| CO
     end
 
     subgraph "Infrastructure"
-        PA -->|"gRPC (Protobuf)"| SYM["Symbolizer Service"]
+        CO -->|"gRPC (Protobuf)"| SYM["Symbolizer Service"]
         PA -->|"Metrics"| MET["Prometheus"]
     end
 
@@ -59,24 +61,24 @@ graph TD
 The pipeline is designed to be "eventually consistent." When a cgroup or process starts experiencing pressure, the following sequence occurs:
 
 1.  **The Trigger:** The Linux kernel wakes up our `TriggerAgent` via a `poll()` on a PSI file descriptor.
-2.  **The Resolution:** The agent looks up the relevant process metadata in a shared `CgroupCache`. This cache is maintained by a background watcher task that tracks the lifecycle of cgroups, ensuring we don't have to walk `/proc` on every single event.
-3.  **The Filtering:** We use a Longest Prefix Match (LPM) Trie in BPF. This is a deliberate choice: it allows us to filter by specific process names or cgroup paths with high efficiency. The `TriggerAgent` updates this trie in real-time.
-4.  **The Capture:** The BPF program, triggered by a timer or tracepoint, checks the LPM trie. If the current task matches a "hot" entry, it captures the stack trace and pushes it into a high-performance Ring Buffer.
-5.  **The Consumption:** A dedicated blocking thread in user-space drains the ring buffer.
-6.  **The Export:** The agent serializes the raw stack traces using gRPC and sends them to the central `Symbolizer` service for cross-host resolution.
+2.  **The Resolution:** The agent looks up the relevant process metadata. We use `/proc/<pid>/cgroup` for BPF-originated events and a periodic `ProcWalker` to ensure all matching processes are identified even if exec tracing was missed.
+3.  **The Filtering:** We use a Longest Prefix Match (LPM) Trie in BPF. This is a deliberate choice: it allows us to filter by specific process names or prefixes with high efficiency. The `TriggerAgent` updates this trie in real-time.
+4.  **The Capture:** The BPF program, triggered by a timer (at a prime-number frequency like 19Hz to avoid aliasing), checks the PID filter. If the current task is "hot," it captures the stack trace and pushes it into a high-performance Ring Buffer.
+5.  **The Consumption:** A dedicated async task drains the ring buffer using Tokio's IO reactor, integrating the BPF ring buffer's epoll file descriptor directly into the async event loop.
+6.  **The Export:** The `CaptureOrchestrator` deduplicates traces into dictionary-encoded sessions and serializes them using gRPC for the central `Symbolizer` service.
 
 ## Design Principles
 
--   **Event Loop Integrity:** We use a multi-threaded Tokio runtime, but we strictly separate IO-bound tasks from blocking tasks. Since the eBPF ring buffer must be polled synchronously and `/proc` walking is CPU-heavy, we dedicate threads to these via `spawn_blocking` to ensure the primary async loop remains responsive to new PSI events.
+-   **Event Loop Integrity:** We use a multi-threaded Tokio runtime, but we strictly separate IO-bound tasks from blocking tasks. Since `/proc` walking and config parsing are CPU-heavy and synchronous, we dedicate threads to these via `spawn_blocking` to ensure the primary async loop remains responsive to new PSI events.
 -   **Minimal Threading Budget:** By default, Bistouri runs on a skeleton crew—one worker thread for IO and one for blocking. This is a "conservative by default" stance; we want the profiling tool to be the last thing contributing to the system pressure it's trying to measure.
--   **Safety and Observability:** We use `repr(C)` structs to share memory between Rust and C, and we expose internal health (like how many events we've processed or how many BPF errors occurred) via a Prometheus endpoint on port 9464.
+-   **Safety and Observability:** We use `repr(C)` structs to share memory between Rust and C, and we expose internal health (like how many events we've processed, buffer fullness, or how many BPF errors occurred) via a Prometheus endpoint on port 9464.
 
 ## Key Tradeoffs
 
--   **LPM Trie vs. Hash Maps:** We chose an LPM Trie for filtering. While a Hash Map might be slightly faster for exact PID matches, the Trie allows us to define "pressure policies" based on cgroup hierarchies or process name prefixes, providing much greater flexibility in containerized environments.
+-   **LPM Trie vs. Hash Maps:** We chose an LPM Trie for filtering. While a Hash Map might be slightly faster for exact PID matches, the Trie allows us to define "pressure policies" based on process name prefixes, providing much greater flexibility in containerized environments where naming conventions are common.
 -   **Eventual Consistency:** There is a tiny window where a process might start experiencing pressure but the user-space agent hasn't yet updated the BPF map. We accept this "lost sample" at the very start of a pressure spike in exchange for not having the BPF program perform complex lookups itself.
--   **User-space Triggering:** One might ask why we don't trigger the profiler entirely in the kernel. The answer is policy. Defining what constitutes "too much pressure" often involves complex configuration and metadata (like container names) that is significantly easier and safer to manage in Rust than in C-based BPF code.
+-   **User-space Triggering:** One might ask why we don't trigger the profiler entirely in the kernel. The answer is policy. Defining what constitutes "too much pressure" often involves complex configuration and metadata (like container names and threshold percentages) that is significantly easier and safer to manage in Rust than in C-based BPF code.
 
 ---
-_Auto-generated from commit `6703ee0` by Gemini 3.1 Pro.
+_Auto-generated from commit `02320e5` by Gemini 3.1 Pro.
 Last updated: 2026-05-10_

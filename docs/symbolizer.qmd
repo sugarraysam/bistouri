@@ -1,0 +1,82 @@
+---
+title: "Symbolizer"
+---
+
+The most challenging part of building an eBPF profiler isn't the collection—it's the translation. While the eBPF programs in Bistouri can efficiently capture stack traces, those traces are merely sequences of instruction pointers (IPs). To a human operator, `0xffffffff810cb8c0` is meaningless; they need to see `find_vma`. The Symbolizer is the component responsible for this transformation, bridging the gap between raw binary addresses and human-readable source locations.
+
+## The Cross-Host Symbolization Problem
+
+Symbolizing profiles on the same host where they are captured is the "easy" path, but it’s often prohibited in production environments. Shipping debug symbols (which can be gigabytes in size) to every production node is a deployment nightmare and a waste of disk space. Furthermore, the act of symbolization—parsing large ELF files and DWARF tables—is CPU and memory-intensive. Performing this on a machine already under resource pressure (the very reason Bistouri might have been triggered) is counter-productive.
+
+Bistouri is designed with a "decoupled symbolization" philosophy. The agent captures the bare minimum: raw IPs, the kernel Build ID, and the KASLR (Kernel Address Space Layout Randomization) offset. This allows the heavy lifting of symbol resolution to happen on a centralized service or a developer's machine, where symbols for various kernel versions can be indexed and cached once.
+
+## gRPC Interface & Protobuf Contract
+
+The communication between the profiling agent and the symbolizer is governed by a Protobuf contract. We chose gRPC and Protobuf because profiling data is inherently structured but high-volume. The `SessionPayload` acts as an envelope that carries both the raw data and the necessary context for translation.
+
+The most critical part of this contract is the `KernelMeta` message:
+
+```proto
+message KernelMeta {
+  string release = 1;
+  bytes build_id = 2;
+  uint64 kaslr_offset = 3;
+}
+```
+
+By including the `build_id`, we eliminate the ambiguity of the `release` string (e.g., `5.15.0-generic`). A Build ID is a unique cryptographic hash of the kernel binary itself. This ensures that if we have two kernels with the same version string but different patches, we never accidentally use the wrong symbol table. The `kaslr_offset` is equally vital; it tells the symbolizer how much to "shift" the runtime addresses back to their static, compiled-time equivalents before looking them up in the ELF file.
+
+## Symbol Resolution Pipeline
+
+The symbolization pipeline follows a strict hierarchy of data refinement. When a `SessionPayload` arrives, the symbolizer first extracts the `Metadata` to determine the environment of the capture.
+
+For kernel-space traces, the pipeline looks like this:
+1. **Normalization**: Subtract the `kaslr_offset` from every IP in the `traces_payload`. This transforms runtime addresses into static file offsets.
+2. **Binary Identification**: Use the `build_id` to locate the corresponding symbol table in the local cache or a remote symbol server (like a debuginfod server).
+3. **Lookup**: Perform a binary search or hash table lookup (depending on the index format) to find the function name associated with the normalized IP.
+4. **Attribution**: If debug information (DWARF) is available, further refine the symbol into a filename and line number.
+
+For user-space traces, the problem is significantly harder because the symbolizer must know the memory mapping (`/proc/pid/maps`) at the exact moment the profile was taken. This is a future area of expansion for the Bistouri architecture.
+
+## Build ID Indexing
+
+Storing symbols for every kernel version across a fleet requires an efficient indexing strategy. Bistouri's symbolizer treats the Build ID as the primary key. 
+
+We avoid relying on file paths because the path to a kernel image on a target host (`/boot/vmlinuz-...`) is irrelevant to the symbolizer. Instead, the symbolizer maintains a content-addressable store. When it encounters a new Build ID, it attempts to fetch the corresponding symbols and stores them in a directory structure indexed by the first few bytes of the hash. This allows for rapid lookups during high-frequency profiling sessions.
+
+## Deployment Model
+
+The symbolizer can be deployed in two primary modes:
+
+*   **Sidecar/Centralized Service**: The agent streams `SessionPayloads` to a remote gRPC endpoint. This is ideal for large-scale deployments where a central "Bistouri Server" provides a UI and handles symbolization for the entire fleet.
+*   **Local CLI**: For debugging a single machine, the agent and symbolizer can run as a single logical unit, symbolizing "on the fly" before dumping the results to a file (like a FlameGraph-compatible format).
+
+::: {.callout-note}
+## Tradeoff: Latency vs. Accuracy
+Symbolizing traces immediately after capture ensures that the environment (like loaded kernel modules) hasn't changed. However, it increases the footprint of the agent. Bistouri defaults to capturing raw data and deferring symbolization to maximize the reliability of the target system.
+:::
+
+## Service Lifecycle
+
+The symbolizer operates as a reactive service. It remains dormant until a profiling session is initiated by a trigger.
+
+```{mermaid}
+stateDiagram-v2
+    [*] --> Initializing: Load Local Cache
+    Initializing --> Listening: Start gRPC Server
+    
+    state "Processing Session" as Processing {
+        Listening --> Receiving: Incoming SessionPayload
+        Receiving --> Identifying: Extract BuildID/KASLR
+        Identifying --> Fetching: Locate ELF/DWARF
+        Fetching --> Resolving: Map IPs to Symbols
+        Resolving --> Aggregating: Build FlameGraph/Tree
+    }
+    
+    Aggregating --> Listening: Send Results & Wait
+    Listening --> [*]: Shutdown
+```
+
+---
+_Auto-generated from commit `02320e5` by Gemini 3.1 Pro.
+Last updated: 2024-10-25_
