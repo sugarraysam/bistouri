@@ -8,6 +8,10 @@ pub(crate) mod watcher;
 
 use crate::capture::session::CaptureRequest;
 use crate::sys::cgroup::{cgroup_path_to_id, find_cgroup2_mount, resolve_cgroup_path};
+use crate::telemetry::{
+    METRIC_CGROUP_RESOLVE_FAILURES, METRIC_CONFIG_RELOADS, METRIC_CONFIG_RELOAD_FAILURES,
+    METRIC_PSI_FD_BUILD_FAILURES, METRIC_STALE_EVENTS,
+};
 use config::TriggerConfig;
 use error::Result;
 use matcher::CommMatcher;
@@ -54,47 +58,6 @@ pub(super) enum TriggerControl {
 }
 
 // ---------------------------------------------------------------------------
-// Metric counter names — constants prevent typos and centralize naming.
-// ---------------------------------------------------------------------------
-
-const METRIC_CGROUP_RESOLVE_FAILURES: &str = "bistouri_trigger_cgroup_resolve_failures";
-const METRIC_PSI_FD_BUILD_FAILURES: &str = "bistouri_trigger_psi_fd_build_failures";
-const METRIC_STALE_EVENTS: &str = "bistouri_trigger_stale_events";
-const METRIC_DUPLICATE_PSI_SKIPS: &str = "bistouri_trigger_duplicate_psi_skips";
-const METRIC_CONFIG_RELOADS: &str = "bistouri_trigger_config_reloads";
-const METRIC_CONFIG_RELOAD_FAILURES: &str = "bistouri_trigger_config_reload_failures";
-
-/// Registers metric descriptions with the `metrics` facade. Called once
-/// during `prepare()` so that Prometheus help text is available before
-/// any counters are incremented.
-fn describe_metrics() {
-    metrics::describe_counter!(
-        METRIC_CGROUP_RESOLVE_FAILURES,
-        "Number of cgroup resolution failures during event processing"
-    );
-    metrics::describe_counter!(
-        METRIC_PSI_FD_BUILD_FAILURES,
-        "Number of PSI file descriptor build failures"
-    );
-    metrics::describe_counter!(
-        METRIC_STALE_EVENTS,
-        "Number of stale events filtered after config reload"
-    );
-    metrics::describe_counter!(
-        METRIC_DUPLICATE_PSI_SKIPS,
-        "Number of duplicate PSI watcher registration attempts skipped"
-    );
-    metrics::describe_counter!(
-        METRIC_CONFIG_RELOADS,
-        "Number of successful configuration hot-reloads"
-    );
-    metrics::describe_counter!(
-        METRIC_CONFIG_RELOAD_FAILURES,
-        "Number of failed configuration hot-reload attempts"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Two-phase init
 // ---------------------------------------------------------------------------
 
@@ -121,7 +84,6 @@ impl PreparedTriggerAgent {
         proc_path: PathBuf,
         cgroup_path: Option<PathBuf>,
     ) -> Result<Self> {
-        describe_metrics();
         let config = TriggerConfig::load_or_default(&config_path).await;
         let (event_tx, event_rx) = mpsc::channel::<ProcessMatchEvent>(TRIGGER_CHANNEL_SIZE);
 
@@ -328,7 +290,6 @@ impl TriggerAgent {
                         resource = ?res_cfg.resource,
                         "PSI watcher already registered for this cgroup+resource, skipping",
                     );
-                    metrics::counter!(METRIC_DUPLICATE_PSI_SKIPS).increment(1);
                 }
                 PsiRegisterResult::BuildFailed => {
                     debug!(

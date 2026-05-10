@@ -13,39 +13,17 @@ use super::pid_filter::BpfPidFilter;
 use super::session::{CaptureRequest, CaptureSession, CaptureSource, CompletedSession, SessionId};
 use super::trace::StackSample;
 use crate::sys::kernel::KernelMeta;
+use crate::telemetry::{
+    METRIC_ACTIVE_SESSIONS, METRIC_SAMPLES_INGESTED, METRIC_SAMPLES_UNMATCHED,
+    METRIC_SESSIONS_COMPLETED, METRIC_SESSIONS_REJECTED_DUPLICATE, METRIC_SESSIONS_STARTED,
+    METRIC_SESSION_SAMPLES, METRIC_SINK_FAILURES,
+};
 
-const METRIC_SESSIONS_STARTED: &str = "bistouri_capture_sessions_started";
-const METRIC_SESSIONS_COMPLETED: &str = "bistouri_capture_sessions_completed";
-const METRIC_SESSIONS_REJECTED_DUPLICATE: &str = "bistouri_capture_sessions_rejected_duplicate";
-const METRIC_SAMPLES_INGESTED: &str = "bistouri_capture_samples_ingested";
-const METRIC_SAMPLES_UNMATCHED: &str = "bistouri_capture_samples_unmatched";
-const METRIC_SINK_FAILURES: &str = "bistouri_capture_sink_failures";
-
-fn describe_metrics() {
-    metrics::describe_counter!(
-        METRIC_SESSIONS_STARTED,
-        "Capture sessions started after PSI trigger"
-    );
-    metrics::describe_counter!(
-        METRIC_SESSIONS_COMPLETED,
-        "Capture sessions finalized and sent downstream"
-    );
-    metrics::describe_counter!(
-        METRIC_SESSIONS_REJECTED_DUPLICATE,
-        "Capture requests rejected due to duplicate (pid, resource) inflight"
-    );
-    metrics::describe_counter!(
-        METRIC_SAMPLES_INGESTED,
-        "Stack samples ingested into active sessions"
-    );
-    metrics::describe_counter!(
-        METRIC_SAMPLES_UNMATCHED,
-        "Stack samples received for PIDs with no active session"
-    );
-    metrics::describe_counter!(
-        METRIC_SINK_FAILURES,
-        "Failures sending completed sessions downstream"
-    );
+/// Extracts the resource label string from a `CaptureSource` for metric labels.
+fn source_label(source: &CaptureSource) -> String {
+    match source {
+        CaptureSource::Psi(res) => res.to_string(),
+    }
 }
 
 /// Abstracts BPF `pid_filter_map` operations for testability.
@@ -111,7 +89,6 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         cancel: CancellationToken,
         kernel_meta: Arc<KernelMeta>,
     ) -> Self {
-        describe_metrics();
         Self {
             request_rx,
             stack_rx,
@@ -183,9 +160,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         *refcount += 1;
 
         // Extract label values before request.comm is moved into the session.
-        let resource_label = match &request.source {
-            CaptureSource::Psi(res) => res.to_string(),
-        };
+        let resource_label = source_label(&request.source);
         let comm_label = request.comm.clone();
 
         let session = CaptureSession::new(
@@ -218,6 +193,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         .increment(1);
 
         self.sessions.insert(session_id, session);
+        metrics::gauge!(METRIC_ACTIVE_SESSIONS).set(self.sessions.len() as f64);
     }
 
     /// Routes a stack sample to all active sessions monitoring that PID.
@@ -247,7 +223,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
                 // Common case: single session per PID. Zero clones.
                 if let Some(session) = self.sessions.get_mut(&ids[0]) {
                     session.record(trace);
-                    metrics::counter!(METRIC_SAMPLES_INGESTED).increment(1);
+                    metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                 }
             }
             _ => {
@@ -255,12 +231,12 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
                 for session_id in &ids[..ids.len() - 1] {
                     if let Some(session) = self.sessions.get_mut(session_id) {
                         session.record(trace.clone());
-                        metrics::counter!(METRIC_SAMPLES_INGESTED).increment(1);
+                        metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                     }
                 }
                 if let Some(session) = self.sessions.get_mut(ids.last().unwrap()) {
                     session.record(trace);
-                    metrics::counter!(METRIC_SAMPLES_INGESTED).increment(1);
+                    metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                 }
             }
         }
@@ -309,10 +285,12 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         );
         metrics::counter!(
             METRIC_SESSIONS_COMPLETED,
-            "source" => match &completed.source { CaptureSource::Psi(res) => res.to_string() },
+            "resource" => source_label(&completed.source),
             "comm" => completed.comm.clone(),
         )
         .increment(1);
+        metrics::histogram!(METRIC_SESSION_SAMPLES).record(completed.total_samples as f64);
+        metrics::gauge!(METRIC_ACTIVE_SESSIONS).set(self.sessions.len() as f64);
 
         if self.session_tx.send(completed).await.is_err() {
             warn!("downstream receiver dropped, completed session lost");

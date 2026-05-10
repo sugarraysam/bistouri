@@ -4,6 +4,7 @@ use crate::capture::orchestrator::{CaptureOrchestrator, STACK_SAMPLE_CHANNEL_SIZ
 use crate::capture::session::CompletedSession;
 use crate::capture::trace::StackSample;
 use crate::sys;
+use crate::telemetry;
 use crate::trigger::PreparedTriggerAgent;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -48,6 +49,8 @@ impl BistouriDaemon {
             .install()
             .map_err(|e| anyhow::anyhow!("metrics server on port {}: {e}", args.metrics_port))?;
 
+        telemetry::describe_all();
+
         // Stack sample channel created here (not inside orchestrator) because the
         // BPF ringbuffer callback needs the Sender at agent build time — before
         // the orchestrator exists. All other channels are internal to start().
@@ -55,6 +58,7 @@ impl BistouriDaemon {
 
         // Phase 0: Collect and validate kernel metadata for symbolization.
         let kernel_meta = sys::preflight::run_preflight_checks().await?;
+        telemetry::record_agent_info(&kernel_meta, args.freq, args.capture_duration_secs);
 
         // Phase 1: Prepare TriggerAgent (loads config, creates event channel,
         // resolves cgroup2 mount point).

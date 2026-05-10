@@ -2,9 +2,8 @@ use serde::Serialize;
 use std::hash::{Hash, Hasher};
 
 use crate::agent::profiler::{StackTraceEvent, UserStackFrame, BUILD_ID_SIZE};
+use crate::telemetry::METRIC_USER_FRAMES_FALLBACK;
 use tracing::error;
-
-const METRIC_USER_FRAMES_FALLBACK: &str = "bistouri_profiler_user_frames_fallback";
 
 /// Kernel `bpf_stack_build_id_status` enum values.
 /// Parsed from the raw `i32` status field in `UserStackFrame`.

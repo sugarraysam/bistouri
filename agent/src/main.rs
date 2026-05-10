@@ -3,6 +3,7 @@ mod args;
 mod capture;
 mod daemon;
 mod sys;
+mod telemetry;
 mod trigger;
 
 use args::Args;

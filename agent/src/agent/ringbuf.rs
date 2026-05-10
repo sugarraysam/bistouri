@@ -1,4 +1,3 @@
-use super::profiler::METRIC_RINGBUF_POLL_ERRORS;
 use crate::agent::error::{AgentError, Result};
 use libbpf_rs::RingBuffer;
 use std::os::fd::BorrowedFd;
@@ -7,7 +6,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 const MAX_CONSUME_ERRORS: u32 = 3;
-const METRIC_CONSUME_ERRORS: &str = "bistouri_profiler_consume_errors";
 
 /// Async wrapper around `libbpf_rs::RingBuffer` that integrates with tokio's
 /// IO reactor. Owns both the ring buffer (which holds the epoll fd) and the
@@ -65,7 +63,6 @@ impl AsyncRingBuffer {
                                 }
                                 Err(e) => {
                                     consecutive_errors += 1;
-                                    metrics::counter!(METRIC_CONSUME_ERRORS).increment(1);
                                     error!(
                                         error = %e,
                                         attempt = consecutive_errors,
@@ -93,7 +90,7 @@ impl AsyncRingBuffer {
                                 "ringbuf epoll error — BPF event pipeline is \
                                  irrecoverably broken. Aborting process.",
                             );
-                            metrics::counter!(METRIC_RINGBUF_POLL_ERRORS).increment(1);
+
                             std::process::abort();
                         }
                     }

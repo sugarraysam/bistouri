@@ -1,9 +1,11 @@
 use crate::sys::cgroup::resolve_cgroup_path;
+use crate::telemetry::{METRIC_PROC_WALK_DURATION, METRIC_PROC_WALK_MATCHES};
 use crate::trigger::config::TriggerConfig;
 use crate::trigger::matcher::CommMatcher;
 use crate::trigger::ProcessMatchEvent;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -26,8 +28,10 @@ impl ProcWalker {
 
     /// Walks all processes and sends matching events. Checks cancellation between PIDs.
     pub(crate) fn walk(&self, tx: &mpsc::Sender<ProcessMatchEvent>, cancel: &CancellationToken) {
+        let start = Instant::now();
         let pids = self.pids();
         debug!(pid_count = pids.len(), "proc_walk started");
+        let mut match_count: u64 = 0;
 
         for pid in pids {
             if cancel.is_cancelled() {
@@ -65,6 +69,7 @@ impl ProcWalker {
                     cgroup = %cgroup_path.display(),
                     "proc_walk matched process",
                 );
+                match_count += 1;
                 let event = ProcessMatchEvent {
                     rule_id: *rule_id,
                     pid,
@@ -74,7 +79,15 @@ impl ProcWalker {
                 let _ = tx.blocking_send(event);
             }
         }
-        debug!("proc_walk completed");
+
+        let elapsed = start.elapsed();
+        metrics::histogram!(METRIC_PROC_WALK_DURATION).record(elapsed.as_secs_f64());
+        metrics::counter!(METRIC_PROC_WALK_MATCHES).increment(match_count);
+        debug!(
+            duration_ms = elapsed.as_millis(),
+            matches = match_count,
+            "proc_walk completed"
+        );
     }
 
     fn pids(&self) -> Vec<u32> {

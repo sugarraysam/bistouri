@@ -1,4 +1,5 @@
 use crate::capture::session::{CaptureRequest, CaptureSource};
+use crate::telemetry::{METRIC_ACTIVE_PSI_WATCHERS, METRIC_CAPTURE_CHANNEL_FULL};
 use crate::trigger::config::PsiResource;
 use crate::trigger::error::{Result, TriggerError};
 use std::collections::HashMap;
@@ -8,8 +9,6 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{Interest, Ready};
 use tokio::sync::mpsc;
 use tracing::{error, info};
-
-const METRIC_CAPTURE_CHANNEL_FULL: &str = "bistouri_psi_capture_channel_full";
 
 /// Fixed PSI time window: all thresholds are expressed as a percentage of this.
 const TIME_WINDOW_MS: f64 = 1_000.0;
@@ -77,6 +76,7 @@ impl PsiRegistry {
             self.capture_tx.clone(),
         );
         self.watchers.insert(registry_key, watcher);
+        metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(self.watchers.len() as f64);
 
         PsiRegisterResult::Registered
     }
@@ -86,6 +86,7 @@ impl PsiRegistry {
         for (_, handle) in self.watchers.drain() {
             handle.abort();
         }
+        metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(0.0);
     }
 
     fn build_async_fd(

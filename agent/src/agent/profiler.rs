@@ -1,6 +1,10 @@
 use crate::agent::error::{AgentError, Result};
 use crate::agent::ringbuf::AsyncRingBuffer;
 use crate::capture::trace::StackSample;
+use crate::telemetry::{
+    METRIC_STACK_CHANNEL_FULL, METRIC_STACK_FETCH_ERRORS, METRIC_STACK_RINGBUF_FULL,
+    METRIC_TRIGGER_CHANNEL_FULL, METRIC_TRIGGER_RINGBUF_FULL,
+};
 use crate::trigger::ProcessMatchEvent;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use perf_event::{events::Software, Builder, Counter};
@@ -18,14 +22,6 @@ const DEFAULT_SAMPLING_FREQ_HZ: u64 = 19;
 pub(crate) const MAX_STACK_DEPTH: usize = 127;
 pub(crate) const TASK_COMM_LEN: usize = 16;
 pub(crate) const BUILD_ID_SIZE: usize = 20;
-
-const METRIC_STACK_RINGBUF_FULL: &str = "bistouri_profiler_stack_ringbuf_full";
-const METRIC_STACK_FETCH_ERRORS: &str = "bistouri_profiler_stack_fetch_errors";
-const METRIC_TRIGGER_RINGBUF_FULL: &str = "bistouri_profiler_trigger_ringbuf_full";
-const METRIC_TRIGGER_CHANNEL_FULL: &str = "bistouri_profiler_trigger_channel_full";
-const METRIC_STACK_CHANNEL_FULL: &str = "bistouri_profiler_stack_channel_full";
-pub(super) const METRIC_RINGBUF_POLL_ERRORS: &str = "bistouri_profiler_ringbuf_poll_errors";
-const METRIC_USER_FRAMES_FALLBACK: &str = "bistouri_profiler_user_frames_fallback";
 
 /// Mirrors `max_entries` from `stack_events` map in profiler.bpf.c.
 /// Update both if the ring buffer size changes.
@@ -253,7 +249,8 @@ impl ProfilerError {
                     ret_code,
                     Self::decode_stack_error(*ret_code),
                 );
-                metrics::counter!(METRIC_STACK_FETCH_ERRORS).increment(1);
+                metrics::counter!(METRIC_STACK_FETCH_ERRORS, "space" => space.to_string())
+                    .increment(1);
             }
             ProfilerError::ReserveTriggerRingbuf {
                 rule_id,
@@ -469,38 +466,6 @@ impl LoadedProfilerAgent {
             .map_err(|e| AgentError::PerfEvent("failed to build perf event".into(), e))
     }
 
-    /// Registers metric descriptions for all profiler counters.
-    fn describe_metrics() {
-        metrics::describe_counter!(
-            METRIC_STACK_RINGBUF_FULL,
-            "BPF stack ring buffer reservation failures (64MB buffer full)"
-        );
-        metrics::describe_counter!(
-            METRIC_STACK_FETCH_ERRORS,
-            "BPF bpf_get_stack() failures (transient, process likely exited)"
-        );
-        metrics::describe_counter!(
-            METRIC_TRIGGER_RINGBUF_FULL,
-            "BPF trigger ring buffer reservation failures (256KB buffer full)"
-        );
-        metrics::describe_counter!(
-            METRIC_TRIGGER_CHANNEL_FULL,
-            "Trigger events dropped due to full channel (proc_walk provides completeness)"
-        );
-        metrics::describe_counter!(
-            METRIC_STACK_CHANNEL_FULL,
-            "Stack samples dropped due to full channel (statistical loss at 19Hz)"
-        );
-        metrics::describe_counter!(
-            METRIC_RINGBUF_POLL_ERRORS,
-            "Epoll errors on ring buffer fd (unrecoverable, polling stops)"
-        );
-        metrics::describe_counter!(
-            METRIC_USER_FRAMES_FALLBACK,
-            "User stack frames where kernel could not resolve build_id (JIT, vDSO, anonymous)"
-        );
-    }
-
     /// Starts asynchronous ring buffer polling using tokio's IO reactor.
     ///
     /// Wraps the ring buffer in `AsyncRingBuffer` which registers the internal
@@ -509,8 +474,6 @@ impl LoadedProfilerAgent {
         &mut self,
         cancel: CancellationToken,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        Self::describe_metrics();
-
         let rb = self.ring_buffer.take().ok_or_else(|| {
             AgentError::InvalidState("ringbuffer not initialized or already polling".into())
         })?;
