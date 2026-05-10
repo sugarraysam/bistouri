@@ -6,7 +6,7 @@ title: "The Profiling Agent"
 
 The heart of Bistouri is a feedback loop between the kernel and userspace. We don't want to profile everything all the time—that's too expensive. Instead, we use a two-stage mechanism: identification and sampling.
 
-The first stage is reactive. When a process executes (`match_comm_on_exec`), the kernel-side BPF program checks the new process's command name against a set of rules stored in an LPM (Longest Prefix Match) trie. If the process matches our criteria—for example, if it's a binary name we've been told to watch—the BPF program automatically marks it for monitoring. This "marking" is simply an entry in a hash map (`pid_filter_map`) that acts as a fast-path allow-list. 
+The first stage is reactive. When a process executes (`match_comm_on_exec`), the kernel-side BPF program checks the new process's command name against a set of rules stored in an LPM (Longest Prefix Match) trie. If the process matches our criteria—for example, if it's a binary name we've been told to watch—the BPF program emits an event to the `trigger_events` ring buffer. This signals the userspace agent to "mark" the PID for monitoring by adding it to a fast-path allow-list hash map (`pid_filter_map`).
 
 The second stage is the actual sampling. We attach a BPF program to a software perf event (`CPU_CLOCK`) on every CPU. At a fixed frequency—by default 19Hz, a prime number chosen to avoid synchronization with periodic application tasks—the kernel interrupts the CPU and runs our handler. This handler checks the `pid_filter_map`. If the current PID isn't there, we exit immediately with minimal overhead. If it is, we perform the "heavy" work: walking the stack for both kernel and user space.
 
@@ -18,7 +18,7 @@ Managing BPF maps requires a careful dance between the lifetime of the BPF objec
 
 ::: {.callout-note}
 ## Design Decision: Decoupled Map Ownership
-A `MapHandle` duplicates the underlying file descriptor of a BPF map. This is critical for our architecture because it allows the `TriggerAgent` (which determines which processes to profile) to update the `comm_lpm_trie` independently of the `ProfilerAgent`'s main loop. 
+A `MapHandle` duplicates the underlying file descriptor of a BPF map. This is critical for our architecture because it allows the `TriggerAgent` (which determines which processes to profile) and the `CaptureOrchestrator` (which manages active PID filtering) to manipulate maps independently of the `ProfilerAgent`'s main skeleton.
 :::
 
 By duplicating the FD, we avoid complex borrow-checking issues where multiple components would otherwise need to hold a reference to the entire BPF skeleton. This allows us to treat the maps themselves as the "source of truth" and the primary communication bus. The `pid_filter_map` is a persistent control plane, while the ring buffers serve as the data plane.
@@ -29,7 +29,7 @@ Bistouri uses the modern `BPF_MAP_TYPE_RINGBUF` rather than the older `BPF_MAP_T
 
 Perf buffers allocate a separate memory region per CPU. If you have 128 CPUs, you have 128 buffers. This often leads to wasted memory if one CPU is idle while another is dropping samples. The modern Ring Buffer is a single, shared memory region for all CPUs. It supports high-performance reservation-based allocation, allowing us to write stack traces directly into the buffer memory (`bpf_ringbuf_reserve`) without extra copies.
 
-Furthermore, the Ring Buffer preserves the temporal order of events across CPUs more effectively and handles spikes in volume better than the per-CPU approach. When we poll the buffer in userspace, we do so on a dedicated blocking thread to ensure we don't starve the async reactor, effectively decoupling the kernel's high-frequency data production from our application's consumption.
+Furthermore, the Ring Buffer preserves the temporal order of events across CPUs more effectively. Unlike older profilers that rely on a dedicated blocking thread to poll BPF maps, Bistouri uses a custom `AsyncRingBuffer`. This wrapper registers the ring buffer's epoll file descriptor with the Tokio reactor. When the kernel pushes data, Tokio wakes the profiling task, which then drains the buffer. This integrates profiling naturally into the async event loop without sacrificing performance or starving the CPU.
 
 ## LPM Trie for Cgroup Matching
 
@@ -48,10 +48,11 @@ We've optimized this by moving the filtering logic to the `pid_filter_map`. When
 One of the most overlooked aspects of eBPF design is "telemetry for the profiler itself." If a stack walk fails in the kernel, or if we run out of space in a ring buffer, how does the operator know?
 
 We implemented a dedicated `errors` ringbuffer. Inside the BPF programs, we use a tagged union (`ErrorEvent`) to report different failure modes:
-1.  **`ERR_GET_STACK`**: If `bpf_get_stack` returns a negative code (e.g., because the stack was paged out).
-2.  **`ERR_RINGBUF_RESERVE`**: If the ring buffer is full and we dropped a sample.
+1.  **`ERR_STACK_FETCH`**: If `bpf_get_stack` returns a negative code (e.g., because the process exited while the stack was being walked).
+2.  **`ERR_RESERVE_STACK_RINGBUF`**: If the high-volume stack event ring buffer is full and we dropped a sample.
+3.  **`ERR_RESERVE_TRIGGER_RINGBUF`**: If the trigger event ring buffer is full.
 
-In userspace, these are caught, decoded, and logged. This allows us to distinguish between "there is no activity" and "the profiler is failing to capture data." The use of a C union in the BPF side, mapped to a Rust `enum` in the agent, gives us a type-safe way to handle these heterogeneous error events without the overhead of multiple maps.
+In userspace, these are caught, decoded, and logged with actionable advice (e.g., "increase ring buffer size"). This allows us to distinguish between "there is no activity" and "the profiler is failing to capture data." The use of a C union in the BPF side, mapped to a Rust `enum` in the agent, gives us a type-safe way to handle these heterogeneous error events without the overhead of multiple maps.
 
 ## Agent Lifecycle
 
@@ -63,16 +64,16 @@ stateDiagram-v2
     Unloaded --> Loaded : "load()"
     Loaded --> Attached : "attach_perf_events()"
     Attached --> Polling : "start_polling()"
-    Polling --> Attached : "stop_flag.set(true)"
+    Polling --> Attached : "cancel.cancel()"
     Attached --> [*] : "Drop"
 
     note right of Loaded : "Maps created, PROG_LOAD called"
     note right of Attached : "Progs linked to CPU_CLOCK"
-    note right of Polling : "Blocking thread running rb.poll()"
+    note right of Polling : "Tokio task running AsyncRingBuffer"
 ```
 
 The `LoadedProfilerAgent` struct acts as a guard for the active profiling session. When the struct is dropped, the BPF links and the ring buffer are cleaned up in a specific sequence. This prevents use-after-free-like scenarios where the kernel might try to push data into a ring buffer that userspace has already unmapped.
 
 ---
-_Auto-generated from commit `6703ee0` by Gemini 3.1 Pro.
+_Auto-generated from commit `02320e5` by Gemini 3.1 Pro.
 Last updated: 2026-05-10_
