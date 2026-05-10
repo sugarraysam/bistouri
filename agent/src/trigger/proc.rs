@@ -1,3 +1,4 @@
+use crate::capture::vdso::{read_vdso_range, VdsoCache};
 use crate::sys::cgroup::resolve_cgroup_path;
 use crate::telemetry::{METRIC_PROC_WALK_DURATION, METRIC_PROC_WALK_MATCHES};
 use crate::trigger::config::TriggerConfig;
@@ -5,6 +6,7 @@ use crate::trigger::matcher::CommMatcher;
 use crate::trigger::ProcessMatchEvent;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +29,14 @@ impl ProcWalker {
     }
 
     /// Walks all processes and sends matching events. Checks cancellation between PIDs.
-    pub(crate) fn walk(&self, tx: &mpsc::Sender<ProcessMatchEvent>, cancel: &CancellationToken) {
+    /// Populates the VdsoCache for each matched PID so the profiler can classify
+    /// fallback stack frames (vDSO vs unknown).
+    pub(crate) fn walk(
+        &self,
+        tx: &mpsc::Sender<ProcessMatchEvent>,
+        cancel: &CancellationToken,
+        vdso_cache: &Arc<Mutex<VdsoCache>>,
+    ) {
         let start = Instant::now();
         let pids = self.pids();
         debug!(pid_count = pids.len(), "proc_walk started");
@@ -45,6 +54,13 @@ impl ProcWalker {
             let rule_ids = self.matcher.match_comm(&comm);
             if rule_ids.is_empty() {
                 continue;
+            }
+
+            // Read /proc/<pid>/auxv OUTSIDE the lock — this is the slow I/O.
+            // Only lock briefly to insert the result.
+            let range = read_vdso_range(pid, &self.proc_path);
+            if let Ok(mut cache) = vdso_cache.lock() {
+                cache.insert(pid, range);
             }
 
             let cgroup_path = match resolve_cgroup_path(&self.cgroup2_mount, &self.proc_path, pid) {

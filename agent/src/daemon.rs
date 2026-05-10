@@ -3,9 +3,11 @@ use crate::args::Args;
 use crate::capture::orchestrator::{CaptureOrchestrator, STACK_SAMPLE_CHANNEL_SIZE};
 use crate::capture::session::CompletedSession;
 use crate::capture::trace::StackSample;
+use crate::capture::vdso::VdsoCache;
 use crate::sys;
 use crate::telemetry;
 use crate::trigger::PreparedTriggerAgent;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +62,10 @@ impl BistouriDaemon {
         let kernel_meta = sys::preflight::run_preflight_checks().await?;
         telemetry::record_agent_info(&kernel_meta, args.freq, args.capture_duration_secs);
 
+        // Shared VdsoCache: populated by proc_walk (trigger module),
+        // read by profiler ringbuf callback (capture module).
+        let vdso_cache = Arc::new(Mutex::new(VdsoCache::new()));
+
         // Phase 1: Prepare TriggerAgent (loads config, creates event channel,
         // resolves cgroup2 mount point).
         let prepared =
@@ -69,7 +75,8 @@ impl BistouriDaemon {
         let agent_builder = ProfilerAgentBuilder::new()
             .with_freq(args.freq)
             .with_trigger_tx(prepared.trigger_tx())
-            .with_stack_tx(stack_tx);
+            .with_stack_tx(stack_tx)
+            .with_vdso_cache(vdso_cache.clone());
         let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
         let comm_lpm_trie_handle = loaded_agent.comm_lpm_trie_handle()?;
         let pid_filter_handle = loaded_agent.pid_filter_handle()?;
@@ -91,7 +98,7 @@ impl BistouriDaemon {
 
         // Phase 4: Start TriggerAgent with BPF trie handle and capture channel.
         let trigger_handle = prepared
-            .start(comm_lpm_trie_handle, capture_tx, cancel.clone())
+            .start(comm_lpm_trie_handle, capture_tx, cancel.clone(), vdso_cache)
             .await?;
 
         // Downstream consumer — logs completed sessions until symbolizer is wired.

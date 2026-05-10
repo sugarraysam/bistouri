@@ -408,7 +408,7 @@ mod tests {
             pid,
             trace: StackTrace::new(
                 vec![trace_id],
-                vec![UserFrame {
+                vec![UserFrame::Resolved {
                     build_id: [trace_id as u8; BUILD_ID_SIZE],
                     file_offset: trace_id + 1,
                 }],

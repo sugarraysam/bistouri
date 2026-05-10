@@ -226,7 +226,7 @@ mod tests {
 
     /// Shorthand for a resolved user frame.
     fn frame(bid_byte: u8, offset: u64) -> UserFrame {
-        UserFrame {
+        UserFrame::Resolved {
             build_id: bid(bid_byte),
             file_offset: offset,
         }

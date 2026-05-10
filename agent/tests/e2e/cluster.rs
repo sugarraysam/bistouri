@@ -45,40 +45,6 @@ impl E2eCluster {
     }
 }
 
-impl Drop for E2eCluster {
-    fn drop(&mut self) {
-        info!("cleaning up E2E resources");
-        // Delete in reverse order. --ignore-not-found prevents errors if
-        // the test failed before all resources were created.
-        let _ = kubectl(&[
-            "delete",
-            "-f",
-            &format!("{}/workloads.yaml", self.k8s_dir),
-            "--ignore-not-found",
-            "--wait=false",
-        ]);
-        let _ = kubectl(&[
-            "delete",
-            "-f",
-            &format!("{}/bistouri-daemonset.yaml", self.k8s_dir),
-            "--ignore-not-found",
-            "--wait=false",
-        ]);
-        let _ = kubectl(&[
-            "delete",
-            "-f",
-            &format!("{}/configmap-phase2.yaml", self.k8s_dir),
-            "--ignore-not-found",
-        ]);
-        let _ = kubectl(&[
-            "delete",
-            "-f",
-            &format!("{}/configmap-phase1.yaml", self.k8s_dir),
-            "--ignore-not-found",
-        ]);
-    }
-}
-
 /// Run a kubectl command, returning stdout on success.
 fn kubectl(args: &[&str]) -> Result<String, E2eError> {
     let output = Command::new("kubectl")

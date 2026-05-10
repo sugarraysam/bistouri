@@ -8,9 +8,9 @@ FROM gcc:bookworm AS builder
 
 COPY cpu_burner.c io_burner.c mem_hog.c ./
 
-RUN gcc -static -O2 -o cpu-burner cpu_burner.c -lm \
- && gcc -static -O2 -o io-burner io_burner.c \
- && gcc -static -O2 -o mem-hog   mem_hog.c
+RUN gcc -static -O2 -Wl,--build-id -o cpu-burner cpu_burner.c -lm \
+ && gcc -static -O2 -Wl,--build-id -o io-burner io_burner.c \
+ && gcc -static -O2 -Wl,--build-id -o mem-hog   mem_hog.c
 
 FROM scratch
 COPY --from=builder /cpu-burner /io-burner /mem-hog /

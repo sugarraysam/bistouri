@@ -34,7 +34,7 @@ integration-tests:
 
 # Run E2E tests, skip image rebuild (reuse existing images)
 integration-tests-debug:
-	SKIP_BUILD=true ./tests/e2e/run-e2e-wrapper.sh
+	SKIP_CLEANUP=true ./tests/e2e/run-e2e-wrapper.sh
 
 clean:
 	cargo clean -p bistouri-agent

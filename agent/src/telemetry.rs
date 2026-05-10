@@ -27,8 +27,9 @@ pub(crate) const METRIC_TRIGGER_CHANNEL_FULL: &str = "bistouri_profiler_trigger_
 /// Stack samples dropped due to full channel (statistical loss at 19 Hz).
 pub(crate) const METRIC_STACK_CHANNEL_FULL: &str = "bistouri_profiler_stack_channel_full";
 
-/// User stack frames where kernel could not resolve build_id (JIT, vDSO, anonymous).
-pub(crate) const METRIC_USER_FRAMES_FALLBACK: &str = "bistouri_profiler_user_frames_fallback";
+/// User stack frames by classification.
+/// Labels: `kind` = "resolved" | "vdso" | "corrupted" | "unresolved".
+pub(crate) const METRIC_USER_FRAMES: &str = "bistouri_profiler_user_frames";
 
 // ---------------------------------------------------------------------------
 // Trigger subsystem (trigger/mod.rs, trigger/psi.rs)
@@ -130,8 +131,8 @@ pub(crate) fn describe_all() {
         "Stack samples dropped due to full channel (statistical loss at 19Hz)"
     );
     metrics::describe_counter!(
-        METRIC_USER_FRAMES_FALLBACK,
-        "User stack frames where kernel could not resolve build_id (JIT, vDSO, anonymous)"
+        METRIC_USER_FRAMES,
+        "User stack frames by classification (resolved, vdso, corrupted, unresolved)"
     );
 
     // -- Trigger --

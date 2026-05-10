@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Outer safety net for Bistouri E2E tests.
 
-set -euo pipefail
+set -euxo pipefail
 
+SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
@@ -21,7 +22,11 @@ sudo nohup k3s server --disable=traefik --disable=servicelb \
 until sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -q .; do sleep 2; done
 sudo k3s kubectl wait --for=condition=Ready node --all --timeout=60s
 
-cleanup() { sudo k3s-killall.sh 2>/dev/null || true; }
+cleanup() {
+	if [[ "${SKIP_CLEANUP}" != "true" ]]; then
+		sudo k3s-killall.sh 2>/dev/null || true
+	fi
+}
 trap cleanup EXIT
 
 # 3. Kubeconfig setup

@@ -7,6 +7,7 @@ mod trie;
 pub(crate) mod watcher;
 
 use crate::capture::session::CaptureRequest;
+use crate::capture::vdso::VdsoCache;
 use crate::sys::cgroup::{cgroup_path_to_id, find_cgroup2_mount, resolve_cgroup_path};
 use crate::telemetry::{
     METRIC_CGROUP_RESOLVE_FAILURES, METRIC_CONFIG_RELOADS, METRIC_CONFIG_RELOAD_FAILURES,
@@ -18,7 +19,7 @@ use matcher::CommMatcher;
 use proc::ProcWalker;
 use psi::{PsiRegisterResult, PsiRegistry};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -127,6 +128,7 @@ impl PreparedTriggerAgent {
         comm_lpm_trie_handle: libbpf_rs::MapHandle,
         capture_tx: mpsc::Sender<CaptureRequest>,
         cancel: CancellationToken,
+        vdso_cache: Arc<Mutex<VdsoCache>>,
     ) -> Result<JoinHandle<()>> {
         let (control_tx, control_rx) = mpsc::channel::<TriggerControl>(8);
 
@@ -144,6 +146,7 @@ impl PreparedTriggerAgent {
             &self.proc_path,
             self.event_tx.clone(),
             proc_walk_cancel.clone(),
+            vdso_cache.clone(),
         );
 
         // Spawn config file watcher with the daemon's cancel token.
@@ -172,6 +175,7 @@ impl PreparedTriggerAgent {
             event_tx: self.event_tx,
             event_rx,
             control_rx,
+            vdso_cache,
         };
 
         let task_handle = tokio::spawn(async move {
@@ -202,6 +206,7 @@ struct TriggerAgent {
     event_tx: mpsc::Sender<ProcessMatchEvent>,
     event_rx: mpsc::Receiver<ProcessMatchEvent>,
     control_rx: mpsc::Receiver<TriggerControl>,
+    vdso_cache: Arc<Mutex<VdsoCache>>,
 }
 
 impl TriggerAgent {
@@ -351,6 +356,7 @@ impl TriggerAgent {
             &self.proc_path,
             self.event_tx.clone(),
             self.proc_walk_cancel.clone(),
+            self.vdso_cache.clone(),
         );
         self.proc_handle = Some(handle);
     }
@@ -364,6 +370,7 @@ impl TriggerAgent {
         proc_path: &Path,
         tx: mpsc::Sender<ProcessMatchEvent>,
         cancel: CancellationToken,
+        vdso_cache: Arc<Mutex<VdsoCache>>,
     ) -> tokio::task::JoinHandle<()> {
         let config = Arc::clone(config);
         let mount = cgroup2_mount.to_path_buf();
@@ -386,9 +393,10 @@ impl TriggerAgent {
                 let p = proc_path.clone();
                 let t = tx.clone();
                 let ct = cancel.clone();
+                let vc = vdso_cache.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let walker = ProcWalker::new(&cfg, &m, &p);
-                    walker.walk(&t, &ct);
+                    walker.walk(&t, &ct, &vc);
                 })
                 .await;
             }

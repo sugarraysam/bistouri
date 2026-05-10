@@ -1,6 +1,7 @@
 use crate::agent::error::{AgentError, Result};
 use crate::agent::ringbuf::AsyncRingBuffer;
 use crate::capture::trace::StackSample;
+use crate::capture::vdso::VdsoCache;
 use crate::telemetry::{
     METRIC_STACK_CHANNEL_FULL, METRIC_STACK_FETCH_ERRORS, METRIC_STACK_RINGBUF_FULL,
     METRIC_TRIGGER_CHANNEL_FULL, METRIC_TRIGGER_RINGBUF_FULL,
@@ -9,6 +10,7 @@ use crate::trigger::ProcessMatchEvent;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use perf_event::{events::Software, Builder, Counter};
 use std::os::fd::AsRawFd;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -298,6 +300,7 @@ pub(crate) struct ProfilerAgent {
     ncpus: usize,
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
     stack_tx: Sender<StackSample>,
+    vdso_cache: Arc<Mutex<VdsoCache>>,
 }
 
 impl ProfilerAgent {
@@ -305,6 +308,7 @@ impl ProfilerAgent {
         freq: u64,
         trigger_tx: Option<Sender<ProcessMatchEvent>>,
         stack_tx: Sender<StackSample>,
+        vdso_cache: Arc<Mutex<VdsoCache>>,
     ) -> Result<Self> {
         let ncpus = libbpf_rs::num_possible_cpus()
             .map_err(|e| AgentError::Bpf("failed to get possible CPUs".into(), e))?;
@@ -313,6 +317,7 @@ impl ProfilerAgent {
             ncpus,
             trigger_tx,
             stack_tx,
+            vdso_cache,
         })
     }
 
@@ -354,7 +359,7 @@ impl ProfilerAgent {
             })?;
         loaded.links.push(link);
 
-        loaded.setup_ringbuffers(self.trigger_tx, self.stack_tx)?;
+        loaded.setup_ringbuffers(self.trigger_tx, self.stack_tx, self.vdso_cache)?;
         loaded.attach_perf_events(self.ncpus, self.freq)?;
 
         Ok(loaded)
@@ -380,13 +385,14 @@ impl LoadedProfilerAgent {
         &mut self,
         trigger_tx: Option<Sender<ProcessMatchEvent>>,
         stack_tx: Sender<StackSample>,
+        vdso_cache: Arc<Mutex<VdsoCache>>,
     ) -> Result<()> {
         let mut builder = libbpf_rs::RingBufferBuilder::new();
 
         builder
             .add(&self.skel.maps.stack_events, move |data| {
                 if let Some(event) = StackTraceEvent::from_bytes(data) {
-                    let sample = StackSample::from_event(event);
+                    let sample = StackSample::from_event(event, &vdso_cache);
                     if let Err(mpsc::error::TrySendError::Full(_)) = stack_tx.try_send(sample) {
                         error!(
                             "stack sample channel full, samples being dropped — \
@@ -506,6 +512,7 @@ pub(crate) struct ProfilerAgentBuilder {
     freq: u64,
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
     stack_tx: Option<Sender<StackSample>>,
+    vdso_cache: Option<Arc<Mutex<VdsoCache>>>,
 }
 
 impl Default for ProfilerAgentBuilder {
@@ -514,6 +521,7 @@ impl Default for ProfilerAgentBuilder {
             freq: DEFAULT_SAMPLING_FREQ_HZ,
             trigger_tx: None,
             stack_tx: None,
+            vdso_cache: None,
         }
     }
 }
@@ -538,10 +546,18 @@ impl ProfilerAgentBuilder {
         self
     }
 
+    pub(crate) fn with_vdso_cache(mut self, cache: Arc<Mutex<VdsoCache>>) -> Self {
+        self.vdso_cache = Some(cache);
+        self
+    }
+
     pub(crate) fn try_build(self) -> Result<ProfilerAgent> {
         let stack_tx = self
             .stack_tx
             .ok_or_else(|| AgentError::InvalidState("stack_tx is required".into()))?;
-        ProfilerAgent::try_new(self.freq, self.trigger_tx, stack_tx)
+        let vdso_cache = self
+            .vdso_cache
+            .ok_or_else(|| AgentError::InvalidState("vdso_cache is required".into()))?;
+        ProfilerAgent::try_new(self.freq, self.trigger_tx, stack_tx, vdso_cache)
     }
 }

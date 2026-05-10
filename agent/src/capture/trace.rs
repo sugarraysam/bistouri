@@ -1,9 +1,17 @@
 use serde::Serialize;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
-use crate::agent::profiler::{StackTraceEvent, UserStackFrame, BUILD_ID_SIZE};
-use crate::telemetry::METRIC_USER_FRAMES_FALLBACK;
-use tracing::error;
+use crate::agent::profiler::{StackTraceEvent, UserStackFrame, BUILD_ID_SIZE, TASK_COMM_LEN};
+use crate::capture::vdso::{is_canonical_user_address, VdsoCache};
+use crate::telemetry::METRIC_USER_FRAMES;
+use tracing::debug;
+
+/// Placeholder label for vDSO frames — kernel-provided syscall fast-path.
+const LABEL_VDSO: &str = "[vdso]";
+
+/// Placeholder label for unresolved frames — JIT, anonymous mappings.
+const LABEL_UNKNOWN: &str = "[unknown]";
 
 /// Kernel `bpf_stack_build_id_status` enum values.
 /// Parsed from the raw `i32` status field in `UserStackFrame`.
@@ -27,13 +35,25 @@ impl TryFrom<i32> for BuildIdStatus {
     }
 }
 
-/// A resolved user-space frame with build_id and file offset.
-/// The kernel computed the file offset from the VMA — ASLR is already handled.
-/// The symbolizer adjusts by `(p_vaddr - p_offset)` for symbol table lookup.
+/// A user-space stack frame from `bpf_get_stack` with `BPF_F_USER_BUILD_ID`.
+///
+/// Frames are either fully resolved (build_id + file offset) or placeholders
+/// for addresses the kernel couldn't resolve. Placeholders preserve call chain
+/// structure in flamegraphs — production profilers (`perf`, Strobelight, Parca)
+/// use the same approach.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub(crate) struct UserFrame {
-    pub build_id: [u8; BUILD_ID_SIZE],
-    pub file_offset: u64,
+pub(crate) enum UserFrame {
+    /// Kernel resolved build_id + file_offset. Ready for symbolization.
+    /// The kernel computed the file offset from the VMA — ASLR is already handled.
+    /// The symbolizer adjusts by `(p_vaddr - p_offset)` for symbol table lookup.
+    Resolved {
+        build_id: [u8; BUILD_ID_SIZE],
+        file_offset: u64,
+    },
+    /// Placeholder for frames the kernel couldn't resolve.
+    /// Preserves call chain structure in flamegraphs.
+    /// `label` is a static tag like "[vdso]" or "[unknown]".
+    Placeholder { label: &'static str, ip: u64 },
 }
 
 /// A unique stack trace (kernel + user frames), trimmed to actual depth.
@@ -43,9 +63,9 @@ pub(crate) struct UserFrame {
 /// enabling the symbolizer to attribute frames to specific DSOs without needing
 /// /proc/pid/maps.
 ///
-/// Frames where the kernel could not resolve a build_id (`BPF_STACK_BUILD_ID_IP`)
-/// are dropped — they require /proc/pid/maps de-ASLR which is not yet implemented.
-/// A metric counter tracks their frequency for future prioritization.
+/// Fallback frames where the kernel could not resolve a build_id are kept as
+/// labeled placeholders (`[vdso]`, `[unknown]`) to preserve call chain integrity.
+/// Corrupted frames (non-canonical addresses) are silently dropped.
 ///
 /// Uses pre-computed hashing: the content hash is computed once during
 /// construction and cached in `cached_hash`. The `Hash` impl feeds only
@@ -105,10 +125,10 @@ impl StackTrace {
     ///
     /// User frames are parsed from `UserStackFrame` structs returned by
     /// `bpf_get_stack` with `BPF_F_USER_BUILD_ID`. Each frame has a status:
-    /// - `Valid` (1): build_id + file_offset resolved by kernel → stored
-    /// - `FallbackIp` (2): raw IP fallback (JIT, vDSO) → logged, metriced, dropped
+    /// - `Valid` (1): build_id + file_offset resolved by kernel → `Resolved`
+    /// - `FallbackIp` (2): raw IP → classified as `[vdso]`, `[unknown]`, or corrupted
     /// - `Empty` (0): end-of-trace sentinel → stops parsing
-    pub(crate) fn from_event(event: &StackTraceEvent) -> Self {
+    pub(crate) fn from_event(event: &StackTraceEvent, vdso_cache: &Arc<Mutex<VdsoCache>>) -> Self {
         let kernel_frames = if event.kernel_stack_sz > 0 {
             let count = event.kernel_stack_sz as usize / std::mem::size_of::<u64>();
             event.kernel_stack[..count].to_vec()
@@ -118,7 +138,12 @@ impl StackTrace {
 
         let user_frames = if event.user_stack_sz > 0 {
             let count = event.user_stack_sz as usize / std::mem::size_of::<UserStackFrame>();
-            Self::parse_user_frames(&event.user_stack[..count])
+            Self::parse_user_frames(
+                &event.user_stack[..count],
+                event.pid,
+                &event.comm,
+                vdso_cache,
+            )
         } else {
             Vec::new()
         };
@@ -126,13 +151,24 @@ impl StackTrace {
         Self::new(kernel_frames, user_frames)
     }
 
-    fn parse_user_frames(raw: &[UserStackFrame]) -> Vec<UserFrame> {
+    fn parse_user_frames(
+        raw: &[UserStackFrame],
+        pid: u32,
+        comm: &[u8; TASK_COMM_LEN],
+        vdso_cache: &Arc<Mutex<VdsoCache>>,
+    ) -> Vec<UserFrame> {
+        let comm_str = std::str::from_utf8(comm)
+            .unwrap_or("unknown")
+            .trim_end_matches('\0');
+
         let mut frames = Vec::with_capacity(raw.len());
         for frame in raw {
             let status = match BuildIdStatus::try_from(frame.status) {
                 Ok(s) => s,
                 Err(unknown) => {
-                    error!(
+                    debug!(
+                        pid = pid,
+                        comm = comm_str,
                         status = unknown,
                         "unknown user_stack_frame status, skipping frame",
                     );
@@ -143,18 +179,40 @@ impl StackTrace {
             match status {
                 BuildIdStatus::Empty => break,
                 BuildIdStatus::Valid => {
-                    frames.push(UserFrame {
+                    metrics::counter!(METRIC_USER_FRAMES, "kind" => "resolved").increment(1);
+                    frames.push(UserFrame::Resolved {
                         build_id: frame.build_id,
                         file_offset: frame.offset_or_ip,
                     });
                 }
                 BuildIdStatus::FallbackIp => {
-                    error!(
-                        ip = format_args!("{:#x}", frame.offset_or_ip),
-                        "user frame has no build_id (BPF_STACK_BUILD_ID_IP), \
-                         de-ASLR for fallback frames not yet implemented",
-                    );
-                    metrics::counter!(METRIC_USER_FRAMES_FALLBACK).increment(1);
+                    let ip = frame.offset_or_ip;
+
+                    if !is_canonical_user_address(ip) {
+                        // Stack walk corruption — garbage return address.
+                        metrics::counter!(METRIC_USER_FRAMES, "kind" => "corrupted").increment(1);
+                        continue;
+                    }
+
+                    // Check if IP falls in the process's vDSO range.
+                    let is_vdso = vdso_cache
+                        .lock()
+                        .map(|mut cache| cache.contains(pid, ip))
+                        .unwrap_or(false);
+
+                    if is_vdso {
+                        metrics::counter!(METRIC_USER_FRAMES, "kind" => "vdso").increment(1);
+                        frames.push(UserFrame::Placeholder {
+                            label: LABEL_VDSO,
+                            ip,
+                        });
+                    } else {
+                        metrics::counter!(METRIC_USER_FRAMES, "kind" => "unresolved").increment(1);
+                        frames.push(UserFrame::Placeholder {
+                            label: LABEL_UNKNOWN,
+                            ip,
+                        });
+                    }
                 }
             }
         }
@@ -171,10 +229,10 @@ pub(crate) struct StackSample {
 }
 
 impl StackSample {
-    pub(crate) fn from_event(event: &StackTraceEvent) -> Self {
+    pub(crate) fn from_event(event: &StackTraceEvent, vdso_cache: &Arc<Mutex<VdsoCache>>) -> Self {
         Self {
             pid: event.pid,
-            trace: StackTrace::from_event(event),
+            trace: StackTrace::from_event(event, vdso_cache),
         }
     }
 }
@@ -183,12 +241,18 @@ impl StackSample {
 mod tests {
     use super::*;
     use crate::agent::profiler::{MAX_STACK_DEPTH, TASK_COMM_LEN};
+    use crate::capture::vdso::read_vdso_range;
     use rstest::rstest;
 
     /// Status constants for test readability (mirror BuildIdStatus discriminants).
     const VALID: i32 = 1;
     const FALLBACK_IP: i32 = 2;
     const EMPTY: i32 = 0;
+
+    /// Build a VdsoCache with no entries — all lookups miss.
+    fn empty_vdso_cache() -> Arc<Mutex<VdsoCache>> {
+        Arc::new(Mutex::new(VdsoCache::new()))
+    }
 
     /// Helper: builds a zero-initialized event, then populates kernel frames
     /// (raw IPs) and user frames (UserStackFrame with status/build_id/offset).
@@ -242,7 +306,8 @@ mod tests {
     #[case::max_depth(127, 127)]
     fn kernel_frame_trimming(#[case] depth: usize, #[case] expected: usize) {
         let event = make_event(depth, &[]);
-        let trace = StackTrace::from_event(&event);
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
         assert_eq!(trace.kernel_frames.len(), expected);
     }
 
@@ -261,25 +326,10 @@ mod tests {
         2,
         "multiple valid frames stored"
     )]
-    #[case::fallback_dropped(
-        &[(FALLBACK_IP, [0; BUILD_ID_SIZE], 0xFFFF_CAFE)],
-        0,
-        "fallback IP frame is dropped"
-    )]
     #[case::empty_terminates(
         &[(VALID, bid(0xAA), 0x1000), (EMPTY, [0; BUILD_ID_SIZE], 0), (VALID, bid(0xCC), 0x3000)],
         1,
         "EMPTY status terminates parsing, trailing VALID is not reached"
-    )]
-    #[case::mixed_valid_and_fallback(
-        &[(VALID, bid(0xAA), 0x100), (FALLBACK_IP, [0; BUILD_ID_SIZE], 0xDEAD), (VALID, bid(0xBB), 0x200)],
-        2,
-        "fallback frame dropped, both valid frames stored"
-    )]
-    #[case::all_fallback(
-        &[(FALLBACK_IP, [0; BUILD_ID_SIZE], 0x1), (FALLBACK_IP, [0; BUILD_ID_SIZE], 0x2)],
-        0,
-        "all-fallback trace yields zero user frames"
     )]
     #[case::unknown_status_skipped(
         &[(99, [0; BUILD_ID_SIZE], 0x42), (VALID, bid(0xAA), 0x100)],
@@ -292,22 +342,169 @@ mod tests {
         #[case] description: &str,
     ) {
         let event = make_event(0, raw_frames);
-        let trace = StackTrace::from_event(&event);
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
         assert_eq!(trace.user_frames.len(), expected_count, "{description}");
     }
+
+    // -----------------------------------------------------------------------
+    // Fallback classification — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::corrupted_poison_aa(0xAAAA_AAAA_AAAA_AAAA, 0, "non-canonical poison bytes are dropped")]
+    #[case::corrupted_kernel_range(
+        0xFFFF_8000_0000_0000,
+        0,
+        "kernel-range address is non-canonical, dropped"
+    )]
+    #[case::canonical_becomes_unknown(
+        0x7FFE_0000_1000,
+        1,
+        "canonical address without vdso cache hit → [unknown] placeholder"
+    )]
+    #[case::low_canonical_becomes_unknown(
+        0x0040_1000,
+        1,
+        "low canonical address (typical .text) → [unknown] placeholder"
+    )]
+    fn fallback_classification(
+        #[case] ip: u64,
+        #[case] expected_count: usize,
+        #[case] description: &str,
+    ) {
+        let event = make_event(0, &[(FALLBACK_IP, [0; BUILD_ID_SIZE], ip)]);
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
+        assert_eq!(trace.user_frames.len(), expected_count, "{description}");
+
+        // If kept, verify it's an [unknown] placeholder.
+        if expected_count == 1 {
+            match &trace.user_frames[0] {
+                UserFrame::Placeholder {
+                    label,
+                    ip: frame_ip,
+                } => {
+                    assert_eq!(*label, LABEL_UNKNOWN);
+                    assert_eq!(*frame_ip, ip);
+                }
+                other => panic!("expected Placeholder, got {:?}", other),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // vDSO tagging (requires auxv fixture)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vdso_frame_tagged_when_cache_hit() {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test_trace_vdso");
+        let pid_dir = dir.join("42");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+
+        let vdso_base: u64 = 0x7FFE_ABCD_0000;
+        // Write synthetic auxv with AT_SYSINFO_EHDR.
+        let mut auxv = Vec::new();
+        auxv.extend_from_slice(&33u64.to_ne_bytes()); // AT_SYSINFO_EHDR
+        auxv.extend_from_slice(&vdso_base.to_ne_bytes());
+        auxv.extend_from_slice(&0u64.to_ne_bytes()); // AT_NULL
+        auxv.extend_from_slice(&0u64.to_ne_bytes());
+        std::fs::write(pid_dir.join("auxv"), &auxv).unwrap();
+
+        let cache = Arc::new(Mutex::new(VdsoCache::new()));
+        let range = read_vdso_range(42, &dir);
+        cache.lock().unwrap().insert(42, range);
+
+        let ip_in_vdso = vdso_base + 0x100;
+        let event = make_event(0, &[(FALLBACK_IP, [0; BUILD_ID_SIZE], ip_in_vdso)]);
+        let trace = StackTrace::from_event(&event, &cache);
+
+        assert_eq!(trace.user_frames.len(), 1);
+        match &trace.user_frames[0] {
+            UserFrame::Placeholder { label, ip } => {
+                assert_eq!(*label, LABEL_VDSO);
+                assert_eq!(*ip, ip_in_vdso);
+            }
+            other => panic!("expected [vdso] Placeholder, got {:?}", other),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Mixed trace ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mixed_trace_preserves_order() {
+        // Resolved + fallback canonical + resolved → 3 frames in order.
+        let event = make_event(
+            1,
+            &[
+                (VALID, bid(0xAA), 0x1000),
+                (FALLBACK_IP, [0; BUILD_ID_SIZE], 0x7FFE_0000_2000),
+                (VALID, bid(0xBB), 0x3000),
+            ],
+        );
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
+
+        assert_eq!(trace.user_frames.len(), 3);
+        assert!(matches!(&trace.user_frames[0], UserFrame::Resolved { .. }));
+        assert!(matches!(
+            &trace.user_frames[1],
+            UserFrame::Placeholder {
+                label: LABEL_UNKNOWN,
+                ..
+            }
+        ));
+        assert!(matches!(&trace.user_frames[2], UserFrame::Resolved { .. }));
+    }
+
+    #[test]
+    fn corrupted_frame_in_middle_dropped_others_kept() {
+        // Resolved + corrupted + resolved → 2 frames (corrupted dropped).
+        let event = make_event(
+            0,
+            &[
+                (VALID, bid(0xAA), 0x100),
+                (FALLBACK_IP, [0; BUILD_ID_SIZE], 0xAAAA_AAAA_AAAA_AAAA),
+                (VALID, bid(0xBB), 0x200),
+            ],
+        );
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
+        assert_eq!(trace.user_frames.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolved frame field preservation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn valid_frame_preserves_build_id_and_offset() {
         let event = make_event(0, &[(VALID, bid(0xAA), 0x1000)]);
-        let trace = StackTrace::from_event(&event);
-        assert_eq!(trace.user_frames[0].build_id, bid(0xAA));
-        assert_eq!(trace.user_frames[0].file_offset, 0x1000);
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
+        match &trace.user_frames[0] {
+            UserFrame::Resolved {
+                build_id,
+                file_offset,
+            } => {
+                assert_eq!(*build_id, bid(0xAA));
+                assert_eq!(*file_offset, 0x1000);
+            }
+            other => panic!("expected Resolved, got {:?}", other),
+        }
     }
 
     #[test]
     fn kernel_frames_preserve_addresses() {
         let event = make_event(3, &[]);
-        let trace = StackTrace::from_event(&event);
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
         assert_eq!(trace.kernel_frames[0], 0xdead_0000);
         assert_eq!(trace.kernel_frames[2], 0xdead_0002);
     }
@@ -325,7 +522,8 @@ mod tests {
         event.kernel_stack_sz = kernel_sz;
         event.user_stack_sz = user_sz;
 
-        let trace = StackTrace::from_event(&event);
+        let cache = empty_vdso_cache();
+        let trace = StackTrace::from_event(&event, &cache);
         assert!(trace.kernel_frames.is_empty());
         assert!(trace.user_frames.is_empty());
     }
@@ -362,8 +560,9 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let a = StackTrace::from_event(&make_event(1, frames_a));
-        let b = StackTrace::from_event(&make_event(1, frames_b));
+        let cache = empty_vdso_cache();
+        let a = StackTrace::from_event(&make_event(1, frames_a), &cache);
+        let b = StackTrace::from_event(&make_event(1, frames_b), &cache);
 
         assert_eq!(a == b, expected_equal, "{description}");
 
@@ -384,7 +583,8 @@ mod tests {
     #[test]
     fn stack_sample_extracts_pid() {
         let event = make_event(1, &[(VALID, bid(0xFF), 0x42)]);
-        let sample = StackSample::from_event(&event);
+        let cache = empty_vdso_cache();
+        let sample = StackSample::from_event(&event, &cache);
         assert_eq!(sample.pid, 42);
         assert_eq!(sample.trace.kernel_frames.len(), 1);
         assert_eq!(sample.trace.user_frames.len(), 1);
