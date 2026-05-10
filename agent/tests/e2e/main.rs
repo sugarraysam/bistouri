@@ -104,6 +104,70 @@ async fn bistouri_e2e() {
     info!("   capture sessions started:  cpu={cpu_val} io={io_val} mem={mem_val}");
     info!("   capture sessions completed (total): {completed_total}");
 
+    // ── Phase 1: Frame quality assertions ────────────────────────────
+    // Validate the BPF stack unwinder produces usable frames. With
+    // -fno-omit-frame-pointer on the stress binaries, resolved frames
+    // must dominate. A regression here means the frame pointer flag was
+    // dropped or the unwinder is broken.
+    let resolved = metrics
+        .get_counter("bistouri_profiler_user_frames", Some(("kind", "resolved")))
+        .await
+        .unwrap_or(0.0);
+    let corrupted = metrics
+        .get_counter("bistouri_profiler_user_frames", Some(("kind", "corrupted")))
+        .await
+        .unwrap_or(0.0);
+    let unresolved = metrics
+        .get_counter(
+            "bistouri_profiler_user_frames",
+            Some(("kind", "unresolved")),
+        )
+        .await
+        .unwrap_or(0.0);
+    let vdso = metrics
+        .get_counter("bistouri_profiler_user_frames", Some(("kind", "vdso")))
+        .await
+        .unwrap_or(0.0);
+
+    info!("📊 Frame quality: resolved={resolved} corrupted={corrupted} unresolved={unresolved} vdso={vdso}");
+
+    assert!(
+        resolved > corrupted,
+        "resolved frames ({resolved}) must exceed corrupted ({corrupted}) — \
+         check -fno-omit-frame-pointer in Dockerfile.stress"
+    );
+
+    // CPU samples must be ingested — validates the full BPF pipeline
+    // (pid_filter_map → perf_event → ringbuf → user-space ingestion).
+    let cpu_samples = metrics
+        .get_counter(
+            "bistouri_capture_samples_ingested",
+            Some(("resource", "cpu")),
+        )
+        .await
+        .unwrap_or(0.0);
+    assert!(
+        cpu_samples > 0.0,
+        "expected CPU samples to be ingested, got {cpu_samples}"
+    );
+    info!("📊 CPU samples ingested: {cpu_samples}");
+
+    // IO samples may be zero — perf_event only fires on-CPU, and
+    // io-burner is mostly off-CPU in kernel I/O wait. Log but don't
+    // assert until off-CPU profiling is implemented.
+    let io_samples = metrics
+        .get_counter(
+            "bistouri_capture_samples_ingested",
+            Some(("resource", "io")),
+        )
+        .await
+        .unwrap_or(0.0);
+    if io_samples == 0.0 {
+        tracing::warn!("⚠️  IO samples ingested = 0 (expected — perf_event is on-CPU only)");
+    } else {
+        info!("📊 IO samples ingested: {io_samples}");
+    }
+
     // ── Phase 2: Hot-reload config ───────────────────────────────────
     info!("Phase 2: testing config hot-reload");
 

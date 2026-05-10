@@ -8,14 +8,31 @@
  *
  * Writes 1 MB per iteration (256 × 4KB pages) with O_SYNC, then drops
  * the page cache to prevent the kernel from coalescing writes.
+ *
+ * Helper functions are __attribute__((noinline)) to produce a multi-frame
+ * stack trace, validating that the BPF frame-pointer unwinder can walk
+ * beyond a single frame.
  */
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
 
+/* 4 KB aligned buffer — matches page size for efficient flushing. */
+static char buf[4096];
+
+__attribute__((noinline)) static void write_page(int fd) {
+    lseek(fd, 0, SEEK_SET);
+    write(fd, buf, sizeof(buf));
+}
+
+__attribute__((noinline)) static void write_burst(int fd) {
+    /* Write 1 MB per burst — 256 sync writes per loop. */
+    for (int i = 0; i < 256; i++) {
+        write_page(fd);
+    }
+}
+
 int main(void) {
-    /* 4 KB aligned buffer — matches page size for efficient flushing. */
-    char buf[4096];
     memset(buf, 'A', sizeof(buf));
 
     int fd = open("/tmp/io_burn", O_WRONLY | O_CREAT | O_SYNC, 0644);
@@ -23,11 +40,7 @@ int main(void) {
         return 1;
 
     for (;;) {
-        /* Write 1 MB per iteration — 256 sync writes per loop. */
-        for (int i = 0; i < 256; i++) {
-            lseek(fd, 0, SEEK_SET);
-            write(fd, buf, sizeof(buf));
-        }
+        write_burst(fd);
         /* Force data + metadata to disk. */
         fdatasync(fd);
         /* Advise kernel to drop page cache — creates IO on next write. */

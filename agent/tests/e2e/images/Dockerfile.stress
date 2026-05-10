@@ -3,14 +3,21 @@
 # Produces three statically-linked binaries with distinct Linux `comm` names
 # (cpu-burner, io-burner, mem-hog) so Bistouri's comm-based matching can
 # differentiate them. Final image is FROM scratch (~200KB total).
+#
+# Uses Alpine (musl-libc) instead of Debian (glibc) because musl's syscall
+# wrappers are trivially shallow — the BPF frame-pointer unwinder rarely
+# hits corruption even in libc internals. Debian's glibc is compiled without
+# frame pointers, causing ~20% corrupted frames in stack traces.
 
-FROM gcc:bookworm AS builder
+FROM alpine:3.21 AS builder
+
+RUN apk add --no-cache gcc musl-dev
 
 COPY cpu_burner.c io_burner.c mem_hog.c ./
 
-RUN gcc -static -O2 -Wl,--build-id -o cpu-burner cpu_burner.c -lm \
- && gcc -static -O2 -Wl,--build-id -o io-burner io_burner.c \
- && gcc -static -O2 -Wl,--build-id -o mem-hog   mem_hog.c
+RUN gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o cpu-burner cpu_burner.c -lm \
+ && gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o io-burner io_burner.c \
+ && gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o mem-hog   mem_hog.c
 
 FROM scratch
 COPY --from=builder /cpu-burner /io-burner /mem-hog /
