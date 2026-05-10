@@ -3,7 +3,7 @@
 # Expected triggers:
 #   cpu-burner  → cpu     (tight 100m CPU limit creates cpu.pressure stalls)
 #   io-burner   → io      (fsync loop creates io.pressure stalls)
-#   mem-hog     → memory  (tight 32Mi limit creates memory.pressure stalls)
+#   mem-burner  → memory  (tight 64Mi limit creates memory.pressure stalls)
 #
 # The remaining 6 rules should NOT trigger because those resources
 # are not constrained for those workloads.
@@ -38,10 +38,10 @@ data:
           - resource: io
             threshold: 5.0
 
-      # mem-hog: Memory-bound workload — only memory.pressure should fire
+      # mem-burner: Memory-bound workload — only memory.pressure should fire
       - rule:
           type: Exact
-          comm: "mem-hog"
+          comm: "mem-burner"
         resources:
           - resource: cpu
             threshold: 5.0

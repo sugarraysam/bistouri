@@ -15,8 +15,8 @@ use super::trace::StackSample;
 use crate::sys::kernel::KernelMeta;
 use crate::telemetry::{
     METRIC_ACTIVE_SESSIONS, METRIC_SAMPLES_INGESTED, METRIC_SAMPLES_UNMATCHED,
-    METRIC_SESSIONS_COMPLETED, METRIC_SESSIONS_REJECTED_DUPLICATE, METRIC_SESSIONS_STARTED,
-    METRIC_SESSION_SAMPLES, METRIC_SINK_FAILURES,
+    METRIC_SESSIONS_COMPLETED, METRIC_SESSIONS_EMPTY, METRIC_SESSIONS_REJECTED_DUPLICATE,
+    METRIC_SESSIONS_STARTED, METRIC_SESSION_SAMPLES, METRIC_SINK_FAILURES,
 };
 
 /// Extracts the resource label string from a `CaptureSource` for metric labels.
@@ -290,6 +290,14 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         )
         .increment(1);
         metrics::histogram!(METRIC_SESSION_SAMPLES).record(completed.total_samples as f64);
+        if completed.total_samples == 0 {
+            metrics::counter!(
+                METRIC_SESSIONS_EMPTY,
+                "resource" => source_label(&completed.source),
+                "comm" => completed.comm.clone(),
+            )
+            .increment(1);
+        }
         metrics::gauge!(METRIC_ACTIVE_SESSIONS).set(self.sessions.len() as f64);
 
         if self.session_tx.send(completed).await.is_err() {

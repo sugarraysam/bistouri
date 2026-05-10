@@ -7,7 +7,7 @@
 # Dropped rules:
 #   cpu-burner  → cpu     (was triggering — now removed)
 #   io-burner   → io      (was triggering — now removed)
-#   mem-hog     → memory  (was triggering — now removed)
+#   mem-burner  → memory  (was triggering — now removed)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -35,10 +35,10 @@ data:
           - resource: memory
             threshold: 5.0
 
-      # mem-hog: only cpu + io (dropped memory)
+      # mem-burner: only cpu + io (dropped memory)
       - rule:
           type: Exact
-          comm: "mem-hog"
+          comm: "mem-burner"
         resources:
           - resource: cpu
             threshold: 5.0

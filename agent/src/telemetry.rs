@@ -94,6 +94,14 @@ pub(crate) const METRIC_ACTIVE_SESSIONS: &str = "bistouri_capture_active_session
 /// Total samples collected per completed session (histogram).
 pub(crate) const METRIC_SESSION_SAMPLES: &str = "bistouri_capture_session_samples";
 
+/// Completed sessions with zero stack samples.
+///
+/// Non-zero values indicate a PSI trigger fired but no BPF perf-event samples
+/// landed in the capture window — typically caused by a stale PID in the filter
+/// map (process restarted between watcher registration and capture), an
+/// exclusively off-CPU workload, or an extremely short pressure window.
+pub(crate) const METRIC_SESSIONS_EMPTY: &str = "bistouri_capture_sessions_empty";
+
 // ---------------------------------------------------------------------------
 // Agent info
 // ---------------------------------------------------------------------------
@@ -205,6 +213,10 @@ pub(crate) fn describe_all() {
     metrics::describe_histogram!(
         METRIC_SESSION_SAMPLES,
         "Total samples collected per completed session"
+    );
+    metrics::describe_counter!(
+        METRIC_SESSIONS_EMPTY,
+        "Completed sessions with zero stack samples (stale PID, off-CPU workload, or short pressure window)"
     );
 
     // -- Agent info --

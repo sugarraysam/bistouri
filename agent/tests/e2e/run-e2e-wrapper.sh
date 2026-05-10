@@ -8,13 +8,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # 1. Clean slate: Kill any stale k3s processes
-sudo k3s-killall.sh 2>/dev/null || true
+function cleanup() {
+	sudo pkill -9 "k3s" 2>/dev/null || true
+	sudo rm -fr /var/lib/rancher/k3s/server/db || true
+
+	# fix terminal output
+	stty sane || true
+}
+
+cleanup
 if systemctl is-active --quiet k3s 2>/dev/null; then
 	sudo systemctl stop k3s
 fi
 
 # 2. Start k3s fresh with standard defaults (Watch strategy is already native and fast)
-sudo nohup k3s server --disable=traefik --disable=servicelb \
+sudo nohup k3s server --disable=traefik \
+	--disable=servicelb \
 	--write-kubeconfig-mode=644 \
 	--kubelet-arg="sync-frequency=3s" \
 	>/tmp/k3s.log 2>&1 &
@@ -22,12 +31,12 @@ sudo nohup k3s server --disable=traefik --disable=servicelb \
 until sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -q .; do sleep 2; done
 sudo k3s kubectl wait --for=condition=Ready node --all --timeout=60s
 
-cleanup() {
+trap_cleanup() {
 	if [[ "${SKIP_CLEANUP}" != "true" ]]; then
-		sudo k3s-killall.sh 2>/dev/null || true
+		cleanup
 	fi
 }
-trap cleanup EXIT
+trap trap_cleanup EXIT
 
 # 3. Kubeconfig setup
 sudo cp /etc/rancher/k3s/k3s.yaml /tmp/bistouri-e2e-kubeconfig

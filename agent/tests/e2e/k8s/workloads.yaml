@@ -15,7 +15,7 @@ metadata:
     app: stress
     type: cpu
 spec:
-  restartPolicy: Always
+  restartPolicy: Never
   containers:
   - name: burner
     image: bistouri-stress:local
@@ -45,7 +45,7 @@ metadata:
     app: stress
     type: io
 spec:
-  restartPolicy: Always
+  restartPolicy: Never
   initContainers:
   - name: io-throttle
     image: busybox:latest
@@ -136,12 +136,12 @@ metadata:
     app: stress
     type: memory
 spec:
-  restartPolicy: Always
+  restartPolicy: Never
   containers:
   - name: hog
     image: bistouri-stress:local
     imagePullPolicy: Never
-    command: ["/mem-hog"]
+    command: ["/mem-burner"]
     resources:
       requests:
         cpu: "500m"

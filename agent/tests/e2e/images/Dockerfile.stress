@@ -13,13 +13,13 @@ FROM alpine:3.21 AS builder
 
 RUN apk add --no-cache gcc musl-dev
 
-COPY cpu_burner.c io_burner.c mem_hog.c ./
+COPY cpu_burner.c io_burner.c mem_burner.c ./
 
 RUN gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o cpu-burner cpu_burner.c -lm \
- && gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o io-burner io_burner.c \
- && gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o mem-hog   mem_hog.c
+ && gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o io-burner  io_burner.c \
+ && gcc -static -O2 -fno-omit-frame-pointer -Wl,--build-id -o mem-burner mem_burner.c
 
 FROM scratch
-COPY --from=builder /cpu-burner /io-burner /mem-hog /
+COPY --from=builder /cpu-burner /io-burner /mem-burner /
 # io-burner writes to /tmp — scratch images have no directories.
 COPY --from=builder /tmp /tmp
