@@ -129,6 +129,7 @@ impl PreparedTriggerAgent {
         capture_tx: mpsc::Sender<CaptureRequest>,
         cancel: CancellationToken,
         vdso_cache: Arc<Mutex<VdsoCache>>,
+        request_cooldown: Duration,
     ) -> Result<JoinHandle<()>> {
         let (control_tx, control_rx) = mpsc::channel::<TriggerControl>(8);
 
@@ -167,7 +168,7 @@ impl PreparedTriggerAgent {
             bpf_trie,
             cgroup2_mount: self.cgroup2_mount,
             proc_path: self.proc_path,
-            psi_registry: PsiRegistry::new(capture_tx),
+            psi_registry: PsiRegistry::new(capture_tx, request_cooldown),
             proc_handle: Some(proc_handle),
             watcher_handle: Some(watcher_handle),
             cancel,

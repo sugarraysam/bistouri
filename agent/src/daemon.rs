@@ -97,8 +97,18 @@ impl BistouriDaemon {
         let completed_rx = orch_handle.completed_rx;
 
         // Phase 4: Start TriggerAgent with BPF trie handle and capture channel.
+        // request_cooldown matches the capture window: a watcher cannot fire more
+        // than once per profiling session. Semantically distinct from capture_duration
+        // even though they share the same value today.
+        let request_cooldown = std::time::Duration::from_secs(args.capture_duration_secs);
         let trigger_handle = prepared
-            .start(comm_lpm_trie_handle, capture_tx, cancel.clone(), vdso_cache)
+            .start(
+                comm_lpm_trie_handle,
+                capture_tx,
+                cancel.clone(),
+                vdso_cache,
+                request_cooldown,
+            )
             .await?;
 
         // Downstream consumer — logs completed sessions until symbolizer is wired.

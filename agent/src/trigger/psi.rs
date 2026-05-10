@@ -29,13 +29,22 @@ pub(crate) enum PsiRegisterResult {
 pub(crate) struct PsiRegistry {
     watchers: HashMap<(u64, PsiResource), tokio::task::JoinHandle<()>>,
     capture_tx: mpsc::Sender<CaptureRequest>,
+    /// Minimum interval between successive capture requests from a single
+    /// watcher. Initialized from the capture duration so that a watcher
+    /// cannot emit more than one request per profiling window. Each watcher
+    /// enforces this locally — no shared state required.
+    request_cooldown: Duration,
 }
 
 impl PsiRegistry {
-    pub(crate) fn new(capture_tx: mpsc::Sender<CaptureRequest>) -> Self {
+    pub(crate) fn new(
+        capture_tx: mpsc::Sender<CaptureRequest>,
+        request_cooldown: Duration,
+    ) -> Self {
         Self {
             watchers: HashMap::new(),
             capture_tx,
+            request_cooldown,
         }
     }
 
@@ -74,6 +83,7 @@ impl PsiRegistry {
             resource,
             cgroup_path.to_path_buf(),
             self.capture_tx.clone(),
+            self.request_cooldown,
         );
         self.watchers.insert(registry_key, watcher);
         metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(self.watchers.len() as f64);
@@ -133,13 +143,24 @@ impl PsiRegistry {
         resource: PsiResource,
         cgroup_path: PathBuf,
         capture_tx: mpsc::Sender<CaptureRequest>,
+        request_cooldown: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             // PSI triggers fire via POLLPRI, not POLLIN. We must use
             // .ready(Interest::PRIORITY) — .readable() waits for POLLIN
             // which is always set on PSI fds (they are stat-like files).
+            //
+            // Cooldown: after sending a capture request, suppress further sends
+            // for `request_cooldown`. This reduces noise from repeated PSI fires
+            // during an active capture window. The orchestrator's inflight_guard
+            // remains the authoritative correctness backstop; the cooldown is a
+            // best-effort rate limiter that lives entirely within this task.
+            let mut last_sent: Option<std::time::Instant> = None;
             while let Ok(mut guard) = async_fd.ready(Interest::PRIORITY).await {
                 guard.clear_ready_matching(Ready::PRIORITY);
+                if last_sent.is_some_and(|t| t.elapsed() < request_cooldown) {
+                    continue;
+                }
                 info!(
                     pid = pid,
                     comm = %comm,
@@ -165,6 +186,8 @@ impl PsiRegistry {
                         "comm" => comm.clone(),
                     )
                     .increment(1);
+                } else {
+                    last_sent = Some(std::time::Instant::now());
                 }
             }
         })
