@@ -53,39 +53,39 @@ The following diagram illustrates how an event flows from a kernel trigger throu
 ```{mermaid}
 graph TD
     subgraph "Kernel Space"
-        P[Perf Event / Timer] -->|Trigger| H[handle_perf]
-        E[execve] -->|Trigger| M[match_comm_on_exec]
+        P["Perf Event / Timer"] -->|"Trigger"| H["handle_perf"]
+        E["execve"] -->|"Trigger"| M["match_comm_on_exec"]
 
-        H --> L1{PID in filter?}
-        L1 -- No --> Exit
-        L1 -- Yes --> R1[Reserve Ringbuf Space]
+        H --> L1{"PID in filter?"}
+        L1 -->|"No"| Exit["Exit"]
+        L1 -->|"Yes"| R1["Reserve Ringbuf Space"]
 
-        R1 -- Success --> S[Capture Kernel & User Stacks]
-        S --> Sub[Submit Event]
-        R1 -- Failure --> Err[Log to Error Map]
+        R1 -->|"Success"| S["Capture Kernel & User Stacks"]
+        S -->|"Submit"| Sub["Submit Event"]
+        R1 -->|"Failure"| Err["Log to Error Map"]
 
-        M --> L2{Comm in Trie?}
-        L2 -- Yes --> R2[Reserve Trigger Space]
-        R2 -- Success --> Sub2[Submit Match Event]
+        M --> L2{"Comm in Trie?"}
+        L2 -->|"Yes"| R2["Reserve Trigger Space"]
+        R2 -->|"Success"| Sub2["Submit Match Event"]
     end
 
     subgraph "Maps & Buffers"
-        Sub --> RB1[(perf_events Ringbuf)]
-        Sub2 --> RB2[(trigger_events Ringbuf)]
-        Err --> RB3[(errors Ringbuf)]
-        T[comm_lpm_trie] -.-> L2
-        F[pid_filter_map] -.-> L1
+        Sub --> RB1[("perf_events Ringbuf")]
+        Sub2 --> RB2[("trigger_events Ringbuf")]
+        Err --> RB3[("errors Ringbuf")]
+        T[("comm_lpm_trie")] -.-> L2
+        F[("pid_filter_map")] -.-> L1
     end
 
     subgraph "User Space (Rust)"
-        RB1 --> Reader1[Profile Collector]
-        RB2 --> Reader2[Trigger Handler]
-        RB3 --> Reader3[Error Logger]
-        Control[Agent Logic] -->|Update| F
-        Control -->|Update| T
+        RB1 --> Reader1["Profile Collector"]
+        RB2 --> Reader2["Trigger Handler"]
+        RB3 --> Reader3["Error Logger"]
+        Control["Agent Logic"] -->|"Update"| F
+        Control -->|"Update"| T
     end
 ```
 
 ---
-_Auto-generated from commit `9287f83` by Gemini 3.1 Pro.
-Last updated: 2026-05-07_
+_Auto-generated from commit `6703ee0` by Gemini 3.1 Pro.
+Last updated: 2026-05-10_
