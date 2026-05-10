@@ -62,6 +62,13 @@ symbolizer service for cross-host symbol resolution.
   trivial to add coverage for newly discovered edge cases — just add a
   new `#[case]` line. Use standalone `#[test]` only for complex
   lifecycle tests that don't fit a table structure.
+- Allocation Discipline: Avoid unnecessary heap allocations on hot paths.
+  Do not call `.clone()`, `.to_string()`, or `format!()` unless strictly
+  required by an API boundary. Prefer borrowing (`&str` over `String`,
+  `&[T]` over `Vec<T>`) and use `Copy` types where possible. When a
+  value must be moved into a consuming call, read any fields needed for
+  logging/error context from the result of that call rather than cloning
+  them beforehand.
 
 ### 2. eBPF Specific Guidelines (agent/ crate only)
 

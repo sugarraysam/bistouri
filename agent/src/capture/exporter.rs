@@ -1,0 +1,113 @@
+use crate::capture::error::ExportError;
+use crate::capture::session::CompletedSession;
+use async_trait::async_trait;
+use bistouri_api::v1::capture_service_client::CaptureServiceClient;
+use tonic::transport::Channel;
+use tracing::{info, warn};
+
+/// Downstream delivery contract for completed capture sessions.
+///
+/// This is the modularity boundary: the E2E `SessionSink`, the real
+/// symbolizer service, and any future consumer all implement this trait.
+/// `BistouriDaemon` depends only on `Box<dyn SessionExporter>` — swapping
+/// implementations requires no changes to the agent core.
+#[async_trait]
+pub(crate) trait SessionExporter: Send + Sync + 'static {
+    async fn export(&self, session: CompletedSession) -> Result<(), ExportError>;
+}
+
+// ── Log-only exporter (default when no endpoint is configured) ────────────
+
+/// Placeholder exporter that logs completed sessions and discards them.
+/// Used until a symbolizer endpoint is configured.
+pub(crate) struct NullExporter;
+
+#[async_trait]
+impl SessionExporter for NullExporter {
+    async fn export(&self, session: CompletedSession) -> Result<(), ExportError> {
+        info!(
+            session_id = %session.session_id,
+            pid = session.pid,
+            comm = %session.comm,
+            source = ?session.source,
+            total_samples = session.total_samples,
+            unique_traces = session.stack_traces.len(),
+            "completed session ready for symbolization (no endpoint configured)",
+        );
+        Ok(())
+    }
+}
+
+// ── gRPC exporter (production + E2E) ─────────────────────────────────────
+
+/// Ships `CompletedSession`s to a downstream `CaptureService` gRPC endpoint.
+///
+/// The channel is created once and re-used across sessions — tonic manages
+/// connection health and reconnects transparently. The TCP connection is
+/// established lazily on the first RPC call, so the agent starts successfully
+/// even if the downstream service is temporarily unavailable.
+pub(crate) struct GrpcExporter {
+    endpoint: String,
+    client: CaptureServiceClient<Channel>,
+}
+
+impl GrpcExporter {
+    /// Prepare a lazy gRPC channel to `endpoint` (e.g. `"http://localhost:9500"`).
+    ///
+    /// Does NOT open a TCP connection — the handshake is deferred to the first
+    /// `ReportSession` call. This means the agent binary never fails to start
+    /// due to a transiently unavailable symbolizer.
+    pub(crate) fn connect(endpoint: String) -> Result<Self, ExportError> {
+        let channel = Channel::from_shared(endpoint.clone())
+            .expect("invalid endpoint URI")
+            .connect_lazy();
+        Ok(Self {
+            endpoint,
+            client: CaptureServiceClient::new(channel),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionExporter for GrpcExporter {
+    async fn export(&self, session: CompletedSession) -> Result<(), ExportError> {
+        // session_id and total_samples are Copy — grab them before the move.
+        let session_id = session.session_id;
+        let total_samples = session.total_samples;
+
+        let payload = session.into_grpc_payload()?;
+
+        // Read comm before moving payload into the RPC call. One String per
+        // session (every ~3 s) — acceptable at this granularity.
+        let comm = payload
+            .metadata
+            .as_ref()
+            .map(|m| m.comm.clone())
+            .unwrap_or_default();
+
+        // CaptureServiceClient<Channel> is cheap to clone (inner Arc).
+        let mut client = self.client.clone();
+        match client.report_session(payload).await {
+            Ok(_) => {
+                info!(
+                    session_id = %session_id,
+                    comm = %comm,
+                    total_samples,
+                    "session forwarded to downstream service",
+                );
+                Ok(())
+            }
+            Err(status) => {
+                warn!(
+                    session_id = %session_id,
+                    comm = %comm,
+                    endpoint = %self.endpoint,
+                    code = ?status.code(),
+                    message = %status.message(),
+                    "session export failed — dropping (best-effort delivery)",
+                );
+                Err(ExportError::Grpc(status))
+            }
+        }
+    }
+}

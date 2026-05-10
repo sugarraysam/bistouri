@@ -1,9 +1,11 @@
 //! Bistouri E2E integration tests.
 //!
-//! Deploys Bistouri as a DaemonSet in a k3s cluster alongside three stress
+//! Deploys Bistouri as a Pod in a k3s cluster alongside three stress
 //! workloads (cpu-burner, io-burner, mem-hog). Validates:
 //!
-//!   Phase 1: PSI triggers fire for the correct (workload, resource) pairs.
+//!   Phase 1: Completed sessions arrive at the gRPC sink for each workload,
+//!             then Prometheus counters and frame quality are checked in one
+//!             scrape.
 //!   Phase 2: Config hot-reload is detected by the agent.
 //!
 //! Prerequisites (handled by `run-e2e-wrapper.sh`):
@@ -12,9 +14,11 @@
 
 mod cluster;
 mod error;
+mod grpc_sink;
 mod metrics;
 
 use cluster::E2eCluster;
+use grpc_sink::SessionSink;
 use metrics::MetricsClient;
 use std::time::Duration;
 use tracing::info;
@@ -23,6 +27,9 @@ const METRICS_PORT: u16 = 9464;
 const METRICS_REACHABLE_TIMEOUT: Duration = Duration::from_secs(180);
 const PHASE1_TIMEOUT: Duration = Duration::from_secs(120);
 const PHASE2_TIMEOUT: Duration = Duration::from_secs(120);
+
+// The three workloads whose sessions we expect to receive.
+const EXPECTED_COMMS: &[&str] = &["cpu-burner", "io-burner", "mem-hog"];
 
 fn k8s_dir() -> String {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
@@ -42,6 +49,14 @@ async fn bistouri_e2e() {
     let k8s_dir = k8s_dir();
     let metrics = MetricsClient::new(METRICS_PORT);
 
+    // ── Start gRPC sink (before deploying the agent) ──────────────────
+    // The sink must be up before the agent connects, so we start it first.
+    // Port is fixed (SINK_PORT = 9500) and shared with the pod YAML.
+    let sink = SessionSink::start()
+        .await
+        .expect("failed to start gRPC session sink");
+    info!(port = grpc_sink::SINK_PORT, "gRPC session sink listening");
+
     // ── Deploy Phase 1 ───────────────────────────────────────────────
     let cluster = E2eCluster::deploy_phase1(&k8s_dir).expect("failed to deploy Phase 1 resources");
 
@@ -51,135 +66,102 @@ async fn bistouri_e2e() {
         .await
         .expect("bistouri metrics endpoint never became reachable");
 
-    // ── Phase 1: Assert triggers fire ────────────────────────────────
-    info!("Phase 1: waiting for PSI triggers");
+    // ── Phase 1: Wait for completed sessions ─────────────────────────
+    // The sink receives a SessionPayload for each workload once its capture
+    // window finishes. This is a stronger signal than any Prometheus counter:
+    // it confirms the full pipeline (PSI → BPF capture → serialization →
+    // gRPC delivery) completed end-to-end.
+    info!("Phase 1: waiting for completed sessions from all workloads");
 
-    let cpu_val = metrics
-        .wait_for_counter_gt(
-            "bistouri_capture_sessions_started",
-            Some(("comm", "cpu-burner")),
-            0.0,
-            PHASE1_TIMEOUT,
-        )
+    let sessions = sink
+        .wait_for_comms(EXPECTED_COMMS, PHASE1_TIMEOUT)
         .await
-        .expect("cpu-burner did not trigger a CPU capture session");
-    info!(cpu_val, "✅ cpu-burner triggered CPU capture session");
+        .expect("did not receive a completed session for every workload");
 
-    // IO is now deterministic — io.max throttle guarantees io.pressure.
-    let io_val = metrics
-        .wait_for_counter_gt(
-            "bistouri_capture_sessions_started",
-            Some(("comm", "io-burner")),
-            0.0,
-            PHASE1_TIMEOUT,
-        )
-        .await
-        .expect("io-burner did not trigger an IO capture session");
-    info!(io_val, "✅ io-burner triggered IO capture session");
+    for comm in EXPECTED_COMMS {
+        let session = sessions
+            .iter()
+            .find(|s| s.metadata.as_ref().is_some_and(|m| m.comm == *comm))
+            .unwrap_or_else(|| panic!("no session received for workload {comm}"));
 
-    let mem_val = metrics
-        .wait_for_counter_gt(
-            "bistouri_capture_sessions_started",
-            Some(("comm", "mem-hog")),
-            0.0,
-            PHASE1_TIMEOUT,
-        )
-        .await
-        .expect("mem-hog did not trigger a Memory capture session");
-    info!(mem_val, "✅ mem-hog triggered Memory capture session");
+        info!(
+            comm = %comm,
+            session_id = %session.session_id,
+            total_samples = session.total_samples,
+            "✅ received completed session",
+        );
+    }
 
-    // ── Phase 1 Summary ──────────────────────────────────────────────
-    // Wait for at least 3 completed sessions (one per workload) to
-    // confirm the full capture pipeline finishes, not just triggers.
-    let completed_total = metrics
-        .wait_for_counter_gt(
-            "bistouri_capture_sessions_completed",
-            None,
-            2.0,
-            PHASE1_TIMEOUT,
-        )
-        .await
-        .expect("capture sessions never completed (expected >= 3)");
-    info!("📊 Phase 1 summary:");
-    info!("   capture sessions started:  cpu={cpu_val} io={io_val} mem={mem_val}");
-    info!("   capture sessions completed (total): {completed_total}");
+    // ── Phase 1: Prometheus counter + frame quality assertions ────────
+    // The gRPC sink confirmed the pipeline ran — counters are stable.
+    // One scrape, all assertions. No polling needed.
+    info!("Phase 1: scraping Prometheus counters");
+    let snapshot = metrics.scrape().await.expect("failed to scrape metrics");
 
-    // ── Phase 1: Frame quality assertions ────────────────────────────
-    // Validate the BPF stack unwinder produces usable frames. With
-    // -fno-omit-frame-pointer on the stress binaries, resolved frames
-    // must dominate. A regression here means the frame pointer flag was
-    // dropped or the unwinder is broken.
-    let resolved = metrics
-        .get_counter("bistouri_profiler_user_frames", Some(("kind", "resolved")))
-        .await
-        .unwrap_or(0.0);
-    let corrupted = metrics
-        .get_counter("bistouri_profiler_user_frames", Some(("kind", "corrupted")))
-        .await
-        .unwrap_or(0.0);
-    let unresolved = metrics
-        .get_counter(
-            "bistouri_profiler_user_frames",
-            Some(("kind", "unresolved")),
-        )
-        .await
-        .unwrap_or(0.0);
-    let vdso = metrics
-        .get_counter("bistouri_profiler_user_frames", Some(("kind", "vdso")))
-        .await
-        .unwrap_or(0.0);
+    // Sessions completed per workload — stronger signal than "started" since it
+    // confirms the full capture window ran and the payload was shipped.
+    for comm in EXPECTED_COMMS {
+        let val = snapshot.counter("bistouri_capture_sessions_completed", Some(("comm", comm)));
+        assert!(
+            val > 0.0,
+            "no completed capture sessions for {comm} (counter = {val})"
+        );
+        info!(comm, val, "✅ capture sessions completed");
+    }
+
+    // Frame quality: resolved must dominate corrupted.
+    let resolved = snapshot.counter("bistouri_profiler_user_frames", Some(("kind", "resolved")));
+    let corrupted = snapshot.counter("bistouri_profiler_user_frames", Some(("kind", "corrupted")));
+    let unresolved = snapshot.counter(
+        "bistouri_profiler_user_frames",
+        Some(("kind", "unresolved")),
+    );
+    let vdso = snapshot.counter("bistouri_profiler_user_frames", Some(("kind", "vdso")));
 
     info!("📊 Frame quality: resolved={resolved} corrupted={corrupted} unresolved={unresolved} vdso={vdso}");
-
     assert!(
         resolved > corrupted,
         "resolved frames ({resolved}) must exceed corrupted ({corrupted}) — \
          check -fno-omit-frame-pointer in Dockerfile.stress"
     );
 
-    // CPU samples must be ingested — validates the full BPF pipeline
-    // (pid_filter_map → perf_event → ringbuf → user-space ingestion).
-    let cpu_samples = metrics
-        .get_counter(
-            "bistouri_capture_samples_ingested",
-            Some(("resource", "cpu")),
-        )
-        .await
-        .unwrap_or(0.0);
+    // CPU samples must be ingested (validates BPF pipeline end-to-end).
+    let cpu_samples = snapshot.counter(
+        "bistouri_capture_samples_ingested",
+        Some(("resource", "cpu")),
+    );
     assert!(
         cpu_samples > 0.0,
         "expected CPU samples to be ingested, got {cpu_samples}"
     );
     info!("📊 CPU samples ingested: {cpu_samples}");
 
-    // IO samples may be zero — perf_event only fires on-CPU, and
-    // io-burner is mostly off-CPU in kernel I/O wait. Log but don't
-    // assert until off-CPU profiling is implemented.
-    let io_samples = metrics
-        .get_counter(
-            "bistouri_capture_samples_ingested",
-            Some(("resource", "io")),
-        )
-        .await
-        .unwrap_or(0.0);
+    // IO samples may be zero — perf_event only fires on-CPU.
+    let io_samples = snapshot.counter(
+        "bistouri_capture_samples_ingested",
+        Some(("resource", "io")),
+    );
     if io_samples == 0.0 {
         tracing::warn!("⚠️  IO samples ingested = 0 (expected — perf_event is on-CPU only)");
     } else {
         info!("📊 IO samples ingested: {io_samples}");
     }
 
+    let completed_total = snapshot.counter("bistouri_capture_sessions_completed", None);
+    info!(completed_total, "📊 Phase 1: completed sessions");
+
     // ── Phase 2: Hot-reload config ───────────────────────────────────
     info!("Phase 2: testing config hot-reload");
 
-    let initial_reloads = metrics
-        .get_counter("bistouri_trigger_config_reloads", None)
-        .await
-        .unwrap_or(0.0);
+    // Snapshot the current reload count before triggering the change.
+    let initial_reloads = snapshot.counter("bistouri_trigger_config_reloads", None);
 
     cluster
         .apply_phase2_config()
         .expect("failed to apply Phase 2 config");
 
+    // Poll until the agent detects the reload — this is the only place we
+    // genuinely need to wait for a future event.
     metrics
         .wait_for_counter_gt(
             "bistouri_trigger_config_reloads",
@@ -191,5 +173,6 @@ async fn bistouri_e2e() {
         .expect("config hot-reload was not detected");
     info!("✅ config hot-reload detected");
 
+    sink.shutdown();
     info!("🎉 All E2E assertions passed");
 }

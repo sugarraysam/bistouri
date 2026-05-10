@@ -7,16 +7,19 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: bistouri
+  name: bistouri-agent
   labels:
-    app: bistouri
+    app: bistouri-agent
 spec:
   # Access /proc for all host processes (comm, cgroup discovery).
   hostPID: true
+  # Share the host network namespace so that localhost:9500 resolves to
+  # the in-process SessionSink running in the E2E test binary.
+  hostNetwork: true
   restartPolicy: Always
   terminationGracePeriodSeconds: 5
   containers:
-  - name: bistouri
+  - name: bistouri-agent
     image: bistouri-agent:local
     imagePullPolicy: Never
     args:
@@ -26,6 +29,8 @@ spec:
     - "/host/proc"
     - "--log-level"
     - "bistouri_agent=debug"
+    - "--symbolizer-endpoint"
+    - "http://localhost:9500"
     ports:
     - containerPort: 9464
       hostPort: 9464

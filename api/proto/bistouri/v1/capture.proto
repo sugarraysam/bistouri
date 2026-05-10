@@ -1,6 +1,17 @@
 syntax = "proto3";
 package bistouri.v1;
 
+import "google/protobuf/empty.proto";
+
+// Downstream consumer contract.
+//
+// Both the E2E test sink and the production symbolizer implement this
+// service — the trait is the modularity boundary that makes them
+// interchangeable from the agent's perspective.
+service CaptureService {
+  rpc ReportSession(SessionPayload) returns (google.protobuf.Empty);
+}
+
 message CaptureSource {
   oneof source {
     PsiTrigger psi = 1;
@@ -34,7 +45,12 @@ message SessionPayload {
   string session_id = 1;
   CaptureSource source = 2;
   Metadata metadata = 3;
-  
+
   bytes traces_payload = 4;
   bytes counts_payload = 5;
+
+  // Total stack samples collected during this capture window.
+  // Surfaced here so consumers can assert on pipeline health
+  // without deserializing the full bincode payloads.
+  uint64 total_samples = 6;
 }

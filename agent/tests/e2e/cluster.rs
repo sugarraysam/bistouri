@@ -21,7 +21,7 @@ impl E2eCluster {
         info!("deploying Phase 1 resources");
 
         kubectl(&["apply", "-f", &format!("{k8s_dir}/configmap-phase1.yaml")])?;
-        kubectl(&["apply", "-f", &format!("{k8s_dir}/bistouri-daemonset.yaml")])?;
+        kubectl(&["apply", "-f", &format!("{k8s_dir}/bistouri-agent-pod.yaml")])?;
         kubectl(&["apply", "-f", &format!("{k8s_dir}/workloads.yaml")])?;
 
         info!("Phase 1 resources deployed");

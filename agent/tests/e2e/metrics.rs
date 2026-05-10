@@ -2,11 +2,35 @@ use crate::error::E2eError;
 use std::time::Duration;
 use tracing::{debug, info};
 
-/// Prometheus metrics client that polls Bistouri's `/metrics` endpoint.
+/// A single parsed scrape of Bistouri's `/metrics` endpoint.
 ///
-/// Collapses pod readiness, hostPort availability, and agent startup into
-/// a single idempotent poll — if we can read metrics, everything upstream
-/// is working.
+/// Holds the full parse result so callers can query many counters without
+/// making repeated HTTP requests.
+pub(crate) struct MetricsSnapshot {
+    scrape: prometheus_parse::Scrape,
+}
+
+impl MetricsSnapshot {
+    /// Look up a counter by name, optionally filtering by a single label pair.
+    /// Returns `0.0` when the metric is absent.
+    pub(crate) fn counter(&self, name: &str, label: Option<(&str, &str)>) -> f64 {
+        self.scrape
+            .samples
+            .iter()
+            .find(|s| {
+                s.metric == name
+                    && label.is_none_or(|(k, v)| s.labels.get(k).is_some_and(|lv| lv == v))
+            })
+            .map_or(0.0, |s| match s.value {
+                prometheus_parse::Value::Counter(v)
+                | prometheus_parse::Value::Gauge(v)
+                | prometheus_parse::Value::Untyped(v) => v,
+                _ => 0.0,
+            })
+    }
+}
+
+/// Prometheus metrics client that polls Bistouri's `/metrics` endpoint.
 pub(crate) struct MetricsClient {
     url: String,
     port: u16,
@@ -48,36 +72,21 @@ impl MetricsClient {
         })
     }
 
-    /// Scrape a counter by metric name. Optionally filter by a label
-    /// key/value pair. Returns 0.0 if the metric is absent.
-    pub(crate) async fn get_counter(
-        &self,
-        name: &str,
-        label: Option<(&str, &str)>,
-    ) -> Result<f64, E2eError> {
+    /// Fetch and parse the `/metrics` endpoint once, returning a snapshot for
+    /// multi-counter assertions without repeated HTTP round-trips.
+    pub(crate) async fn scrape(&self) -> Result<MetricsSnapshot, E2eError> {
         let body = self.client.get(&self.url).send().await?.text().await?;
         let lines = body.lines().map(|l| Ok(l.to_owned()));
         let scrape = prometheus_parse::Scrape::parse(lines)
             .map_err(|e| E2eError::MetricsParse(e.to_string()))?;
-
-        let val = scrape
-            .samples
-            .iter()
-            .find(|s| {
-                s.metric == name
-                    && label.is_none_or(|(k, v)| s.labels.get(k).is_some_and(|lv| lv == v))
-            })
-            .map_or(0.0, |s| match s.value {
-                prometheus_parse::Value::Counter(v)
-                | prometheus_parse::Value::Gauge(v)
-                | prometheus_parse::Value::Untyped(v) => v,
-                _ => 0.0,
-            });
-
-        Ok(val)
+        Ok(MetricsSnapshot { scrape })
     }
 
     /// Poll until a counter exceeds `threshold`, or time out.
+    ///
+    /// Kept for Phase 2 (hot-reload) where we must wait for an event
+    /// that hasn't happened yet. All Phase 1 assertions use `scrape()`
+    /// instead — the gRPC sink guarantees the pipeline has already run.
     pub(crate) async fn wait_for_counter_gt(
         &self,
         name: &str,
@@ -87,7 +96,11 @@ impl MetricsClient {
     ) -> Result<f64, E2eError> {
         tokio::time::timeout(timeout, async {
             loop {
-                let val = self.get_counter(name, label).await.unwrap_or(0.0);
+                let val = self
+                    .scrape()
+                    .await
+                    .map(|s| s.counter(name, label))
+                    .unwrap_or(0.0);
                 if val > threshold {
                     return val;
                 }

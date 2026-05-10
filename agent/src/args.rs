@@ -86,6 +86,17 @@ pub(crate) struct Args {
     /// Must be a prime number between 2 and 1009 (inclusive).
     #[arg(long, env = "BISTOURI_FREQ", default_value_t = 19, value_parser = parse_prime_freq)]
     pub freq: u64,
+
+    /// gRPC endpoint for the downstream CaptureService (e.g. `http://localhost:9500`).
+    ///
+    /// When set, completed capture sessions are forwarded to this endpoint via
+    /// the `CaptureService.ReportSession` RPC. When omitted, sessions are
+    /// logged locally (NullExporter).
+    ///
+    /// In production this points at the symbolizer service. In E2E tests it
+    /// points at the in-process `SessionSink`.
+    #[arg(long, env = "BISTOURI_SYMBOLIZER_ENDPOINT")]
+    pub symbolizer_endpoint: Option<String>,
 }
 
 fn clap_styles() -> Styles {

@@ -1,4 +1,5 @@
-mod error;
+pub(crate) mod error;
+pub(crate) mod exporter;
 pub(crate) mod orchestrator;
 mod pid_filter;
 pub(crate) mod session;

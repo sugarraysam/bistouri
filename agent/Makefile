@@ -4,8 +4,8 @@ help:
 	@echo "Agent targets:"
 	@echo "  docker-build            Build the agent Docker image"
 	@echo "  docker-run              Run the agent Docker image locally"
-	@echo "  integration-tests       Run E2E integration tests in k3s"
-	@echo "  integration-tests-debug Run E2E tests, skip image rebuild"
+	@echo "  integration-tests       Run E2E integration tests in k3s (INFO logging)"
+	@echo "  integration-tests-debug Run E2E tests with DEBUG logging, skip image rebuild"
 	@echo "  clean                   Clean agent build artifacts"
 
 # Build from repo root context so workspace Cargo.toml + api/ crate are available.
@@ -32,9 +32,9 @@ docker-run:
 integration-tests:
 	./tests/e2e/run-e2e-wrapper.sh
 
-# Run E2E tests, skip image rebuild (reuse existing images)
+# Run E2E tests with DEBUG logging and keep the cluster alive for inspection.
 integration-tests-debug:
-	SKIP_CLEANUP=true ./tests/e2e/run-e2e-wrapper.sh
+	SKIP_CLEANUP=true RUST_LOG=debug ./tests/e2e/run-e2e-wrapper.sh
 
 clean:
 	cargo clean -p bistouri-agent

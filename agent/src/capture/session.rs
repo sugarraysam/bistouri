@@ -145,25 +145,23 @@ pub(crate) struct CompletedSession {
     pub comm: String,
     /// Host kernel metadata for kernel stack symbolization.
     /// Shared across all sessions on this host (Arc = pointer bump).
-    #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub kernel_meta: Arc<KernelMeta>,
     #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub started_at: Instant,
     // TODO: stall_total_usec delta — PSI violation severity.
     pub stack_traces: Vec<StackTrace>,
     /// Dictionary-encoded profile: `counts[i]` = sample count for `stack_traces[i]`.
-    #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub counts: Vec<u64>,
     pub total_samples: u64,
 }
 
 impl CompletedSession {
-    #[allow(dead_code)]
     pub(crate) fn into_grpc_payload(
         self,
     ) -> std::result::Result<proto::SessionPayload, bincode::Error> {
         let traces_payload = bincode::serialize(&self.stack_traces)?;
         let counts_payload = bincode::serialize(&self.counts)?;
+        let total_samples = self.total_samples;
 
         let source = match self.source {
             CaptureSource::Psi(res) => {
@@ -196,6 +194,7 @@ impl CompletedSession {
             metadata: Some(metadata),
             traces_payload,
             counts_payload,
+            total_samples,
         })
     }
 }

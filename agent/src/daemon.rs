@@ -1,5 +1,6 @@
 use crate::agent::profiler::{LoadedProfilerAgent, ProfilerAgentBuilder};
 use crate::args::Args;
+use crate::capture::exporter::{GrpcExporter, NullExporter, SessionExporter};
 use crate::capture::orchestrator::{CaptureOrchestrator, STACK_SAMPLE_CHANNEL_SIZE};
 use crate::capture::session::CompletedSession;
 use crate::capture::trace::StackSample;
@@ -111,11 +112,24 @@ impl BistouriDaemon {
             )
             .await?;
 
-        // Downstream consumer — logs completed sessions until symbolizer is wired.
+        // Phase 5: Build the downstream exporter.
+        // GrpcExporter when --symbolizer-endpoint is configured, NullExporter
+        // otherwise. Both implement `SessionExporter` — the daemon core is
+        // agnostic to which one is running.
         let ds_cancel = cancel.clone();
-        let downstream_handle = tokio::spawn(async move {
-            Self::downstream_consumer(completed_rx, ds_cancel).await;
-        });
+        let downstream_handle = if let Some(endpoint) = args.symbolizer_endpoint {
+            info!(endpoint = %endpoint, "preparing downstream CaptureService (lazy connect)");
+            let exporter = GrpcExporter::connect(endpoint)
+                .map_err(|e| anyhow::anyhow!("failed to build symbolizer channel: {e}"))?;
+            tokio::spawn(async move {
+                Self::run_downstream(completed_rx, exporter, ds_cancel).await;
+            })
+        } else {
+            info!("no symbolizer endpoint configured — sessions will be logged locally");
+            tokio::spawn(async move {
+                Self::run_downstream(completed_rx, NullExporter, ds_cancel).await;
+            })
+        };
 
         info!("BPF profiler agent started");
 
@@ -141,10 +155,12 @@ impl BistouriDaemon {
         // loaded_agent drops here — BPF skel, links, and object are released last.
     }
 
-    /// Placeholder downstream consumer — logs completed sessions until
-    /// the symbolizer service is wired in.
-    async fn downstream_consumer(
+    /// Drive the downstream consumer loop. Receives `CompletedSession`s from
+    /// the orchestrator and hands them to the configured `SessionExporter`.
+    /// Export errors are logged and discarded — delivery is best-effort.
+    async fn run_downstream<E: SessionExporter>(
         mut completed_rx: mpsc::Receiver<CompletedSession>,
+        exporter: E,
         cancel: CancellationToken,
     ) {
         loop {
@@ -153,16 +169,9 @@ impl BistouriDaemon {
                 _ = cancel.cancelled() => break,
                 session = completed_rx.recv() => match session {
                     Some(session) => {
-                        info!(
-                            session_id = %session.session_id,
-                            pid = session.pid,
-                            comm = %session.comm,
-                            source = ?session.source,
-                            total_samples = session.total_samples,
-                            unique_traces = session.stack_traces.len(),
-                            "completed session ready for symbolization",
-                        );
-                        // TODO: forward to symbolizer service
+                        if let Err(e) = exporter.export(session).await {
+                            tracing::warn!(error = %e, "session export failed");
+                        }
                     }
                     None => break,
                 },

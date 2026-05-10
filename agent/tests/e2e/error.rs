@@ -14,4 +14,7 @@ pub(crate) enum E2eError {
 
     #[error("failed to parse metrics: {0}")]
     MetricsParse(String),
+
+    #[error("failed to bind gRPC sink on port {port}: {source}")]
+    SinkBind { port: u16, source: std::io::Error },
 }
