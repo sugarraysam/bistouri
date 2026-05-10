@@ -83,7 +83,7 @@ impl PsiRegistry {
 
     /// Aborts all active PSI watcher tasks and clears the registry.
     pub(crate) fn shutdown(&mut self) {
-        for (_, handle) in self.watchers.drain() {
+        for handle in self.watchers.drain().map(|(_, h)| h) {
             handle.abort();
         }
         metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(0.0);
@@ -161,7 +161,7 @@ impl PsiRegistry {
                     );
                     metrics::counter!(
                         METRIC_CAPTURE_CHANNEL_FULL,
-                        "resource" => format!("{resource:?}").to_lowercase(),
+                        "resource" => resource.to_string(),
                         "comm" => comm.clone(),
                     )
                     .increment(1);

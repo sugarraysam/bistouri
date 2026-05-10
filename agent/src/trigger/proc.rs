@@ -117,7 +117,7 @@ impl ProcWalker {
     }
 
     fn comm(&self, pid: u32) -> Option<String> {
-        fs::read_to_string(self.proc_path.join(format!("{}/comm", pid)))
+        fs::read_to_string(self.proc_path.join(pid.to_string()).join("comm"))
             .ok()
             .map(|s| s.trim_end().to_string())
     }

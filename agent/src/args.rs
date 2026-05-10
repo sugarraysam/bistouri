@@ -11,7 +11,7 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/bistouri/trigger.yaml";
 /// Runs on a minimal thread budget by default (1 async IO thread + 1 blocking thread)
 /// and scales via --io-threads / --blocking-threads for high-event environments.
 #[derive(Parser)]
-#[command(version, about, color = clap::ColorChoice::Always, styles = my_styles())]
+#[command(version, about, color = clap::ColorChoice::Always, styles = clap_styles())]
 pub(crate) struct Args {
     /// Path to the trigger config file (YAML).
     ///
@@ -54,9 +54,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 1)]
     pub blocking_threads: usize,
 
-    /// Log level filter (e.g. "bistouri=debug", "bistouri=info,tokio=warn").
+    /// Log level filter (e.g. "bistouri_agent=debug", "bistouri_agent=info,tokio=warn").
     ///
-    /// Resolution order: --log-level flag > RUST_LOG env > "bistouri=info"
+    /// Resolution order: --log-level flag > RUST_LOG env > "bistouri_agent=info"
     #[arg(long, env = "RUST_LOG")]
     pub log_level: Option<String>,
 
@@ -88,8 +88,7 @@ pub(crate) struct Args {
     pub freq: u64,
 }
 
-// Define your custom color palette
-fn my_styles() -> Styles {
+fn clap_styles() -> Styles {
     Styles::styled()
         .header(
             Style::new()

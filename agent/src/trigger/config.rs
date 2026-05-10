@@ -111,12 +111,12 @@ impl TriggerConfig {
         }
     }
 
-    /// Minimal default config: watch the bistouri process itself for
+    /// Minimal default config: watch the bistouri-agent process itself for
     /// Memory and CPU pressure at 10% threshold.
     pub(crate) fn default_config() -> Self {
         Self::try_new(vec![TargetConfig {
             rule: MatchRule::Exact {
-                comm: "bistouri".to_string(),
+                comm: "bistouri-agent".to_string(),
             },
             resources: vec![
                 ResourceConfig {

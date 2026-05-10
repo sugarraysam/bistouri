@@ -14,13 +14,13 @@ use tracing::info;
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Log level resolution: --log-level flag > RUST_LOG env > "bistouri=info"
+    // Log level resolution: --log-level flag > RUST_LOG env > "bistouri_agent=info"
     // Clap's `env` attribute already handles flag > env precedence, so
     // args.log_level is Some if either was set.
     let filter = args
         .log_level
         .as_deref()
-        .unwrap_or("bistouri=info")
+        .unwrap_or("bistouri_agent=info")
         .to_string();
 
     tracing_subscriber::fmt()

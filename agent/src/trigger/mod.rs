@@ -385,18 +385,15 @@ impl TriggerAgent {
                     _ = cancel.cancelled() => break,
                     _ = interval.tick() => {},
                 }
-                if cancel.is_cancelled() {
-                    break;
-                }
-                let cfg = Arc::clone(&config);
-                let m = mount.clone();
-                let p = proc_path.clone();
-                let t = tx.clone();
-                let ct = cancel.clone();
-                let vc = vdso_cache.clone();
+                let config = Arc::clone(&config);
+                let mount = mount.clone();
+                let proc_path = proc_path.clone();
+                let tx = tx.clone();
+                let cancel = cancel.clone();
+                let vdso_cache = vdso_cache.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let walker = ProcWalker::new(&cfg, &m, &p);
-                    walker.walk(&t, &ct, &vc);
+                    let walker = ProcWalker::new(&config, &mount, &proc_path);
+                    walker.walk(&tx, &cancel, &vdso_cache);
                 })
                 .await;
             }

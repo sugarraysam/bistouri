@@ -214,27 +214,27 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             return;
         };
 
-        let ids = session_ids.clone();
         let trace = sample.trace;
 
-        match ids.len() {
+        match session_ids.len() {
             0 => unreachable!("pid_sessions entry is never empty"),
             1 => {
                 // Common case: single session per PID. Zero clones.
-                if let Some(session) = self.sessions.get_mut(&ids[0]) {
+                if let Some(session) = self.sessions.get_mut(&session_ids[0]) {
                     session.record(trace);
                     metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                 }
             }
             _ => {
                 // Multiple sessions (e.g. mem + cpu): clone for all but last.
-                for session_id in &ids[..ids.len() - 1] {
+                let last_idx = session_ids.len() - 1;
+                for session_id in &session_ids[..last_idx] {
                     if let Some(session) = self.sessions.get_mut(session_id) {
                         session.record(trace.clone());
                         metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                     }
                 }
-                if let Some(session) = self.sessions.get_mut(ids.last().unwrap()) {
+                if let Some(session) = self.sessions.get_mut(&session_ids[last_idx]) {
                     session.record(trace);
                     metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                 }
@@ -306,7 +306,7 @@ const CAPTURE_REQUEST_CHANNEL_SIZE: usize = 128;
 /// Channel buffer for BPF ring buffer → CaptureOrchestrator stack samples.
 /// At 19Hz × N monitored PIDs, 4096 provides ~20s of buffering for 10 PIDs.
 /// `pub(crate)` because the stack sample channel is created externally (see
-/// `main.rs`) due to a circular dependency: the BPF ringbuffer callback needs
+/// `daemon.rs`) due to a circular dependency: the BPF ringbuffer callback needs
 /// the `Sender` at agent build time, before the orchestrator exists.
 pub(crate) const STACK_SAMPLE_CHANNEL_SIZE: usize = 4096;
 

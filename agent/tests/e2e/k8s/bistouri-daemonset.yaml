@@ -25,7 +25,7 @@ spec:
     - "--proc-path"
     - "/host/proc"
     - "--log-level"
-    - "bistouri=debug"
+    - "bistouri_agent=debug"
     ports:
     - containerPort: 9464
       hostPort: 9464

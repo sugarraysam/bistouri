@@ -214,6 +214,12 @@ pub(crate) fn describe_all() {
     );
 }
 
+/// Formats a byte slice as a lowercase hex string (e.g. `"ab01cd..."`).
+/// Used to format the kernel build ID for the agent info metric label.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Records the `bistouri_agent_info` gauge with host/config metadata labels.
 /// Called once at startup after `describe_all()`.
 pub(crate) fn record_agent_info(
@@ -221,15 +227,10 @@ pub(crate) fn record_agent_info(
     freq_hz: u64,
     capture_duration_secs: u64,
 ) {
-    let build_id_hex: String = kernel_meta
-        .build_id
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
     metrics::gauge!(
         METRIC_AGENT_INFO,
         "kernel_release" => kernel_meta.release.clone(),
-        "build_id" => build_id_hex,
+        "build_id" => hex_encode(&kernel_meta.build_id),
         "freq_hz" => freq_hz.to_string(),
         "capture_duration_secs" => capture_duration_secs.to_string(),
     )

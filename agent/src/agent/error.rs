@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum AgentError {
+pub(crate) enum AgentError {
     #[error("eBPF operation failed: {0}")]
     Bpf(String, #[source] libbpf_rs::Error),
 
@@ -15,4 +15,4 @@ pub enum AgentError {
     InvalidState(String),
 }
 
-pub type Result<T> = std::result::Result<T, AgentError>;
+pub(crate) type Result<T> = std::result::Result<T, AgentError>;
