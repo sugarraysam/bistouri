@@ -2,6 +2,13 @@
 name = "bistouri-api"
 version = "0.1.0"
 edition = "2021"
+publish = false
+
+[[bin]]
+name = "crd-gen"
+path = "src/bin/crd-gen.rs"
+# The crd-gen binary requires the kube feature for BistouriConfig::crd().
+required-features = ["kube"]
 
 [features]
 # Enables JsonSchema derives on config types — required by crd-gen and by the

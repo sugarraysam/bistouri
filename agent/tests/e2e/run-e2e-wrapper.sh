@@ -43,7 +43,13 @@ sudo cp /etc/rancher/k3s/k3s.yaml /tmp/bistouri-e2e-kubeconfig
 sudo chown "$(id -u):$(id -g)" /tmp/bistouri-e2e-kubeconfig
 export KUBECONFIG=/tmp/bistouri-e2e-kubeconfig
 
-# 4. Build + load images
+# 4. Validate deployment manifests against the live cluster (dry-run client-side).
+# The cluster is up and kubectl is configured — CRD kinds are registered by the
+# E2E Rust test itself, but --dry-run=client doesn't require server-side schema
+# awareness and the Makefile target tolerates 'no matches for kind' gracefully.
+make -C "$REPO_ROOT" validate-deployment
+
+# 5. Build + load images
 if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
 	DOCKER_BUILDKIT=1 docker build -t bistouri-agent:local -f "${REPO_ROOT}/agent/Dockerfile" "$REPO_ROOT"
 	docker build -t bistouri-stress:local \
@@ -54,5 +60,5 @@ docker pull busybox:latest
 docker save busybox:latest | sudo k3s ctr images import -
 docker save bistouri-stress:local | sudo k3s ctr images import -
 
-# 5. Run the Rust E2E test
+# 6. Run the Rust E2E test
 cargo +nightly test --test e2e -- --nocapture "$@"

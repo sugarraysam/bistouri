@@ -1,10 +1,10 @@
 //! CRD generator for Bistouri.
 //!
 //! Generates the `BistouriConfig` CustomResourceDefinition YAML.
-//! The schema, CEL rules, and CR type all live in `bistouri-api::cr`.
+//! The schema, CEL rules, and CR type all live in `bistouri_api::cr`.
 //!
 //! Usage:
-//!   cargo run -q -p crd-gen > deployment/crd/bistouriconfig.yaml
+//!   cargo run -q -p bistouri-api --bin crd-gen > deployment/crd/bistouriconfig.yaml
 //!   # or via make:
 //!   make generate-crd
 

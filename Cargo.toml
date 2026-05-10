@@ -3,6 +3,5 @@ members = [
     "agent",
     "api",
     "symbolizer",
-    "tools/crd-gen",
 ]
 resolver = "2"

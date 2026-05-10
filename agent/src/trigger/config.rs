@@ -1,12 +1,9 @@
-use crate::telemetry::METRIC_CONFIG_LOAD_FAILURES;
 use crate::trigger::error::{Result, TriggerError};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::Path;
-use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::warn;
 
-// Types are defined once in bistouri-api and shared with tools/crd-gen.
+// Types are defined once in bistouri-api and shared with the crd-gen binary in api/.
 // Re-export here so the rest of the agent continues to import from this module.
 pub(crate) use bistouri_api::config::{MatchRule, PsiResource, ResourceConfig, TargetConfig};
 
@@ -34,37 +31,6 @@ impl TriggerConfig {
         let raw: TriggerConfig =
             serde_yml::from_str(&contents).map_err(TriggerError::ConfigParse)?;
         Self::try_new(raw.targets)
-    }
-
-    /// Loads config from file if it exists, falling back to default config.
-    /// Config parsing runs in `spawn_blocking` to protect the event loop.
-    pub(crate) async fn load_or_default(path: &Path) -> Arc<Self> {
-        let path = path.to_path_buf();
-        match tokio::task::spawn_blocking(move || {
-            Self::load_from_file(path.to_str().unwrap_or_default())
-        })
-        .await
-        {
-            Ok(Ok(config)) => {
-                let comms: Vec<&str> = config.targets.iter().map(|t| t.rule.comm()).collect();
-                info!(
-                    target_count = config.targets.len(),
-                    ?comms,
-                    "loaded trigger config",
-                );
-                Arc::new(config)
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, "failed to load config, using default");
-                metrics::counter!(METRIC_CONFIG_LOAD_FAILURES).increment(1);
-                Arc::new(Self::default_config())
-            }
-            Err(e) => {
-                error!(error = %e, "config load task panicked, using default");
-                metrics::counter!(METRIC_CONFIG_LOAD_FAILURES).increment(1);
-                Arc::new(Self::default_config())
-            }
-        }
     }
 
     /// Minimal default config: watch the bistouri-agent process itself for

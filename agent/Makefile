@@ -4,7 +4,7 @@ help:
 	@echo "Agent targets:"
 	@echo "  docker-build            Build the agent Docker image"
 	@echo "  docker-run              Run the agent Docker image locally"
-	@echo "  integration-tests       Run E2E integration tests in k3s (INFO logging)"
+	@echo "  integration-tests       Run E2E integration tests in k3s (includes validate-deployment)"
 	@echo "  integration-tests-debug Run E2E tests with DEBUG logging, skip image rebuild"
 	@echo "  clean                   Clean agent build artifacts"
 

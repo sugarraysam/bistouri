@@ -1,4 +1,5 @@
 use crate::args::{Args, ConfigSource, KUBE_SA_NAMESPACE_PATH};
+use crate::telemetry::METRIC_CONFIG_LOAD_FAILURES;
 use crate::trigger::config::TriggerConfig;
 use crate::trigger::error::{Result, TriggerError};
 use crate::trigger::TriggerControl;
@@ -116,7 +117,32 @@ pub(crate) struct FileConfigWatcher {
 #[async_trait]
 impl ConfigWatcher for FileConfigWatcher {
     async fn load_initial(&self) -> Arc<TriggerConfig> {
-        TriggerConfig::load_or_default(&self.path).await
+        let path = self.path.clone();
+        match tokio::task::spawn_blocking(move || {
+            TriggerConfig::load_from_file(path.to_str().unwrap_or_default())
+        })
+        .await
+        {
+            Ok(Ok(config)) => {
+                let comms: Vec<&str> = config.targets.iter().map(|t| t.rule.comm()).collect();
+                info!(
+                    target_count = config.targets.len(),
+                    ?comms,
+                    "loaded trigger config",
+                );
+                Arc::new(config)
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "failed to load config, using default");
+                metrics::counter!(METRIC_CONFIG_LOAD_FAILURES).increment(1);
+                Arc::new(TriggerConfig::default_config())
+            }
+            Err(e) => {
+                error!(error = %e, "config load task panicked, using default");
+                metrics::counter!(METRIC_CONFIG_LOAD_FAILURES).increment(1);
+                Arc::new(TriggerConfig::default_config())
+            }
+        }
     }
 
     async fn watch(

@@ -32,9 +32,9 @@ docs-check:
 ci: fmt clippy test build docs-check
 
 # Regenerate deployment/crd/bistouriconfig.yaml from the Rust type definitions in
-# tools/crd-gen. Commit the result — CI validates the committed YAML via dry-run.
+# api/src/bin/crd-gen.rs. Commit the result — CI validates the committed YAML via dry-run.
 generate-crd:
-	cargo run -q -p crd-gen > deployment/crd/bistouriconfig.yaml
+	cargo run -q -p bistouri-api --bin crd-gen --features kube > deployment/crd/bistouriconfig.yaml
 
 # Mirror of the CI validate_deployment job — run locally before pushing.
 # Requires kubectl to be installed and configured (any cluster or just the binary).

@@ -2,7 +2,7 @@
 //!
 //! Gated on the `kube` feature. Consumers:
 //!
-//! - `tools/crd-gen` — calls `BistouriConfig::crd()` to emit the CRD YAML.
+//! - `api/src/bin/crd-gen.rs` — calls `BistouriConfig::crd()` to emit the CRD YAML.
 //! - `bistouri-agent` (KubeConfigWatcher) — watches `BistouriConfig` CRs via
 //!   `kube::Api<BistouriConfig>` and converts the spec to a `TriggerConfig`.
 //!
