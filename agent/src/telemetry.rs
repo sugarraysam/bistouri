@@ -50,6 +50,11 @@ pub(crate) const METRIC_CONFIG_RELOADS: &str = "bistouri_trigger_config_reloads"
 /// Failed configuration hot-reload attempts.
 pub(crate) const METRIC_CONFIG_RELOAD_FAILURES: &str = "bistouri_trigger_config_reload_failures";
 
+/// Config file failed to parse or the load task panicked — agent fell back to defaults.
+/// Distinct from `METRIC_CONFIG_RELOAD_FAILURES` (hot-reload BPF trie failure);
+/// this tracks the initial load path in `TriggerConfig::load_or_default`.
+pub(crate) const METRIC_CONFIG_LOAD_FAILURES: &str = "bistouri_trigger_config_load_failures";
+
 /// Capture request channel full, PSI event dropped.
 pub(crate) const METRIC_CAPTURE_CHANNEL_FULL: &str = "bistouri_trigger_capture_channel_full";
 
@@ -165,6 +170,10 @@ pub(crate) fn describe_all() {
         "Number of failed configuration hot-reload attempts"
     );
     metrics::describe_counter!(
+        METRIC_CONFIG_LOAD_FAILURES,
+        "Config file failed to parse or load task panicked — agent fell back to default config"
+    );
+    metrics::describe_counter!(
         METRIC_CAPTURE_CHANNEL_FULL,
         "Capture request channel full, PSI event dropped"
     );
@@ -245,6 +254,7 @@ pub(crate) fn record_agent_info(
         "build_id" => hex_encode(&kernel_meta.build_id),
         "freq_hz" => freq_hz.to_string(),
         "capture_duration_secs" => capture_duration_secs.to_string(),
+        "version" => env!("CARGO_PKG_VERSION"),
     )
     .set(1.0);
 }

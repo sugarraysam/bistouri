@@ -1,0 +1,135 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "bistouriconfigs.bistouri.dev"
+  },
+  "spec": {
+    "group": "bistouri.dev",
+    "names": {
+      "categories": [],
+      "kind": "BistouriConfig",
+      "plural": "bistouriconfigs",
+      "shortNames": [
+        "bc"
+      ],
+      "singular": "bistouriconfig"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Bistouri trigger configuration — PSI threshold rules per process comm.",
+            "properties": {
+              "spec": {
+                "description": "Bistouri trigger configuration — defines PSI threshold rules per process comm.\n\nApply a `BistouriConfig` CR in the same namespace as the agent to configure\nwhich processes to watch and at what PSI thresholds. The agent hot-reloads\nwhen the CR changes.",
+                "properties": {
+                  "targets": {
+                    "description": "Process targets to watch. At least one required.",
+                    "items": {
+                      "description": "Schema-generation wrapper for `TargetConfig`.\n\nIdentical wire format to `TargetConfig`; differs only in how the `rule`\nfield is represented in the OpenAPI schema (hand-written vs. derived).\nThe agent never instantiates this type at runtime.",
+                      "properties": {
+                        "resources": {
+                          "description": "PSI resources to watch for this target. At most 3 (Memory, Cpu, Io).",
+                          "items": {
+                            "description": "Per-resource trigger configuration within a target rule.",
+                            "properties": {
+                              "resource": {
+                                "description": "The PSI resource to watch.",
+                                "enum": [
+                                  "memory",
+                                  "cpu",
+                                  "io"
+                                ],
+                                "type": "string"
+                              },
+                              "threshold": {
+                                "description": "PSI stall threshold as a percentage of the 1 000 ms time window.\nMust be in the range (0.0, 100.0) exclusive.",
+                                "format": "double",
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "resource",
+                              "threshold"
+                            ],
+                            "type": "object"
+                          },
+                          "maxItems": 3,
+                          "type": "array"
+                        },
+                        "rule": {
+                          "description": "Process matching rule.",
+                          "properties": {
+                            "comm": {
+                              "description": "Process comm string. Max 15 bytes (kernel TASK_COMM_LEN - 1).",
+                              "maxLength": 15,
+                              "type": "string"
+                            },
+                            "type": {
+                              "description": "Exact: match the full comm string. Prefix: match any comm that starts with this string.",
+                              "enum": [
+                                "Exact",
+                                "Prefix"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "comm",
+                            "type"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "resources",
+                        "rule"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 64,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "targets"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "BistouriConfigValidated",
+            "type": "object",
+            "x-kubernetes-validations": [
+              {
+                "message": "spec.targets must not be empty",
+                "rule": "size(self.spec.targets) > 0"
+              },
+              {
+                "message": "threshold must be strictly between 0.0 and 100.0 (exclusive)",
+                "rule": "self.spec.targets.all(t, t.resources.all(r, r.threshold > 0.0 && r.threshold < 100.0))"
+              },
+              {
+                "message": "each target must declare at least one resource",
+                "rule": "self.spec.targets.all(t, size(t.resources) > 0)"
+              },
+              {
+                "message": "duplicate resource type within a single target — each PSI resource may appear at most once per target",
+                "rule": "self.spec.targets.all(t,  [\"memory\", \"cpu\", \"io\"].all(res,    t.resources.filter(r, r.resource == res).size() <= 1  ))"
+              }
+            ]
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {}
+      }
+    ]
+  }
+}

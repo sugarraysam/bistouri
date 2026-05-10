@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use trie::BpfTrie;
+use watcher::ConfigWatcher;
 
 /// Interval between periodic proc_walk scans. Each scan discovers matching
 /// processes that BPF exec tracing may have missed (duplicate-comm rules where
@@ -67,7 +68,7 @@ pub(super) enum TriggerControl {
 /// (needs the Sender) and TriggerAgent (needs the MapHandle).
 pub(crate) struct PreparedTriggerAgent {
     config: Arc<TriggerConfig>,
-    config_path: PathBuf,
+    watcher: Box<dyn ConfigWatcher>,
     event_tx: mpsc::Sender<ProcessMatchEvent>,
     event_rx: Option<mpsc::Receiver<ProcessMatchEvent>>,
     cgroup2_mount: PathBuf,
@@ -75,17 +76,18 @@ pub(crate) struct PreparedTriggerAgent {
 }
 
 impl PreparedTriggerAgent {
-    /// Phase 1: Load config, create channel, resolve cgroup2 mount. No BPF dependency yet.
+    /// Phase 1: Load initial config, create channel, resolve cgroup2 mount.
     ///
+    /// `watcher` is the already-constructed [`ConfigWatcher`] implementation.
     /// `proc_path` should point to procfs (e.g. `/host/proc` in container
     /// deployments). `cgroup_path` overrides auto-detection from the mount
     /// table when set.
     pub(crate) async fn prepare(
-        config_path: PathBuf,
+        watcher: Box<dyn ConfigWatcher>,
         proc_path: PathBuf,
         cgroup_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let config = TriggerConfig::load_or_default(&config_path).await;
+        let config = watcher.load_initial().await;
         let (event_tx, event_rx) = mpsc::channel::<ProcessMatchEvent>(TRIGGER_CHANNEL_SIZE);
 
         let cgroup2_mount = match cgroup_path {
@@ -108,7 +110,7 @@ impl PreparedTriggerAgent {
 
         Ok(Self {
             config,
-            config_path,
+            watcher,
             event_tx,
             event_rx: Some(event_rx),
             cgroup2_mount,
@@ -137,8 +139,6 @@ impl PreparedTriggerAgent {
         let mut bpf_trie = BpfTrie::new(comm_lpm_trie_handle);
         bpf_trie.repopulate(&self.config)?;
 
-        // proc_walk uses a child token: the parent (daemon) cancel reaches it,
-        // but config reload can also cancel just the walk independently.
         let proc_walk_cancel = cancel.child_token();
 
         let proc_handle = TriggerAgent::spawn_proc_walk(
@@ -150,12 +150,13 @@ impl PreparedTriggerAgent {
             vdso_cache.clone(),
         );
 
-        // Spawn config file watcher with the daemon's cancel token.
-        let watcher_handle = TriggerAgent::spawn_config_watcher(
-            self.config_path.clone(),
-            control_tx,
-            cancel.clone(),
-        );
+        // Spawn the config watcher with the daemon's cancel token.
+        // The watcher owns itself through its full watch loop.
+        let watcher_cancel = cancel.clone();
+        let watcher_control_tx = control_tx.clone();
+        let watcher_handle = tokio::spawn(async move {
+            self.watcher.watch(watcher_control_tx, watcher_cancel).await;
+        });
 
         let event_rx = self
             .event_rx
@@ -397,24 +398,6 @@ impl TriggerAgent {
                     walker.walk(&tx, &cancel, &vdso_cache);
                 })
                 .await;
-            }
-        })
-    }
-
-    fn spawn_config_watcher(
-        config_path: PathBuf,
-        control_tx: mpsc::Sender<TriggerControl>,
-        cancel: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {},
-                result = watcher::config_watcher_task(config_path, control_tx) => {
-                    if let Err(e) = result {
-                        error!(error = %e, "config watcher failed");
-                    }
-                },
             }
         })
     }

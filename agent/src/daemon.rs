@@ -7,6 +7,7 @@ use crate::capture::trace::StackSample;
 use crate::capture::vdso::VdsoCache;
 use crate::sys;
 use crate::telemetry;
+use crate::trigger;
 use crate::trigger::PreparedTriggerAgent;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -67,10 +68,11 @@ impl BistouriDaemon {
         // read by profiler ringbuf callback (capture module).
         let vdso_cache = Arc::new(Mutex::new(VdsoCache::new()));
 
-        // Phase 1: Prepare TriggerAgent (loads config, creates event channel,
-        // resolves cgroup2 mount point).
+        // Phase 1: Build the config watcher and load the initial configuration.
+        // build_watcher resolves --config-source=auto by probing the SA token path.
+        let watcher = trigger::watcher::build_watcher(&args).await;
         let prepared =
-            PreparedTriggerAgent::prepare(args.config, args.proc_path, args.cgroup_path).await?;
+            PreparedTriggerAgent::prepare(watcher, args.proc_path, args.cgroup_path).await?;
 
         // Phase 2: Build ProfilerAgent with trigger + stack sample senders.
         let agent_builder = ProfilerAgentBuilder::new()

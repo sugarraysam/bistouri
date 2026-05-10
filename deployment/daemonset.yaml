@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: bistouri-agent
+  namespace: bistouri
+  labels:
+    app.kubernetes.io/name: bistouri-agent
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bistouri-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bistouri-agent
+        app.kubernetes.io/component: agent
+      annotations:
+        # Prometheus scrape annotations for deployments without a ServiceMonitor.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: bistouri-agent
+      # hostPID: the agent walks /proc for all host PIDs and resolves cgroup paths
+      # from the host's perspective. Without this, /proc only shows container PIDs.
+      hostPID: true
+
+      # Tolerate all taints so the agent runs on every node including control-plane
+      # nodes — pressure events can occur anywhere.
+      tolerations:
+        - operator: Exists
+
+      containers:
+        - name: bistouri-agent
+          image: bistouri-agent:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --proc-path=/host/proc
+
+          env:
+            # Non-hot-reloadable runtime parameters — require a pod restart to change.
+            - name: BISTOURI_METRICS_PORT
+              value: "9464"
+            - name: BISTOURI_FREQ
+              value: "19"
+            - name: BISTOURI_CAPTURE_DURATION
+              value: "3"
+            # Used by --config-source=auto (and =kube) to scope the BistouriConfig watch.
+            # Injected via the Downward API so the agent always watches its own namespace.
+            - name: BISTOURI_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          ports:
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
+
+          securityContext:
+            capabilities:
+              add:
+                - BPF          # Load BPF programs and create BPF maps (kernel >= 5.8)
+                - PERFMON      # perf_event_open() for stack sampling (kernel >= 5.8)
+                - SYS_RESOURCE # Create PSI trigger FDs with sub-2s windows
+                - SYSLOG       # Read /proc/kallsyms for KASLR base resolution
+              drop:
+                - ALL
+            # BPF and perf_event_open syscalls are blocked by the default seccomp
+            # profile — Unconfined is required until a custom profile is built.
+            seccompProfile:
+              type: Unconfined
+
+          resources:
+            requests:
+              cpu: 10m
+              # 64 MiB BPF stack ring buffer + ~20 MiB Rust process baseline.
+              # In cgroup v2, BPF map memory is charged to the creating process's
+              # cgroup, so the ring buffer is counted against this limit.
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              # 512 MiB provides ample headroom above the 64 MiB ring buffer.
+              # Tighten after profiling real-world memory usage in your environment.
+              memory: 512Mi
+
+          volumeMounts:
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys-fs-cgroup
+              mountPath: /sys/fs/cgroup
+              # Must be readWrite: PSI fd registration works by writing a threshold
+              # spec to the cgroup pressure file (e.g. cgroup/memory.pressure).
+              # A readOnly mount causes every PsiFdBuilder::build() call to fail.
+              readOnly: false
+            - name: sys-kernel-tracing
+              mountPath: /sys/kernel/tracing
+              readOnly: false  # BPF tracepoint attachment requires write access
+            - name: sys-fs-bpf
+              mountPath: /sys/fs/bpf
+              readOnly: false  # BPF map pinning requires write access
+
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: sys-fs-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+        - name: sys-kernel-tracing
+          hostPath:
+            path: /sys/kernel/tracing
+        - name: sys-fs-bpf
+          hostPath:
+            path: /sys/fs/bpf

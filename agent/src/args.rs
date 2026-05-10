@@ -1,9 +1,38 @@
 use clap::builder::styling::{AnsiColor, Color, Style, Styles};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+
+/// Which config delivery strategy to use.
+///
+/// `Auto` probes for the Kubernetes in-cluster service account token
+/// (`/var/run/secrets/kubernetes.io/serviceaccount/token`). If present the
+/// agent watches a `BistouriConfig` CR; if absent it falls back to a YAML file
+/// watched via inotify. This makes both DaemonSet and baremetal (systemd)
+/// deployments work with no explicit flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ConfigSource {
+    /// Auto-detect: kube if in-cluster SA token exists, file otherwise.
+    Auto,
+    /// Watch a `BistouriConfig` CR via the Kubernetes API.
+    Kube,
+    /// Watch a YAML file on disk via inotify.
+    File,
+}
 
 /// Default config file path when neither --config flag nor BISTOURI_CONFIG env is set.
 const DEFAULT_CONFIG_PATH: &str = "/etc/bistouri/trigger.yaml";
+
+/// Default BistouriConfig CR name watched in kube source mode.
+const DEFAULT_CR_NAME: &str = "bistouri-config";
+
+/// Path to the Kubernetes in-cluster namespace file.
+///
+/// This file is present in every pod that has a ServiceAccount mounted
+/// (the default for all pods unless `automountServiceAccountToken: false`).
+/// Its presence is used by `--config-source=auto` to detect an in-cluster
+/// environment, and its content is read to determine the agent's namespace.
+pub(crate) const KUBE_SA_NAMESPACE_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 
 /// Bistouri — lightweight eBPF profiling agent triggered by Linux PSI events.
 ///
@@ -13,11 +42,55 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/bistouri/trigger.yaml";
 #[derive(Parser)]
 #[command(version, about, color = clap::ColorChoice::Always, styles = clap_styles())]
 pub(crate) struct Args {
+    /// Config delivery strategy.
+    ///
+    /// `auto` (default) probes for a Kubernetes in-cluster service account
+    /// token. Found → kube CR watch mode. Not found → file inotify mode.
+    /// Use `file` or `kube` to override auto-detection explicitly.
+    #[arg(
+        long,
+        env = "BISTOURI_CONFIG_SOURCE",
+        default_value = "auto",
+        value_name = "SOURCE"
+    )]
+    pub config_source: ConfigSource,
+
     /// Path to the trigger config file (YAML).
     ///
+    /// Used when `--config-source=file` (or `auto` resolves to file).
     /// Resolution order: --config flag > BISTOURI_CONFIG env > /etc/bistouri/trigger.yaml
-    #[arg(short, long, env = "BISTOURI_CONFIG", default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(
+        short,
+        long,
+        env = "BISTOURI_CONFIG",
+        default_value = DEFAULT_CONFIG_PATH,
+        conflicts_with_all = ["namespace", "cr_name"]
+    )]
     pub config: PathBuf,
+
+    /// Kubernetes namespace of the BistouriConfig CR to watch.
+    ///
+    /// Used when `--config-source=kube` (or `auto` resolves to kube).
+    /// Defaults to the in-cluster namespace from the service account token.
+    #[arg(
+        long,
+        env = "BISTOURI_NAMESPACE",
+        conflicts_with = "config",
+        value_name = "NS"
+    )]
+    pub namespace: Option<String>,
+
+    /// Name of the BistouriConfig CR to watch.
+    ///
+    /// Used when `--config-source=kube` (or `auto` resolves to kube).
+    #[arg(
+        long,
+        env = "BISTOURI_CR_NAME",
+        default_value = DEFAULT_CR_NAME,
+        conflicts_with = "config",
+        value_name = "NAME"
+    )]
+    pub cr_name: String,
 
     /// Path to procfs.
     ///

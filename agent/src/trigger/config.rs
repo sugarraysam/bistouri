@@ -1,3 +1,4 @@
+use crate::telemetry::METRIC_CONFIG_LOAD_FAILURES;
 use crate::trigger::error::{Result, TriggerError};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -5,62 +6,15 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-pub(crate) enum MatchRule {
-    Exact { comm: String },
-    Prefix { comm: String },
-}
-
-impl MatchRule {
-    pub(crate) fn comm(&self) -> &str {
-        match self {
-            MatchRule::Exact { comm } => comm,
-            MatchRule::Prefix { comm } => comm,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum PsiResource {
-    Memory,
-    Cpu,
-    Io,
-}
-
-impl std::fmt::Display for PsiResource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PsiResource::Memory => write!(f, "memory"),
-            PsiResource::Cpu => write!(f, "cpu"),
-            PsiResource::Io => write!(f, "io"),
-        }
-    }
-}
-
-/// Per-resource trigger configuration within a target rule.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ResourceConfig {
-    pub(crate) resource: PsiResource,
-    /// PSI stall threshold as a percentage of the 1 000 ms time window.
-    /// Must be in the range (0.0, 100.0) exclusive.
-    pub(crate) threshold: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct TargetConfig {
-    pub(crate) rule: MatchRule,
-    pub(crate) resources: Vec<ResourceConfig>,
-    /// Unique identifier assigned during construction.
-    /// Not user-facing — derived from the target's position in the Vec.
-    #[serde(skip)]
-    pub(crate) rule_id: u32,
-}
+// Types are defined once in bistouri-api and shared with tools/crd-gen.
+// Re-export here so the rest of the agent continues to import from this module.
+pub(crate) use bistouri_api::config::{MatchRule, PsiResource, ResourceConfig, TargetConfig};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TriggerConfig {
     pub(crate) targets: Vec<TargetConfig>,
+    // rule_id is assigned during construction via assign_rule_ids().
+    // It is not present in the YAML — TargetConfig::rule_id carries it.
 }
 
 impl TriggerConfig {
@@ -102,10 +56,12 @@ impl TriggerConfig {
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "failed to load config, using default");
+                metrics::counter!(METRIC_CONFIG_LOAD_FAILURES).increment(1);
                 Arc::new(Self::default_config())
             }
             Err(e) => {
                 error!(error = %e, "config load task panicked, using default");
+                metrics::counter!(METRIC_CONFIG_LOAD_FAILURES).increment(1);
                 Arc::new(Self::default_config())
             }
         }

@@ -104,7 +104,8 @@ impl PsiRegistry {
         resource: PsiResource,
         threshold: f64,
     ) -> Result<AsyncFd<presutaoru::PsiFd>> {
-        let entry = presutaoru::PsiEntry::Cgroup(resource.into(), cgroup_path);
+        let entry =
+            presutaoru::PsiEntry::Cgroup(psi_resource_to_cgroup_entry(resource), cgroup_path);
         let stall_amount = Duration::from_millis((threshold / 100.0 * TIME_WINDOW_MS) as u64);
 
         let psi_fd = presutaoru::PsiFdBuilder::default()
@@ -194,12 +195,13 @@ impl PsiRegistry {
     }
 }
 
-impl From<PsiResource> for presutaoru::CgroupEntryType {
-    fn from(resource: PsiResource) -> Self {
-        match resource {
-            PsiResource::Memory => presutaoru::CgroupEntryType::Memory,
-            PsiResource::Cpu => presutaoru::CgroupEntryType::Cpu,
-            PsiResource::Io => presutaoru::CgroupEntryType::Io,
-        }
+/// Converts a `PsiResource` to the `presutaoru::CgroupEntryType` used by the
+/// PSI fd builder. A free function instead of a `From` impl avoids the orphan
+/// rule: both types are external to this crate.
+pub(crate) fn psi_resource_to_cgroup_entry(resource: PsiResource) -> presutaoru::CgroupEntryType {
+    match resource {
+        PsiResource::Memory => presutaoru::CgroupEntryType::Memory,
+        PsiResource::Cpu => presutaoru::CgroupEntryType::Cpu,
+        PsiResource::Io => presutaoru::CgroupEntryType::Io,
     }
 }

@@ -1,0 +1,45 @@
+# Phase 2 BistouriConfig CR — 6 rules (dropped the triggering resource per workload).
+#
+# Applied during the hot-reload phase. kubectl apply updates the SAME "bistouri-config"
+# object as phase 1. The agent's kube::runtime::watcher fires an Apply event,
+# TriggerControl::Reload is sent, and PSI watchers for the dropped resources are torn down.
+#
+# Dropped rules:
+#   cpu-burner  → cpu     (removed)
+#   io-burner   → io      (removed)
+#   mem-hog     → memory  (removed)
+apiVersion: bistouri.dev/v1alpha1
+kind: BistouriConfig
+metadata:
+  name: bistouri-config
+spec:
+  targets:
+    # cpu-burner: only memory + io (dropped cpu)
+    - rule:
+        type: Exact
+        comm: "cpu-burner"
+      resources:
+        - resource: memory
+          threshold: 5.0
+        - resource: io
+          threshold: 5.0
+
+    # io-burner: only cpu + memory (dropped io)
+    - rule:
+        type: Exact
+        comm: "io-burner"
+      resources:
+        - resource: cpu
+          threshold: 5.0
+        - resource: memory
+          threshold: 5.0
+
+    # mem-burner: only cpu + io (dropped memory)
+    - rule:
+        type: Exact
+        comm: "mem-burner"
+      resources:
+        - resource: cpu
+          threshold: 5.0
+        - resource: io
+          threshold: 5.0

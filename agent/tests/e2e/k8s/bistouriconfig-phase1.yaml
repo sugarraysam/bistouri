@@ -1,0 +1,52 @@
+# Phase 1 BistouriConfig CR — 9 rules (all 3 resources for all 3 workloads).
+#
+# Name MUST be "bistouri-config" (the agent's default --cr-name) so that:
+#   1. The agent's load_initial() finds this CR by name on startup.
+#   2. The phase 2 apply (kubectl apply -f bistouriconfig-phase2.yaml) updates
+#      this exact object, triggering the kube watch event the agent listens for.
+#
+# Expected triggers:
+#   cpu-burner  → cpu     (tight 100m CPU limit creates cpu.pressure stalls)
+#   io-burner   → io      (fsync loop creates io.pressure stalls)
+#   mem-hog     → memory  (tight 32Mi limit creates memory.pressure stalls)
+apiVersion: bistouri.dev/v1alpha1
+kind: BistouriConfig
+metadata:
+  name: bistouri-config
+spec:
+  targets:
+    # cpu-burner: CPU-bound workload — only cpu.pressure should fire
+    - rule:
+        type: Exact
+        comm: "cpu-burner"
+      resources:
+        - resource: cpu
+          threshold: 5.0
+        - resource: memory
+          threshold: 5.0
+        - resource: io
+          threshold: 5.0
+
+    # io-burner: IO-bound workload — only io.pressure should fire
+    - rule:
+        type: Exact
+        comm: "io-burner"
+      resources:
+        - resource: cpu
+          threshold: 5.0
+        - resource: memory
+          threshold: 5.0
+        - resource: io
+          threshold: 5.0
+
+    # mem-burner: Memory-bound workload — only memory.pressure should fire
+    - rule:
+        type: Exact
+        comm: "mem-burner"
+      resources:
+        - resource: cpu
+          threshold: 5.0
+        - resource: memory
+          threshold: 5.0
+        - resource: io
+          threshold: 5.0

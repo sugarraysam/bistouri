@@ -3,7 +3,9 @@
 # Uses a plain Pod instead of a DaemonSet for faster teardown — single-node
 # k3s doesn't need DaemonSet scheduling, and Pod deletion is immediate.
 #
-# Security model: privileged mode for BPF program loading.
+# Config delivery: the agent watches the BistouriConfig CR via kube::runtime::watcher.
+# No ConfigMap is required. --config-source=auto detects the in-cluster SA token
+# and switches to kube mode automatically.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -11,6 +13,7 @@ metadata:
   labels:
     app: bistouri-agent
 spec:
+  serviceAccountName: bistouri-agent
   # Access /proc for all host processes (comm, cgroup discovery).
   hostPID: true
   # Share the host network namespace so that localhost:9500 resolves to
@@ -23,14 +26,16 @@ spec:
     image: bistouri-agent:local
     imagePullPolicy: Never
     args:
-    - "--config"
-    - "/etc/bistouri/trigger.yaml"
-    - "--proc-path"
-    - "/host/proc"
-    - "--log-level"
-    - "bistouri_agent=debug"
-    - "--symbolizer-endpoint"
-    - "http://localhost:9500"
+    - "--proc-path=/host/proc"
+    - "--log-level=bistouri_agent=debug"
+    - "--symbolizer-endpoint=http://localhost:9500"
+    env:
+    # --config-source=auto detects the SA token and switches to kube watch mode.
+    # BISTOURI_NAMESPACE scopes the BistouriConfig CR watch to this pod's namespace.
+    - name: BISTOURI_NAMESPACE
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
     ports:
     - containerPort: 9464
       hostPort: 9464
@@ -52,8 +57,6 @@ spec:
     - name: sys-fs-cgroup
       mountPath: /sys/fs/cgroup
       mountPropagation: HostToContainer
-    - name: config
-      mountPath: /etc/bistouri
   volumes:
   - name: host-proc
     hostPath:
@@ -67,6 +70,3 @@ spec:
   - name: sys-fs-cgroup
     hostPath:
       path: /sys/fs/cgroup
-  - name: config
-    configMap:
-      name: bistouri-config

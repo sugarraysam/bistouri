@@ -1,0 +1,42 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bistouri-agent
+  namespace: bistouri
+  labels:
+    app.kubernetes.io/name: bistouri-agent
+    app.kubernetes.io/component: agent
+    # This label must match the Prometheus operator's serviceMonitorSelector.
+    # Adjust to match your cluster's Prometheus instance configuration.
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bistouri-agent
+  namespaceSelector:
+    matchNames:
+      - bistouri
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+---
+# Service that exposes the DaemonSet metrics port so the ServiceMonitor can target it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bistouri-agent
+  namespace: bistouri
+  labels:
+    app.kubernetes.io/name: bistouri-agent
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    app.kubernetes.io/name: bistouri-agent
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+      protocol: TCP
+  clusterIP: None  # Headless: one endpoint per DaemonSet pod (per-node scraping)

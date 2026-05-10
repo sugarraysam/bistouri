@@ -1,0 +1,108 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bistouri-agent
+  namespace: bistouri
+  labels:
+    app.kubernetes.io/name: bistouri-agent
+    app.kubernetes.io/component: agent
+    # Must match your Prometheus operator's ruleSelector.
+    release: prometheus
+spec:
+  groups:
+    - name: bistouri.critical
+      interval: 30s
+      rules:
+        # -----------------------------------------------------------------------
+        # CRITICAL: Agent has zero active PSI watchers.
+        #
+        # The agent is running and scraping, but no PSI watcher tasks are alive.
+        # The node is completely blind to pressure events — no profiling will occur.
+        #
+        # Common causes:
+        #   - /sys/fs/cgroup mounted readOnly (PSI fd write fails)
+        #   - CONFIG_PSI=n in kernel config
+        #   - No processes on this node match any trigger rule
+        #   - All proc_walk scans finding zero matching PIDs (check trigger config)
+        #
+        # Action: kubectl logs -n bistouri daemonset/bistouri-agent
+        #         grep for "PSI fd build failed" or "loaded trigger config"
+        # -----------------------------------------------------------------------
+        - alert: BistouriNoActiveWatchers
+          expr: bistouri_trigger_active_psi_watchers == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Bistouri agent on {{ $labels.instance }} has zero active PSI watchers"
+            description: >
+              The bistouri-agent pod on {{ $labels.instance }} has been running for over 2
+              minutes with no active PSI watcher tasks. The node is blind to CPU, memory,
+              and IO pressure events — no profiling sessions will be triggered.
+              Check agent logs for PSI fd build failures or trigger config load errors.
+
+        # -----------------------------------------------------------------------
+        # CRITICAL: Agent pod is not running on a node.
+        #
+        # The DaemonSet guarantees one pod per schedulable node. An absent pod
+        # means the agent has crashed, been evicted, or the node is unschedulable.
+        # That node is not being profiled at all.
+        #
+        # Action: kubectl get pods -n bistouri -o wide
+        #         kubectl describe pod -n bistouri <pod-name>
+        # -----------------------------------------------------------------------
+        - alert: BistouriAgentMissing
+          expr: up{job="bistouri-agent"} == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Bistouri agent is down on {{ $labels.instance }}"
+            description: >
+              The bistouri-agent on {{ $labels.instance }} has not been scraped successfully
+              for 1 minute. The pod may have crashed, been evicted, or the node may be
+              unschedulable. Check DaemonSet pod status and node conditions.
+
+        # -----------------------------------------------------------------------
+        # CRITICAL: Stack capture pipeline is producing >50% corrupted frames.
+        #
+        # More than half of all user-space stack frames over the last 5 minutes are
+        # classified as corrupted. At this rate profiling data is effectively useless.
+        #
+        # "Corrupted" means bpf_get_stack() returned frames that failed address
+        # canonicality checks — the most common root causes are:
+        #   - Target binaries compiled without -fno-omit-frame-pointer
+        #   - BPF stack buffer overflow (depth > MAX_STACK_DEPTH)
+        #   - Kernel bpf_get_stack() failures (process exited mid-sample)
+        #
+        # The 50% threshold is intentionally conservative: even at moderate
+        # corruption rates below this, flamegraphs remain statistically useful.
+        # Above 50% the signal-to-noise ratio makes the data unreliable.
+        #
+        # Action: kubectl logs -n bistouri daemonset/bistouri-agent
+        #         grep for "bistouri_profiler_stack_fetch_errors"
+        #         Verify target binaries use -fno-omit-frame-pointer.
+        # -----------------------------------------------------------------------
+        - alert: BistouriHighStackCorruptionRate
+          expr: >
+            sum by (instance) (
+              rate(bistouri_profiler_user_frames{kind="corrupted"}[5m])
+            )
+            /
+            sum by (instance) (
+              rate(bistouri_profiler_user_frames[5m])
+            )
+            > 0.5
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Bistouri stack capture corruption rate >50% on {{ $labels.instance }}"
+            description: >
+              More than 50% of user stack frames captured by the bistouri-agent on
+              {{ $labels.instance }} are corrupted. Profiling data from this node is
+              unreliable. Most likely cause: target binaries missing frame pointers
+              (-fno-omit-frame-pointer). Check agent logs for bpf_get_stack() errors.
