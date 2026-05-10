@@ -36,6 +36,8 @@ if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
 		-f "${SCRIPT_DIR}/images/Dockerfile.stress" "${SCRIPT_DIR}/images/"
 fi
 docker save bistouri-agent:local | sudo k3s ctr images import -
+docker pull busybox:latest
+docker save busybox:latest | sudo k3s ctr images import -
 docker save bistouri-stress:local | sudo k3s ctr images import -
 
 # 5. Run the Rust E2E test

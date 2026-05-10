@@ -1,72 +1,67 @@
-# Bistouri DaemonSet for E2E integration tests.
+# Bistouri Pod for E2E integration tests.
 #
-# Security model: granular Linux capabilities, no privileged mode.
-# Mirrors the permissions from `make docker-run`.
-apiVersion: apps/v1
-kind: DaemonSet
+# Uses a plain Pod instead of a DaemonSet for faster teardown — single-node
+# k3s doesn't need DaemonSet scheduling, and Pod deletion is immediate.
+#
+# Security model: privileged mode for BPF program loading.
+apiVersion: v1
+kind: Pod
 metadata:
   name: bistouri
   labels:
     app: bistouri
 spec:
-  selector:
-    matchLabels:
-      app: bistouri
-  template:
-    metadata:
-      labels:
-        app: bistouri
-    spec:
-      # Access /proc for all host processes (comm, cgroup discovery).
-      hostPID: true
-      terminationGracePeriodSeconds: 5
-      containers:
-      - name: bistouri
-        image: bistouri-agent:local
-        imagePullPolicy: Never
-        args:
-        - "--config"
-        - "/etc/bistouri/trigger.yaml"
-        - "--proc-path"
-        - "/host/proc"
-        - "--log-level"
-        - "bistouri=debug"
-        ports:
-        - containerPort: 9464
-          hostPort: 9464
-          name: metrics
-          protocol: TCP
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - name: host-proc
-          mountPath: /host/proc
-          readOnly: true
-        - name: sys-kernel-tracing
-          mountPath: /sys/kernel/tracing
-          readOnly: true
-          mountPropagation: HostToContainer
-        - name: sys-fs-bpf
-          mountPath: /sys/fs/bpf
-          mountPropagation: Bidirectional
-        - name: sys-fs-cgroup
-          mountPath: /sys/fs/cgroup
-          mountPropagation: HostToContainer
-        - name: config
-          mountPath: /etc/bistouri
-      volumes:
-      - name: host-proc
-        hostPath:
-          path: /proc
-      - name: sys-kernel-tracing
-        hostPath:
-          path: /sys/kernel/tracing
-      - name: sys-fs-bpf
-        hostPath:
-          path: /sys/fs/bpf
-      - name: sys-fs-cgroup
-        hostPath:
-          path: /sys/fs/cgroup
-      - name: config
-        configMap:
-          name: bistouri-config
+  # Access /proc for all host processes (comm, cgroup discovery).
+  hostPID: true
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 5
+  containers:
+  - name: bistouri
+    image: bistouri-agent:local
+    imagePullPolicy: Never
+    args:
+    - "--config"
+    - "/etc/bistouri/trigger.yaml"
+    - "--proc-path"
+    - "/host/proc"
+    - "--log-level"
+    - "bistouri=debug"
+    ports:
+    - containerPort: 9464
+      hostPort: 9464
+      name: metrics
+      protocol: TCP
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: host-proc
+      mountPath: /host/proc
+      readOnly: true
+    - name: sys-kernel-tracing
+      mountPath: /sys/kernel/tracing
+      readOnly: true
+      mountPropagation: HostToContainer
+    - name: sys-fs-bpf
+      mountPath: /sys/fs/bpf
+      mountPropagation: Bidirectional
+    - name: sys-fs-cgroup
+      mountPath: /sys/fs/cgroup
+      mountPropagation: HostToContainer
+    - name: config
+      mountPath: /etc/bistouri
+  volumes:
+  - name: host-proc
+    hostPath:
+      path: /proc
+  - name: sys-kernel-tracing
+    hostPath:
+      path: /sys/kernel/tracing
+  - name: sys-fs-bpf
+    hostPath:
+      path: /sys/fs/bpf
+  - name: sys-fs-cgroup
+    hostPath:
+      path: /sys/fs/cgroup
+  - name: config
+    configMap:
+      name: bistouri-config

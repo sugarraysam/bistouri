@@ -65,38 +65,41 @@ async fn bistouri_e2e() {
         .expect("cpu-burner did not trigger a CPU capture session");
     info!(cpu_val, "✅ cpu-burner triggered CPU capture session");
 
-    // IO and Memory are environment-dependent — log but don't gate.
+    // IO is now deterministic — io.max throttle guarantees io.pressure.
     let io_val = metrics
-        .get_counter(
+        .wait_for_counter_gt(
             "bistouri_capture_sessions_started",
             Some(("comm", "io-burner")),
+            0.0,
+            PHASE1_TIMEOUT,
         )
         .await
-        .unwrap_or(0.0);
-    if io_val > 0.0 {
-        info!(io_val, "✅ io-burner triggered IO capture session");
-    } else {
-        info!("⚠️  io-burner IO trigger did not fire");
-    }
+        .expect("io-burner did not trigger an IO capture session");
+    info!(io_val, "✅ io-burner triggered IO capture session");
 
     let mem_val = metrics
-        .get_counter(
+        .wait_for_counter_gt(
             "bistouri_capture_sessions_started",
             Some(("comm", "mem-hog")),
+            0.0,
+            PHASE1_TIMEOUT,
         )
         .await
-        .unwrap_or(0.0);
-    if mem_val > 0.0 {
-        info!(mem_val, "✅ mem-hog triggered Memory capture session");
-    } else {
-        info!("⚠️  mem-hog Memory trigger did not fire");
-    }
+        .expect("mem-hog did not trigger a Memory capture session");
+    info!(mem_val, "✅ mem-hog triggered Memory capture session");
 
     // ── Phase 1 Summary ──────────────────────────────────────────────
+    // Wait for at least 3 completed sessions (one per workload) to
+    // confirm the full capture pipeline finishes, not just triggers.
     let completed_total = metrics
-        .get_counter("bistouri_capture_sessions_completed", None)
+        .wait_for_counter_gt(
+            "bistouri_capture_sessions_completed",
+            None,
+            2.0,
+            PHASE1_TIMEOUT,
+        )
         .await
-        .unwrap_or(0.0);
+        .expect("capture sessions never completed (expected >= 3)");
     info!("📊 Phase 1 summary:");
     info!("   capture sessions started:  cpu={cpu_val} io={io_val} mem={mem_val}");
     info!("   capture sessions completed (total): {completed_total}");

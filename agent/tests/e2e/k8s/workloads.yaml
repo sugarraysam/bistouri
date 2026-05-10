@@ -31,9 +31,12 @@ spec:
 
 ---
 # ── io-burner ──────────────────────────────────────────────────────
-# fsync() loop creates natural IO wait. No Kubernetes IO limits needed —
-# the sync write pattern forces the process to block on the block device,
-# generating io.pressure.
+# Tight IO bandwidth limit (1 MB/s via cgroupv2 io.max) causes the
+# kernel to throttle writes, generating io.pressure.
+#
+# Kubernetes has no native IO resource limits. A privileged init
+# container writes io.max to the pod-level cgroup before the burner
+# starts. Pod-level limits propagate to all child container cgroups.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -43,6 +46,66 @@ metadata:
     type: io
 spec:
   restartPolicy: Always
+  initContainers:
+  - name: io-throttle
+    image: busybox:latest
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      privileged: true
+    env:
+    - name: POD_UID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.uid
+    command:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+
+      # 1. Discover the backing block device (major:minor)
+      # /etc/hosts is a host bind-mount. Column 3 of mountinfo 
+      # natively provides the exact MAJ:MIN backing device ID.
+      DEV=$(grep '/etc/hosts' /proc/self/mountinfo | awk '{print $3}' | head -n 1)
+      if [ -z "$DEV" ]; then
+        echo "FATAL: Could not resolve block device" >&2
+        exit 1
+      fi
+      echo "Resolved block device: ${DEV}"
+
+      # 2. Resolve partition to whole disk
+      # If the device has a 'partition' file in sysfs, it's a partition.
+      # The parent directory contains the 'dev' file for the whole disk.
+      if [ -f "/sys/dev/block/${DEV}/partition" ]; then
+        PARENT_DEV=$(cat "/sys/dev/block/${DEV}/../dev")
+        echo "Device ${DEV} is a partition. Resolved to parent disk: ${PARENT_DEV}"
+        DEV=$PARENT_DEV
+      else
+        echo "Resolved whole block device: ${DEV}"
+      fi
+
+      # 3. Discover pod-level cgroup
+      # cgroupns hides the true path, so we use the K8s Downward API
+      # to inject the Pod UID and find it on the host cgroup tree.
+      POD_UID_UNDERSCORES=$(echo "$POD_UID" | tr '-' '_')
+      
+      # Alphabetical sort guarantees the parent directory (Pod cgroup) 
+      # appears before any longer child paths (Container cgroups).
+      POD_CG=$(find /sys/fs/cgroup -type d | grep -e "${POD_UID}" -e "${POD_UID_UNDERSCORES}" | sort | head -n 1)
+      if [ -z "$POD_CG" ]; then
+        echo "FATAL: Could not find pod cgroup" >&2
+        exit 1
+      fi
+      echo "Found pod cgroup: ${POD_CG}"
+
+      # 4. Apply IO throttle
+      echo "${DEV} rbps=1048576 wbps=1048576" > "${POD_CG}/io.max"
+      echo "Successfully set io.max:"
+      cat "${POD_CG}/io.max"
+      
+    volumeMounts:
+    - name: sys-fs-cgroup
+      mountPath: /sys/fs/cgroup
   containers:
   - name: burner
     image: bistouri-stress:local
@@ -55,6 +118,10 @@ spec:
       limits:
         cpu: "500m"
         memory: "64Mi"
+  volumes:
+  - name: sys-fs-cgroup
+    hostPath:
+      path: /sys/fs/cgroup
 
 ---
 # ── mem-hog ────────────────────────────────────────────────────────
