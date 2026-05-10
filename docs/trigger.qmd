@@ -12,13 +12,19 @@ In Bistouri, we chose not to profile everything all the time. Instead, we treat 
 
 We solve the "when" problem using Linux Pressure Stall Information (PSI). Unlike simple utilization metrics, PSI tracks the amount of time tasks spend waiting for hardware resources (CPU, Memory, or IO). It provides a leading indicator of performance degradation: a process might only be using 10% of a CPU, but if it's stalled 50% of the time waiting for memory pages to swap in, it's in trouble.
 
+::: {.callout-tip}
+## Why PSI?
+Utilization (CPU %) tells you how busy a resource is. Pressure (PSI) tells you how much that resource is delaying your application. For a profiler, pressure is a much higher-fidelity signal that the application is actually suffering.
+:::
+
 Bistouri's trigger system allows users to define thresholds in a configuration file (e.g., "Profile `node` if it spends more than 50ms per second stalled on memory"). We map these rules to specific cgroups. By opening the `/proc/pressure/` files (or their cgroup-specific counterparts) and using `poll()` with the `POLLPRI` flag, the kernel notifies us the moment a threshold is crossed. This allows Bistouri to remain nearly dormant until a specific process actually experiences distress.
 
 ## Trie-Based Process Routing
 
 Once we have a trigger rule, we need to find the processes it applies to. In a dynamic environment like Kubernetes, we cannot rely on PIDs, which are recycled and ephemeral. We rely on the process "comm" name (the filename of the executable).
 
-To handle this efficiently, we use a dual-trie architecture.
+To handle this efficiently, we use a dual-trie architecture:
+
 1.  **Userspace Radix Trie:** A standard radix trie allows us to store arbitrary rules and perform $O(L)$ lookups (where $L$ is the string length) during our periodic system scans.
 2.  **BPF LPM Trie:** We mirror these rules into a BPF `BPF_MAP_TYPE_LPM_TRIE`.
 
@@ -58,6 +64,7 @@ To guarantee completeness, we implement a `proc_walk`. Every 30 seconds, the age
 Bistouri is designed for long-running production use, meaning we must support configuration changes without restarting the agent. The `TriggerAgent` manages this through an internal event loop.
 
 When a configuration file change is detected (via `inotify`), the agent:
+
 1.  Signals the current `proc_walk` to cancel.
 2.  Purges the `PsiRegistry`, effectively "unplugging" all current kernel watchers.
 3.  Rebuilds the userspace matcher and repopulates the BPF trie.
@@ -79,7 +86,7 @@ The following diagram illustrates how a process discovery event flows from the k
 graph TD
     subgraph "Kernel Space"
         K_EXEC["Process Exec/Fork"] -->|"Tracepoint"| BPF_PROG["BPF Probe"]
-        BPF_PROG -->|"LPM Lookup"| BPF_TRIE[("BPF LPM Trie")]
+        BPF_PROG -->|"LPM Lookup"| BPF_TRIE["BPF LPM Trie"]
         BPF_PROG -->|"Match Found"| RING_BUF["BPF Ring Buffer"]
     end
 
@@ -101,5 +108,5 @@ graph TD
 ```
 
 ---
-_Auto-generated from commit `9287f83` by Gemini 3.1 Pro.
-Last updated: 2026-05-07_
+_Auto-generated from commit `6703ee0` by Gemini 3.1 Pro.
+Last updated: 2026-05-10_
