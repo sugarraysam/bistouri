@@ -23,24 +23,12 @@ use tracing::{debug, error, info, warn};
 /// Common interface for config delivery strategies.
 ///
 /// Exactly one implementation is chosen at startup via `--config-source`.
-/// There is no runtime switching.
-///
-/// Implementors:
-/// - [`FileConfigWatcher`] — inotify on a YAML file (baremetal / systemd)
-/// - [`KubeConfigWatcher`] — `kube::runtime::watcher` on a `BistouriConfig` CR
 #[async_trait]
 pub(crate) trait ConfigWatcher: Send + 'static {
-    /// Load and return the initial configuration. Called once before `watch`.
-    ///
-    /// Takes `&mut self` so implementations can cache state from the initial
-    /// load (e.g. `KubeConfigWatcher` caches a spec hash for dedup).
+    /// Load and return the initial configuration.
     async fn load_initial(&mut self) -> Arc<TriggerConfig>;
 
-    /// Run the watch loop until `cancel` fires or an unrecoverable error occurs.
-    ///
-    /// Sends [`TriggerControl::Reload`] on the provided channel for every
-    /// detected configuration change. Consuming `Box<Self>` lets implementations
-    /// own their resources through the entire watch loop without cloning.
+    /// Run the watch loop until `cancel` fires.
     async fn watch(
         self: Box<Self>,
         control_tx: mpsc::Sender<TriggerControl>,
@@ -52,10 +40,7 @@ pub(crate) trait ConfigWatcher: Send + 'static {
 // Factory
 // ---------------------------------------------------------------------------
 
-/// Resolve args into the concrete [`ConfigWatcher`] implementation.
-///
-/// For `--config-source=auto`, probes for the Kubernetes in-cluster service
-/// account token. Chooses kube mode if found, file mode otherwise.
+/// Resolve args into the concrete [`ConfigWatcher`].
 pub(crate) async fn build_watcher(args: &Args) -> Box<dyn ConfigWatcher> {
     let resolved = match args.config_source {
         ConfigSource::File => ConfigSource::File,
@@ -107,11 +92,7 @@ pub(crate) async fn build_watcher(args: &Args) -> Box<dyn ConfigWatcher> {
 // FileConfigWatcher
 // ---------------------------------------------------------------------------
 
-/// Watches a YAML file via epoll-backed inotify for hot-reload.
-///
-/// Handles both direct file edits and Kubernetes ConfigMap symlink swaps.
-/// Designed for baremetal or systemd deployments where no Kubernetes API
-/// server is present.
+/// Watches a YAML file via inotify for hot-reload.
 pub(crate) struct FileConfigWatcher {
     path: PathBuf,
 }
@@ -278,19 +259,11 @@ async fn trigger_reload_from_file(config_path: &Path, control_tx: &mpsc::Sender<
 
 /// Watches a `BistouriConfig` CR via the Kubernetes API for hot-reload.
 ///
-/// Uses `kube::runtime::watcher` which provides automatic reconnection,
-/// backoff, and list+watch semantics. Hot-reload fires on `Apply` events
-/// (runtime updates) only; `InitApply` events are intentionally ignored
-/// because `load_initial()` already fetches the CR via a direct API call.
-///
-/// A spec content hash (`last_spec_hash`) deduplicates reloads: metadata-only
-/// updates (e.g. `kubectl apply` with no spec changes) are silently skipped.
+/// Spec content hash deduplicates reloads: metadata-only updates are skipped.
 pub(crate) struct KubeConfigWatcher {
     client: Client,
     namespace: String,
     cr_name: String,
-    /// Content hash of the last-applied spec. Used to skip no-op reloads
-    /// when only metadata (labels, annotations, resourceVersion) changed.
     last_spec_hash: u64,
 }
 
@@ -353,16 +326,8 @@ impl ConfigWatcher for KubeConfigWatcher {
                 biased;
                 _ = cancel.cancelled() => break,
                 event = stream.next() => match event {
-                    // InitApply is intentionally NOT handled here.
-                    //
-                    // load_initial() already fetched the CR via a direct API call
-                    // before the watch loop started. Handling InitApply would trigger
-                    // a redundant reload that races with PSI trigger registration:
-                    // the TriggerAgent's biased select processes Reload (control_rx)
-                    // before ProcessMatchEvents (event_rx), nuking PSI watchers that
-                    // were just registered by the first proc_walk.
-                    //
-                    // Apply fires only for runtime updates — exactly what we need.
+                    // InitApply intentionally not handled: load_initial() already
+                    // fetched the CR. Handling it would race with proc_walk.
                     Some(Ok(watcher::Event::Apply(cr))) if cr.name_any() == self.cr_name => {
                         let new_hash = spec_content_hash(&cr.spec);
                         if new_hash == self.last_spec_hash {
@@ -384,23 +349,12 @@ impl ConfigWatcher for KubeConfigWatcher {
                                     .await;
                             }
                             Err(e) => {
-                                // CEL rules should prevent invalid CRs from being applied,
-                                // but belt-and-suspenders: keep current config.
-                                warn!(
-                                    error = %e,
-                                    cr_name = %self.cr_name,
-                                    "BistouriConfig CR failed agent-side validation — keeping current config",
-                                );
+                                warn!(error = %e, cr_name = %self.cr_name, "CR validation failed, keeping current config");
                             }
                         }
                     }
                     Some(Ok(watcher::Event::Delete(cr))) if cr.name_any() == self.cr_name => {
-                        // CR was deleted — keep current config and warn.
-                        // The agent continues operating until a new CR is applied.
-                        warn!(
-                            cr_name = %self.cr_name,
-                            "BistouriConfig CR deleted — keeping current config until CR is re-applied",
-                        );
+                        warn!(cr_name = %self.cr_name, "BistouriConfig CR deleted, keeping current config");
                     }
                     Some(Ok(_)) => {} // Other CR names, Init, InitApply events — ignore.
                     Some(Err(e)) => {
@@ -425,21 +379,10 @@ fn parse_cr(cr: BistouriConfig) -> crate::trigger::error::Result<TriggerConfig> 
 }
 
 /// Compute a content hash of the BistouriConfig spec.
-///
-/// Uses the `Debug` representation → `DefaultHasher`. Two specs with identical
-/// target rules and thresholds always produce the same hash, regardless of
-/// Kubernetes metadata (resourceVersion, generation, annotations). This lets
-/// the watch loop skip no-op reloads from `kubectl apply` when only metadata
-/// changed.
-///
-/// `Debug` is derived (not hand-written) on `BistouriConfigSpec`, `MatchRule`,
-/// and `ResourceConfig`, so it mirrors field order and value layout exactly.
+/// Uses `Debug` repr → `DefaultHasher` for deterministic, metadata-independent hashing.
 fn spec_content_hash(spec: &BistouriConfigSpec) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // format! with Debug is deterministic for derived impls — same field
-    // values always produce the same string, regardless of Kubernetes metadata.
-    let debug_repr = format!("{spec:?}");
-    debug_repr.hash(&mut hasher);
+    format!("{spec:?}").hash(&mut hasher);
     hasher.finish()
 }

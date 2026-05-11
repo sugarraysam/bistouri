@@ -6,18 +6,10 @@ use crate::capture::vdso::{is_canonical_user_address, VdsoCache};
 use crate::telemetry::METRIC_USER_FRAMES;
 use tracing::debug;
 
-/// Distinguishes on-CPU samples (fired by `handle_perf` via perf_event) from
-/// off-CPU samples (fired by `handle_sched_switch` when a monitored PID enters
-/// TASK_UNINTERRUPTIBLE, i.e. blocks on IO or a kernel resource).
-///
-/// Stored per sample in `SessionPayload` so the symbolizer can produce
-/// separate on-CPU and off-CPU flamegraphs from a single session payload.
+/// On-CPU vs off-CPU sample classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SampleKind {
-    /// Process was executing on a CPU when the perf_event counter fired.
     OnCpu,
-    /// Process transitioned to TASK_UNINTERRUPTIBLE (D state) — captured at
-    /// the scheduler context-switch point before the task went to sleep.
     OffCpu,
 }
 
@@ -58,42 +50,22 @@ impl TryFrom<i32> for BuildIdStatus {
     }
 }
 
-/// A user-space stack frame from `bpf_get_stack` with `BPF_F_USER_BUILD_ID`.
-///
-/// Frames are either fully resolved (build_id + file offset) or placeholders
-/// for addresses the kernel couldn't resolve. Placeholders preserve call chain
-/// structure in flamegraphs — production profilers (`perf`, Strobelight, Parca)
-/// use the same approach.
+/// A user-space stack frame from `bpf_get_stack(BPF_F_USER_BUILD_ID)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum UserFrame {
-    /// Kernel resolved build_id + file_offset. Ready for symbolization.
-    /// The kernel computed the file offset from the VMA — ASLR is already handled.
-    /// The symbolizer adjusts by `(p_vaddr - p_offset)` for symbol table lookup.
+    /// Build ID + file offset, ready for symbolization.
     Resolved {
         build_id: [u8; BUILD_ID_SIZE],
         file_offset: u64,
     },
-    /// Placeholder for frames the kernel couldn't resolve.
-    /// Preserves call chain structure in flamegraphs.
-    /// `label` is a static tag like "[vdso]" or "[unknown]".
+    /// Placeholder for unresolved frames (`[vdso]`, `[unknown]`).
     Placeholder { label: &'static str, ip: u64 },
 }
 
-/// A unique stack trace (kernel + user frames), trimmed to actual depth.
+/// Unique stack trace (kernel + user frames), trimmed to actual depth.
 ///
-/// Kernel frames are raw instruction pointers (symbolized via /proc/kallsyms).
-/// User frames carry per-frame build_id and file offset from `BPF_F_USER_BUILD_ID`,
-/// enabling the symbolizer to attribute frames to specific DSOs without needing
-/// /proc/pid/maps.
-///
-/// Fallback frames where the kernel could not resolve a build_id are kept as
-/// labeled placeholders (`[vdso]`, `[unknown]`) to preserve call chain integrity.
-/// Corrupted frames (non-canonical addresses) are silently dropped.
-///
-/// Uses pre-computed hashing: the content hash is computed once during
-/// construction and cached in `cached_hash`. The `Hash` impl feeds only
-/// this `u64`, eliminating repeated ~400-byte hashing on every `HashMap`
-/// lookup during deduplication.
+/// Pre-computed hash: computed once at construction, reused on every
+/// `HashMap` lookup during deduplication.
 #[derive(Debug, Clone)]
 pub(crate) struct StackTrace {
     cached_hash: u64,

@@ -24,15 +24,9 @@ pub(crate) enum PsiRegisterResult {
 }
 
 /// Owns the set of active PSI watchers, keyed by (cgroup_id, resource).
-/// Encapsulates the full PSI lifecycle: fd creation, async watcher spawning,
-/// registry tracking, and shutdown.
 pub(crate) struct PsiRegistry {
     watchers: HashMap<(u64, PsiResource), tokio::task::JoinHandle<()>>,
     capture_tx: mpsc::Sender<CaptureRequest>,
-    /// Minimum interval between successive capture requests from a single
-    /// watcher. Initialized from the capture duration so that a watcher
-    /// cannot emit more than one request per profiling window. Each watcher
-    /// enforces this locally — no shared state required.
     request_cooldown: Duration,
 }
 
@@ -49,10 +43,6 @@ impl PsiRegistry {
     }
 
     /// Attempts to register a PSI watcher for the given (cgroup, resource) pair.
-    /// Returns the outcome so the caller can update counters accordingly.
-    ///
-    /// When the PSI threshold is exceeded, the watcher sends a `CaptureRequest`
-    /// for the given `pid` and `comm` to the `CaptureOrchestrator`.
     pub(crate) fn register(
         &mut self,
         cgroup_id: u64,
@@ -64,9 +54,6 @@ impl PsiRegistry {
     ) -> PsiRegisterResult {
         let registry_key = (cgroup_id, resource);
 
-        // One PSI fd per (cgroup, resource) — first matching event wins.
-        // Subsequent PIDs in the same cgroup for the same resource are no-ops
-        // (expected: multiple PIDs with the same comm often coexist in a cgroup).
         if self.watchers.contains_key(&registry_key) {
             return PsiRegisterResult::AlreadyExists;
         }
@@ -91,7 +78,7 @@ impl PsiRegistry {
         PsiRegisterResult::Registered
     }
 
-    /// Aborts all active PSI watcher tasks and clears the registry.
+    /// Aborts all active PSI watcher tasks.
     pub(crate) fn shutdown(&mut self) {
         for handle in self.watchers.drain().map(|(_, h)| h) {
             handle.abort();
@@ -115,23 +102,14 @@ impl PsiRegistry {
             .stall_amount(stall_amount)
             .build()
             .map_err(|e| {
-                error!(
-                    cgroup = %cgroup_path.display(),
-                    resource = ?resource,
-                    error = %e,
-                    "PSI fd build failed — if this persists for all cgroups, \
-                     verify CONFIG_PSI=y in your kernel config \
-                     (grep CONFIG_PSI /boot/config-$(uname -r))",
-                );
+                error!(cgroup = %cgroup_path.display(), resource = ?resource, error = %e, "PSI fd build failed");
                 TriggerError::PsiFdBuild {
                     path: cgroup_path.to_path_buf(),
                     source: e,
                 }
             })?;
 
-        // PSI triggers signal threshold crossings via POLLPRI, not POLLIN.
-        // Using AsyncFd::new() (READABLE) would return immediately every time
-        // because PSI fds are always POLLIN-ready as readable stat files.
+        // PSI triggers via POLLPRI, not POLLIN.
         let async_fd =
             AsyncFd::with_interest(psi_fd, Interest::PRIORITY).map_err(TriggerError::AsyncFd)?;
         Ok(async_fd)
@@ -147,15 +125,6 @@ impl PsiRegistry {
         request_cooldown: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            // PSI triggers fire via POLLPRI, not POLLIN. We must use
-            // .ready(Interest::PRIORITY) — .readable() waits for POLLIN
-            // which is always set on PSI fds (they are stat-like files).
-            //
-            // Cooldown: after sending a capture request, suppress further sends
-            // for `request_cooldown`. This reduces noise from repeated PSI fires
-            // during an active capture window. The orchestrator's inflight_guard
-            // remains the authoritative correctness backstop; the cooldown is a
-            // best-effort rate limiter that lives entirely within this task.
             let mut last_sent: Option<std::time::Instant> = None;
             while let Ok(mut guard) = async_fd.ready(Interest::PRIORITY).await {
                 guard.clear_ready_matching(Ready::PRIORITY);
@@ -163,9 +132,7 @@ impl PsiRegistry {
                     continue;
                 }
                 info!(
-                    pid = pid,
-                    comm = %comm,
-                    resource = ?resource,
+                    pid = pid, comm = %comm, resource = ?resource,
                     cgroup = %cgroup_path.display(),
                     "PSI threshold exceeded, requesting capture",
                 );
@@ -174,13 +141,8 @@ impl PsiRegistry {
                     comm: comm.clone(),
                     source: CaptureSource::Psi(resource),
                 };
-                // Best-effort: if the capture channel is full, the orchestrator's
-                // dedup guard will reject a repeat when the next PSI fires.
                 if capture_tx.try_send(req).is_err() {
-                    error!(
-                        "capture request channel full, PSI event dropped — \
-                         consider doubling CAPTURE_REQUEST_CHANNEL_SIZE",
-                    );
+                    error!("capture request channel full, PSI event dropped");
                     metrics::counter!(
                         METRIC_CAPTURE_CHANNEL_FULL,
                         "resource" => resource.to_string(),
@@ -195,10 +157,7 @@ impl PsiRegistry {
     }
 }
 
-/// Converts a `PsiResource` to the `presutaoru::CgroupEntryType` used by the
-/// PSI fd builder. A free function instead of a `From` impl avoids the orphan
-/// rule: both types are external to this crate.
-pub(crate) fn psi_resource_to_cgroup_entry(resource: PsiResource) -> presutaoru::CgroupEntryType {
+fn psi_resource_to_cgroup_entry(resource: PsiResource) -> presutaoru::CgroupEntryType {
     match resource {
         PsiResource::Memory => presutaoru::CgroupEntryType::Memory,
         PsiResource::Cpu => presutaoru::CgroupEntryType::Cpu,

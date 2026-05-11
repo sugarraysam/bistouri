@@ -29,21 +29,16 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CaptureSource {
     Psi(PsiResource),
 }
 
 /// Trigger event requesting stack capture for a single PID.
-///
-/// Intentionally trigger-agnostic: today these come from PSI watchers,
-/// but the interface supports future sources (CLI, UI, API).
 pub(crate) struct CaptureRequest {
     pub pid: u32,
     pub comm: String,
     pub source: CaptureSource,
-    // TODO: stall_total_usec — read from <cgroup>/resource.pressure at trigger
-    //       time to quantify PSI violation severity.
 }
 
 /// Converts a `CaptureSource` into the proto `capture_source::Source`.
@@ -101,20 +96,10 @@ fn to_proto_frame(
 
 /// Active capture session: one PID, one resource, bounded duration.
 ///
-/// Builds the gRPC `SessionPayload` incrementally during recording —
-/// no intermediate storage, no batch conversion at finalize time.
-///
-/// Deduplication: unique traces are identified via a `HashMap<StackTrace, usize>`
-/// keyed on the Rust `StackTrace` type (which implements `Hash`/`Eq`). The
-/// proto-encoded trace and its counts live directly in `payload.traces[idx]`.
-/// Build IDs are deduplicated into `payload.mappings` via `mapping_index`.
-///
-/// On the hot path (`record()`), a new unique trace triggers:
-///   1. Proto conversion of the trace (clones `kernel_frames` — needed in
-///      both the proto message and the dedup HashMap key)
-///   2. Move of the original `StackTrace` into the dedup map
-///
-/// A duplicate trace is O(1): HashMap lookup + counter increment.
+/// Builds the `SessionPayload` incrementally during `record()`. Unique
+/// traces are deduped via a `HashMap<StackTrace, usize>` → index into
+/// `payload.traces`. Duplicate traces are O(1) (lookup + counter bump).
+/// Build IDs are deduped into `payload.mappings` via `mapping_index`.
 pub(crate) struct CaptureSession {
     id: SessionId,
     pid: u32,
@@ -191,21 +176,23 @@ impl CaptureSession {
         &self.source
     }
 
+    /// Returns the process comm from the proto metadata.
+    pub(crate) fn comm(&self) -> &str {
+        self.payload
+            .metadata
+            .as_ref()
+            .map(|m| m.comm.as_str())
+            .unwrap_or("<unknown>")
+    }
+
     /// Records a stack trace sample, building the proto payload incrementally.
     ///
-    /// New unique traces are converted to proto once and moved into the dedup
-    /// map (zero clones). Duplicate traces are O(1): HashMap lookup + counter
-    /// increment. The mapping table grows only when a previously unseen
-    /// build_id appears.
     pub(crate) fn record(&mut self, trace: StackTrace, kind: SampleKind) {
         let idx = if let Some(&idx) = self.dedup.get(&trace) {
             idx
         } else {
             let idx = self.payload.traces.len();
-
-            // Clone kernel_frames — unavoidable because the data must exist
-            // in both the proto message (payload.traces) and the dedup HashMap
-            // key (moved below). Only happens once per unique trace.
+            // Clone kernel_frames: must exist in both proto and dedup key.
             let kernel_frames = trace.kernel_frames.clone();
             let user_frames: Vec<proto::UserFrame> = trace
                 .user_frames
@@ -233,11 +220,7 @@ impl CaptureSession {
         self.payload.total_samples += 1;
     }
 
-    /// Consumes the session, stamps the capture duration, and returns
-    /// a `FinalizedSession` ready for downstream delivery.
-    ///
-    /// Near zero-cost: sets the duration field on the already-built payload,
-    /// drops the dedup map and mapping index.
+    /// Consumes the session, stamps capture duration, returns ready payload.
     pub(crate) fn finalize(mut self) -> FinalizedSession {
         let elapsed = self.started_at.elapsed();
         self.payload.capture_duration = Some(prost_types::Duration {
@@ -255,9 +238,6 @@ impl CaptureSession {
 }
 
 /// Finalized capture result, ready for downstream delivery.
-///
-/// The `payload` is a fully-built `SessionPayload` proto message —
-/// the exporter sends it directly over the wire with zero conversion.
 /// Session metadata fields (`session_id`, `pid`, `source`) are kept
 /// alongside for orchestrator logging and metric labels.
 pub(crate) struct FinalizedSession {

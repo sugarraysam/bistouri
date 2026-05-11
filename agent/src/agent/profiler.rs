@@ -34,7 +34,6 @@ const STACK_RINGBUF_SIZE_MB: usize = 64;
 const TRIGGER_RINGBUF_SIZE_KB: usize = 256;
 
 /// Mirrors C `struct user_stack_frame` / kernel `struct bpf_stack_build_id`.
-/// Layout: status (4) + build_id (20) + offset_or_ip (8) = 32 bytes per frame.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UserStackFrame {
@@ -50,10 +49,7 @@ pub(crate) struct StackTraceEvent {
     pub comm: [u8; TASK_COMM_LEN],
     pub kernel_stack_sz: i32,
     pub user_stack_sz: i32,
-    /// STACK_KIND_ON_CPU (0) or STACK_KIND_OFF_CPU (1).
     pub kind: u8,
-    /// Explicit padding — mirrors the `__u8 _pad[3]` in the C struct so that
-    /// the `kernel_stack` array remains 4-byte aligned in both layouts.
     pub _pad: [u8; 3],
     pub kernel_stack: [u64; MAX_STACK_DEPTH],
     pub user_stack: [UserStackFrame; MAX_STACK_DEPTH],
@@ -112,10 +108,10 @@ pub(crate) enum SpaceKind {
 
 impl std::fmt::Display for SpaceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SpaceKind::Kernel => write!(f, "kernel"),
-            SpaceKind::User => write!(f, "user"),
-        }
+        f.write_str(match self {
+            SpaceKind::Kernel => "kernel",
+            SpaceKind::User => "user",
+        })
     }
 }
 
@@ -220,11 +216,7 @@ impl ProfilerError {
         }
     }
 
-    /// Logs the error at `error!` level with actionable operator guidance
-    /// and increments the appropriate Prometheus counter.
-    ///
-    /// BPF errors are never fatal — they indicate transient kernel-side
-    /// resource contention. Operators monitor via logs and Prometheus alerts.
+    /// Logs the error and increments the appropriate Prometheus counter.
     fn log_and_record(&self) {
         match self {
             ProfilerError::ReserveStackRingbuf { pid, timestamp_ns } => {
@@ -399,11 +391,6 @@ pub(crate) struct LoadedProfilerAgent {
 
 impl LoadedProfilerAgent {
     /// Registers callbacks for each BPF ring buffer map.
-    ///
-    /// **Design constraint:** Callbacks run inline during `consume()` on the
-    /// async event loop. Keep them to O(1) operations (pointer casts, `try_send`).
-    /// Heavy processing (symbolization, batching, network IO) belongs on a
-    /// separate task fed via a channel.
     fn setup_ringbuffers(
         &mut self,
         trigger_tx: Option<Sender<ProcessMatchEvent>>,
@@ -417,10 +404,7 @@ impl LoadedProfilerAgent {
                 if let Some(event) = StackTraceEvent::from_bytes(data) {
                     let sample = StackSample::from_event(event, &vdso_cache);
                     if let Err(mpsc::error::TrySendError::Full(_)) = stack_tx.try_send(sample) {
-                        error!(
-                            "stack sample channel full, samples being dropped — \
-                             consider doubling STACK_SAMPLE_CHANNEL_SIZE",
-                        );
+                        error!("stack sample channel full, samples dropped");
                         metrics::counter!(METRIC_STACK_CHANNEL_FULL).increment(1);
                     }
                 }
@@ -441,10 +425,6 @@ impl LoadedProfilerAgent {
             builder
                 .add(&self.skel.maps.trigger_events, move |data| {
                     if let Some(bpf_event) = ProcessMatchBpfEvent::from_bytes(data) {
-                        // Trigger events are best-effort: dropping on channel-full
-                        // is safe because proc_walk provides the completeness
-                        // guarantee — all matching processes are discovered within
-                        // one scan interval (eventual consistency).
                         if let Err(mpsc::error::TrySendError::Full(_)) =
                             tx.try_send(bpf_event.into())
                         {
@@ -496,9 +476,6 @@ impl LoadedProfilerAgent {
     }
 
     /// Starts asynchronous ring buffer polling using tokio's IO reactor.
-    ///
-    /// Wraps the ring buffer in `AsyncRingBuffer` which registers the internal
-    /// epoll fd with tokio. Runs as a regular async task — no blocking thread needed.
     pub(crate) fn start_polling(
         &mut self,
         cancel: CancellationToken,

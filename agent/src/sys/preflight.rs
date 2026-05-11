@@ -3,14 +3,9 @@ use std::sync::Arc;
 use tracing::info;
 
 use super::kernel::KernelMeta;
+use crate::telemetry::hex_encode;
 
 /// Runs startup validation checks and collects host metadata.
-///
-/// Designed to grow as we add more startup assertions (kernel version
-/// compatibility, capability checks, cgroup2 mount validation, etc.).
-///
-/// Performs synchronous file I/O internally — wrapped in
-/// `spawn_blocking` to keep the event loop clean.
 pub(crate) async fn run_preflight_checks() -> anyhow::Result<Arc<KernelMeta>> {
     let kernel_meta = tokio::task::spawn_blocking(KernelMeta::collect)
         .await
@@ -24,9 +19,4 @@ pub(crate) async fn run_preflight_checks() -> anyhow::Result<Arc<KernelMeta>> {
     );
 
     Ok(Arc::new(kernel_meta))
-}
-
-/// Formats a byte slice as a lowercase hex string (e.g. "ab01cd...").
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

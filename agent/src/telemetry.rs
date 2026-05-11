@@ -235,9 +235,8 @@ pub(crate) fn describe_all() {
     );
 }
 
-/// Formats a byte slice as a lowercase hex string (e.g. `"ab01cd..."`).
-/// Used to format the kernel build ID for the agent info metric label.
-fn hex_encode(bytes: &[u8]) -> String {
+/// Formats a byte slice as lowercase hex (e.g. `"ab01cd..."`).
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

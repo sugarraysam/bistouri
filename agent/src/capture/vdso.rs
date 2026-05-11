@@ -16,15 +16,6 @@ const AT_PAGESZ: u64 = 6;
 const DEFAULT_PAGE_SIZE: u64 = 4096;
 
 /// Maximum user-space virtual address by architecture.
-/// Addresses above this are either kernel-space or non-canonical (garbage).
-///
-/// - x86_64 (4-level paging, 47-bit VA): `0x0000_7FFF_FFFF_FFFF`
-/// - aarch64 (48-bit VA, default config): `0x0000_FFFF_FFFF_FFFF`
-///
-/// These are conservative lower bounds — some kernels support wider VA
-/// (x86_64 5-level = 56-bit, aarch64 LVA = 52-bit), but using the smaller
-/// bound means we might misclassify a few legitimate high-VA frames as
-/// corrupted. In practice, user code rarely maps above these limits.
 #[cfg(target_arch = "x86_64")]
 const USER_SPACE_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
 
@@ -35,14 +26,9 @@ const USER_SPACE_MAX: u64 = 0x0000_FFFF_FFFF_FFFF;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const USER_SPACE_MAX: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-/// Returns true if `ip` is a valid canonical user-space address.
-///
-/// Non-canonical addresses (like `0xAAAAAAAAAAAAAAAA`) indicate stack walk
-/// corruption — the unwinder followed a garbage "return address" into
-/// unmapped memory. These frames carry no useful information.
-#[inline]
-pub(crate) fn is_canonical_user_address(ip: u64) -> bool {
-    ip <= USER_SPACE_MAX
+/// Canonical user-space address check: valid for both x86_64 and ARM64.
+pub(crate) fn is_canonical_user_address(addr: u64) -> bool {
+    addr <= USER_SPACE_MAX
 }
 
 /// A process's vDSO virtual address range.
@@ -58,15 +44,9 @@ impl VdsoRange {
     }
 }
 
-/// Reads the vDSO base address from `/proc/<pid>/auxv`.
+/// Parses `/proc/<pid>/auxv` for the vDSO base address.
 ///
-/// The auxiliary vector is a sequence of `(type: u64, value: u64)` pairs
-/// written by the kernel at exec time. We scan for `AT_SYSINFO_EHDR` (33)
-/// which holds the vDSO's ELF header address in the process's address space,
-/// and `AT_PAGESZ` (6) for the system page size.
-///
-/// Returns `None` if the process has exited, auxv is unreadable, or the
-/// entry is not found (unlikely on Linux).
+/// Returns `None` if the file can't be read or doesn't contain `AT_SYSINFO_EHDR`.
 pub(crate) fn read_vdso_range(pid: u32, proc_path: &Path) -> Option<VdsoRange> {
     let auxv_path = proc_path.join(format!("{}/auxv", pid));
     let data = std::fs::read(auxv_path).ok()?;
@@ -101,16 +81,10 @@ pub(crate) fn read_vdso_range(pid: u32, proc_path: &Path) -> Option<VdsoRange> {
     })
 }
 
-/// LRU cache mapping PIDs to their vDSO address ranges.
+/// Cache for vDSO address ranges, keyed by PID.
 ///
-/// Populated by `proc_walk` for active rule-matched PIDs. Read by the
-/// profiler's ringbuf callback to classify fallback stack frames.
-///
-/// Thread-safety: shared between trigger module (writer, via `insert`) and
-/// profiler module (reader, via `contains`) through `Arc<Mutex<VdsoCache>>`.
-/// Single reader (ringbuf callback) + single writer (proc_walk every 30s)
-/// = zero contention. Mutex is simpler than RwLock and preserves true LRU
-/// ordering via `get()` (which promotes accessed entries).
+/// Used during stack trace classification to tag fallback frames as `[vdso]`
+/// instead of `[unknown]`.
 pub(crate) struct VdsoCache {
     cache: LruCache<u32, Option<VdsoRange>>,
 }
@@ -132,11 +106,8 @@ impl VdsoCache {
         self.cache.put(pid, range);
     }
 
-    /// Returns true if `ip` falls within the cached vDSO range for `pid`.
-    /// Returns false if the PID has no cached entry or the auxv read failed.
-    ///
-    /// Uses `get()` which promotes the entry to most-recently-used,
-    /// giving us true LRU eviction semantics.
+    /// Returns true if the given instruction pointer falls within the cached
+    /// vDSO range for this PID.
     pub(crate) fn contains(&mut self, pid: u32, ip: u64) -> bool {
         self.cache
             .get(&pid)

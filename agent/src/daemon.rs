@@ -1,7 +1,9 @@
 use crate::agent::profiler::{LoadedProfilerAgent, ProfilerAgentBuilder};
 use crate::args::Args;
 use crate::capture::exporter::{GrpcExporter, NullExporter, SessionExporter};
-use crate::capture::orchestrator::{CaptureOrchestrator, STACK_SAMPLE_CHANNEL_SIZE};
+use crate::capture::orchestrator::{
+    CaptureOrchestrator, CaptureOrchestratorHandle, STACK_SAMPLE_CHANNEL_SIZE,
+};
 use crate::capture::trace::StackSample;
 use crate::capture::vdso::VdsoCache;
 use crate::sys;
@@ -17,15 +19,9 @@ use tracing::info;
 
 /// Top-level lifecycle manager for all Bistouri subsystems.
 ///
-/// Owns a single `CancellationToken` that propagates shutdown to every
-/// subsystem. Components that need independent cancellation (e.g. proc_walk
-/// on config reload) use `child_token()` so the parent cancel still reaches
-/// them.
-///
+/// Owns a single `CancellationToken` that propagates shutdown to every subsystem.
 /// `loaded_agent` must live as long as the daemon: it owns the BPF skel,
-/// perf-event links, and the OpenObject backing memory. The ring buffer
-/// polling task and BPF map handles all reference fds owned by the skel —
-/// dropping it prematurely causes IO safety violations.
+/// perf-event links, and the OpenObject backing memory.
 pub(crate) struct BistouriDaemon {
     cancel: CancellationToken,
     #[allow(dead_code)]
@@ -38,13 +34,6 @@ pub(crate) struct BistouriDaemon {
 
 impl BistouriDaemon {
     /// Boots all subsystems in dependency order and returns a running daemon.
-    ///
-    /// A single `CancellationToken` is threaded through every component:
-    /// - Ring buffer polling
-    /// - Trigger agent event loop
-    /// - Config file watcher
-    /// - Capture orchestrator
-    /// - Downstream consumer
     pub(crate) async fn start(args: Args) -> anyhow::Result<Self> {
         let cancel = CancellationToken::new();
 
@@ -55,26 +44,20 @@ impl BistouriDaemon {
 
         telemetry::describe_all();
 
-        // Stack sample channel created here (not inside orchestrator) because the
-        // BPF ringbuffer callback needs the Sender at agent build time — before
-        // the orchestrator exists. All other channels are internal to start().
+        // Stack sample channel: created here because the BPF ringbuffer
+        // callback needs the Sender before the orchestrator exists.
         let (stack_tx, stack_rx) = mpsc::channel::<StackSample>(STACK_SAMPLE_CHANNEL_SIZE);
 
-        // Phase 0: Collect and validate kernel metadata for symbolization.
         let kernel_meta = sys::preflight::run_preflight_checks().await?;
         telemetry::record_agent_info(&kernel_meta, args.freq, args.capture_duration_secs);
 
-        // Shared VdsoCache: populated by proc_walk (trigger module),
-        // read by profiler ringbuf callback (capture module).
+        // Shared VdsoCache: written by proc_walk, read by profiler ringbuf callback.
         let vdso_cache = Arc::new(Mutex::new(VdsoCache::new()));
 
-        // Phase 1: Build the config watcher and load the initial configuration.
-        // build_watcher resolves --config-source=auto by probing the SA token path.
         let watcher = trigger::watcher::build_watcher(&args).await;
         let prepared =
             PreparedTriggerAgent::prepare(watcher, args.proc_path, args.cgroup_path).await?;
 
-        // Phase 2: Build ProfilerAgent with trigger + stack sample senders.
         let agent_builder = ProfilerAgentBuilder::new()
             .with_freq(args.freq)
             .with_trigger_tx(prepared.trigger_tx())
@@ -83,11 +66,13 @@ impl BistouriDaemon {
         let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
         let comm_lpm_trie_handle = loaded_agent.comm_lpm_trie_handle()?;
         let pid_filter_handle = loaded_agent.pid_filter_handle()?;
-
         let poll_handle = loaded_agent.start_polling(cancel.clone())?;
 
-        // Phase 3: Start CaptureOrchestrator with BPF pid filter and stack channel.
-        let orch_handle = CaptureOrchestrator::start(
+        let CaptureOrchestratorHandle {
+            task_handle: orch_task,
+            capture_tx,
+            payload_rx,
+        } = CaptureOrchestrator::start(
             pid_filter_handle,
             args.capture_duration_secs,
             args.freq,
@@ -96,14 +81,8 @@ impl BistouriDaemon {
             kernel_meta,
         );
 
-        let capture_tx = orch_handle.capture_tx.clone();
-        let orch_task = orch_handle.task_handle;
-        let payload_rx = orch_handle.payload_rx;
-
-        // Phase 4: Start TriggerAgent with BPF trie handle and capture channel.
-        // request_cooldown matches the capture window: a watcher cannot fire more
-        // than once per profiling session. Semantically distinct from capture_duration
-        // even though they share the same value today.
+        // Cooldown matches capture window: a watcher cannot fire more
+        // than once per profiling session.
         let request_cooldown = std::time::Duration::from_secs(args.capture_duration_secs);
         let trigger_handle = prepared
             .start(
@@ -115,23 +94,17 @@ impl BistouriDaemon {
             )
             .await?;
 
-        // Phase 5: Build the downstream exporter.
-        // GrpcExporter when --symbolizer-endpoint is configured, NullExporter
-        // otherwise. Both implement `SessionExporter` — the daemon core is
-        // agnostic to which one is running.
         let ds_cancel = cancel.clone();
         let downstream_handle = if let Some(endpoint) = args.symbolizer_endpoint {
-            info!(endpoint = %endpoint, "preparing downstream CaptureService (lazy connect)");
+            info!(endpoint = %endpoint, "downstream CaptureService configured (lazy connect)");
             let exporter = GrpcExporter::connect(endpoint)
                 .map_err(|e| anyhow::anyhow!("failed to build symbolizer channel: {e}"))?;
-            tokio::spawn(async move {
-                Self::run_downstream(payload_rx, exporter, ds_cancel).await;
-            })
+            tokio::spawn(async move { Self::run_downstream(payload_rx, exporter, ds_cancel).await })
         } else {
-            info!("no symbolizer endpoint configured — sessions will be logged locally");
-            tokio::spawn(async move {
-                Self::run_downstream(payload_rx, NullExporter, ds_cancel).await;
-            })
+            info!("no symbolizer endpoint — sessions logged locally");
+            tokio::spawn(
+                async move { Self::run_downstream(payload_rx, NullExporter, ds_cancel).await },
+            )
         };
 
         info!("BPF profiler agent started");
@@ -146,21 +119,16 @@ impl BistouriDaemon {
         })
     }
 
-    /// Graceful shutdown: cancels the token and awaits all tasks.
     pub(crate) async fn shutdown(self) {
         self.cancel.cancel();
-
         let _ = self.poll_handle.await;
         let _ = self.trigger_handle.await;
         let _ = self.orch_handle.await;
         let _ = self.downstream_handle.await;
-
-        // loaded_agent drops here — BPF skel, links, and object are released last.
     }
 
-    /// Drive the downstream consumer loop. Receives `SessionPayload`s from
-    /// the orchestrator and hands them to the configured `SessionExporter`.
-    /// Export errors are logged and discarded — delivery is best-effort.
+    /// Drives the downstream consumer loop. Export errors are logged and
+    /// discarded — delivery is best-effort.
     async fn run_downstream<E: SessionExporter>(
         mut payload_rx: mpsc::Receiver<SessionPayload>,
         exporter: E,

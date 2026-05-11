@@ -18,7 +18,7 @@ use error::Result;
 use matcher::CommMatcher;
 use proc::ProcWalker;
 use psi::{PsiRegisterResult, PsiRegistry};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -28,60 +28,43 @@ use tracing::{debug, error, info};
 use trie::BpfTrie;
 use watcher::ConfigWatcher;
 
-/// Interval between periodic proc_walk scans. Each scan discovers matching
-/// processes that BPF exec tracing may have missed (duplicate-comm rules where
-/// the BPF LPM trie stores only one rule_id, or fork-without-exec workers).
-/// The BPF path is the fast path (immediate on exec); proc_walk is the
-/// completeness guarantee (all rules covered within one interval).
+/// Interval between periodic proc_walk scans.
 const PROC_WALK_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Buffer size for the internal trigger event channel (BPF → TriggerAgent).
-/// 1024 is generous for most deployments — events are consumed quickly by the
-/// event loop, so backpressure is unlikely. Sized to absorb brief bursts from
-/// concurrent proc_walk + BPF ringbuffer callbacks without dropping.
 const TRIGGER_CHANNEL_SIZE: usize = 1024;
 
-/// A process matched a trigger rule — the clean Rust-typed event used on channels.
-/// Both ProcWalker and BPF ringbuffer callbacks produce this type.
+/// A process matched a trigger rule.
 pub(crate) struct ProcessMatchEvent {
     pub rule_id: u32,
     pub pid: u32,
-    /// Pre-resolved by proc_walk (`Some`), or needs inline resolution for BPF
-    /// events (`None`) via `/proc/<pid>/cgroup`.
     pub cgroup_path: Option<PathBuf>,
     pub comm: String,
 }
 
-/// Control messages for the TriggerAgent event loop.
 pub(super) enum TriggerControl {
-    /// Hot-reload with a new configuration. Nukes PSI watchers, rebuilds matcher
-    /// and proc_walk from scratch.
     Reload(Arc<TriggerConfig>),
 }
 
-// ---------------------------------------------------------------------------
-// Two-phase init
-// ---------------------------------------------------------------------------
+/// Shared context for proc_walk spawning and TriggerAgent fields
+/// that are always passed together.
+struct ProcWalkContext {
+    cgroup2_mount: PathBuf,
+    proc_path: PathBuf,
+    event_tx: mpsc::Sender<ProcessMatchEvent>,
+    vdso_cache: Arc<Mutex<VdsoCache>>,
+}
 
 /// Intermediate state after channel + config are ready but before the BPF trie
-/// handle is available. Resolves the circular dependency between ProfilerAgent
-/// (needs the Sender) and TriggerAgent (needs the MapHandle).
+/// handle is available.
 pub(crate) struct PreparedTriggerAgent {
     config: Arc<TriggerConfig>,
     watcher: Box<dyn ConfigWatcher>,
-    event_tx: mpsc::Sender<ProcessMatchEvent>,
     event_rx: Option<mpsc::Receiver<ProcessMatchEvent>>,
-    cgroup2_mount: PathBuf,
-    proc_path: PathBuf,
+    walk_ctx: ProcWalkContext,
 }
 
 impl PreparedTriggerAgent {
     /// Phase 1: Load initial config, create channel, resolve cgroup2 mount.
-    ///
-    /// `watcher` is the already-constructed [`ConfigWatcher`] implementation.
-    /// `proc_path` should point to procfs (e.g. `/host/proc` in container
-    /// deployments). `cgroup_path` overrides auto-detection from the mount
-    /// table when set.
     pub(crate) async fn prepare(
         mut watcher: Box<dyn ConfigWatcher>,
         proc_path: PathBuf,
@@ -93,11 +76,7 @@ impl PreparedTriggerAgent {
         let cgroup2_mount = match cgroup_path {
             Some(path) => path,
             None => find_cgroup2_mount(&proc_path).map_err(|e| {
-                error!(
-                    error = %e,
-                "cgroup2 is not mounted — bistouri requires cgroup2 for PSI triggers. \
-                 Mount with: mount -t cgroup2 none /sys/fs/cgroup",
-                );
+                error!(error = %e, "cgroup2 not mounted");
                 error::TriggerError::Cgroup2NotMounted(e)
             })?,
         };
@@ -111,20 +90,21 @@ impl PreparedTriggerAgent {
         Ok(Self {
             config,
             watcher,
-            event_tx,
             event_rx: Some(event_rx),
-            cgroup2_mount,
-            proc_path,
+            walk_ctx: ProcWalkContext {
+                cgroup2_mount,
+                proc_path,
+                event_tx,
+                vdso_cache: Arc::new(Mutex::new(VdsoCache::new())),
+            },
         })
     }
 
-    /// Returns a clone of the Sender for ProfilerAgent to use.
     pub(crate) fn trigger_tx(&self) -> mpsc::Sender<ProcessMatchEvent> {
-        self.event_tx.clone()
+        self.walk_ctx.event_tx.clone()
     }
 
-    /// Phase 2: Consume self, inject BPF handle, capture channel, and
-    /// cancellation token, then start the event loop.
+    /// Phase 2: Consume self, inject BPF handle + capture channel, start event loop.
     pub(crate) async fn start(
         mut self,
         comm_lpm_trie_handle: libbpf_rs::MapHandle,
@@ -139,19 +119,13 @@ impl PreparedTriggerAgent {
         let mut bpf_trie = BpfTrie::new(comm_lpm_trie_handle);
         bpf_trie.repopulate(&self.config)?;
 
+        // Replace the internally-created vdso_cache with the shared one from daemon.
+        self.walk_ctx.vdso_cache = vdso_cache;
+
         let proc_walk_cancel = cancel.child_token();
+        let proc_handle =
+            TriggerAgent::spawn_proc_walk(&self.config, &self.walk_ctx, proc_walk_cancel.clone());
 
-        let proc_handle = TriggerAgent::spawn_proc_walk(
-            &self.config,
-            &self.cgroup2_mount,
-            &self.proc_path,
-            self.event_tx.clone(),
-            proc_walk_cancel.clone(),
-            vdso_cache.clone(),
-        );
-
-        // Spawn the config watcher with the daemon's cancel token.
-        // The watcher owns itself through its full watch loop.
         let watcher_cancel = cancel.clone();
         let watcher_control_tx = control_tx.clone();
         let watcher_handle = tokio::spawn(async move {
@@ -167,17 +141,14 @@ impl PreparedTriggerAgent {
             config: self.config,
             matcher,
             bpf_trie,
-            cgroup2_mount: self.cgroup2_mount,
-            proc_path: self.proc_path,
             psi_registry: PsiRegistry::new(capture_tx, request_cooldown),
             proc_handle: Some(proc_handle),
             watcher_handle: Some(watcher_handle),
             cancel,
             proc_walk_cancel,
-            event_tx: self.event_tx,
+            walk_ctx: self.walk_ctx,
             event_rx,
             control_rx,
-            vdso_cache,
         };
 
         let task_handle = tokio::spawn(async move {
@@ -188,31 +159,21 @@ impl PreparedTriggerAgent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TriggerAgent (private event loop)
-// ---------------------------------------------------------------------------
-
 struct TriggerAgent {
     config: Arc<TriggerConfig>,
     matcher: CommMatcher,
     bpf_trie: BpfTrie,
-    cgroup2_mount: PathBuf,
-    proc_path: PathBuf,
     psi_registry: PsiRegistry,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Daemon-level cancel token — triggers full shutdown.
     cancel: CancellationToken,
-    /// Child token for proc_walk — cancelled on reload AND on daemon shutdown.
     proc_walk_cancel: CancellationToken,
-    event_tx: mpsc::Sender<ProcessMatchEvent>,
+    walk_ctx: ProcWalkContext,
     event_rx: mpsc::Receiver<ProcessMatchEvent>,
     control_rx: mpsc::Receiver<TriggerControl>,
-    vdso_cache: Arc<Mutex<VdsoCache>>,
 }
 
 impl TriggerAgent {
-    /// Main event loop — processes events and control messages until cancelled.
     async fn run(&mut self) {
         loop {
             tokio::select! {
@@ -233,35 +194,29 @@ impl TriggerAgent {
 
     fn handle_process_event(&mut self, event: ProcessMatchEvent) {
         let cgroup_path = match event.cgroup_path {
-            // proc_walk already resolved the path.
             Some(path) => path,
-            // BPF event: inline /proc/<pid>/cgroup read (~10-50µs).
-            None => match resolve_cgroup_path(&self.cgroup2_mount, &self.proc_path, event.pid) {
+            None => match resolve_cgroup_path(
+                &self.walk_ctx.cgroup2_mount,
+                &self.walk_ctx.proc_path,
+                event.pid,
+            ) {
                 Ok(path) => path,
                 Err(e) => {
-                    error!(
-                        pid = event.pid,
-                        error = %e,
-                        "cgroup resolution failed for BPF event, skipping",
-                    );
+                    error!(pid = event.pid, error = %e, "cgroup resolution failed, skipping");
                     metrics::counter!(METRIC_CGROUP_RESOLVE_FAILURES).increment(1);
                     return;
                 }
             },
         };
 
-        // Re-validate: confirm the comm still matches the rule in the current config.
-        // Filters out stale events from a pre-reload BPF trie state.
         if !self
             .matcher
             .match_comm(&event.comm)
             .contains(&event.rule_id)
         {
             debug!(
-                rule_id = event.rule_id,
-                comm = %event.comm,
-                pid = event.pid,
-                "stale event filtered: rule_id no longer matches current config",
+                rule_id = event.rule_id, comm = %event.comm, pid = event.pid,
+                "stale event filtered",
             );
             metrics::counter!(METRIC_STALE_EVENTS).increment(1);
             return;
@@ -312,34 +267,17 @@ impl TriggerAgent {
     }
 
     /// Hot-reload: cancel current walk, nuke PSI watchers, rebuild with new config.
-    ///
-    /// Runs inline in the event loop rather than in `spawn_blocking` because every
-    /// step is cheap: `cancel()` flips an atomic, `handle.await` returns near-instantly
-    /// since `walk()` checks cancellation between PIDs, PSI handle aborts are O(1),
-    /// and trie construction is trivially fast for realistic config sizes.
-    /// Moving this to a background task would require `Arc<Mutex<>>` on the PSI
-    /// registry for no measurable benefit.
     async fn reload(&mut self, new_config: Arc<TriggerConfig>) {
-        // 1. Cancel running proc_walk via child token
         self.proc_walk_cancel.cancel();
         if let Some(handle) = self.proc_handle.take() {
             let _ = handle.await;
         }
 
-        // 2. Nuke PSI registry — abort all watcher tasks
         self.psi_registry.shutdown();
 
-        // 3. Rebuild matcher and BPF trie with new config.
-        //    If the BPF trie update fails, roll back entirely to avoid
-        //    split-brain (userspace matcher on new config, BPF trie on old).
         let new_matcher = CommMatcher::new(&new_config);
         if let Err(e) = self.bpf_trie.repopulate(&new_config) {
-            error!(
-                error = %e,
-                "failed to repopulate BPF trie, rolling back to previous config",
-            );
-            // Restore old trie state — if this also fails we are in an
-            // unrecoverable state with an inconsistent BPF trie.
+            error!(error = %e, "failed to repopulate BPF trie, rolling back");
             if let Err(e) = self.bpf_trie.repopulate(&self.config) {
                 panic!("fatal: failed to restore previous BPF trie state: {}", e);
             }
@@ -350,37 +288,24 @@ impl TriggerAgent {
             metrics::counter!(METRIC_CONFIG_RELOADS).increment(1);
         }
 
-        // 4. Spawn new proc_walk with a fresh child token.
         self.proc_walk_cancel = self.cancel.child_token();
-        let handle = Self::spawn_proc_walk(
-            &self.config,
-            &self.cgroup2_mount,
-            &self.proc_path,
-            self.event_tx.clone(),
-            self.proc_walk_cancel.clone(),
-            self.vdso_cache.clone(),
-        );
+        let handle =
+            Self::spawn_proc_walk(&self.config, &self.walk_ctx, self.proc_walk_cancel.clone());
         self.proc_handle = Some(handle);
     }
 
-    /// Spawns a periodic proc_walk loop. The first scan runs immediately,
-    /// then repeats every `PROC_WALK_INTERVAL`. Each individual walk runs
-    /// in `spawn_blocking` to protect the event loop.
     fn spawn_proc_walk(
         config: &Arc<TriggerConfig>,
-        cgroup2_mount: &Path,
-        proc_path: &Path,
-        tx: mpsc::Sender<ProcessMatchEvent>,
+        ctx: &ProcWalkContext,
         cancel: CancellationToken,
-        vdso_cache: Arc<Mutex<VdsoCache>>,
     ) -> tokio::task::JoinHandle<()> {
         let config = Arc::clone(config);
-        let mount = cgroup2_mount.to_path_buf();
-        let proc_path = proc_path.to_path_buf();
+        let mount = ctx.cgroup2_mount.clone();
+        let proc_path = ctx.proc_path.clone();
+        let tx = ctx.event_tx.clone();
+        let vdso_cache = ctx.vdso_cache.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PROC_WALK_INTERVAL);
-            // First tick fires immediately; subsequent ticks maintain cadence
-            // even if a walk overruns (Delay is the default, no ticks are skipped).
             loop {
                 tokio::select! {
                     biased;
@@ -402,7 +327,6 @@ impl TriggerAgent {
         })
     }
 
-    /// Cleanup on shutdown — abort PSI watchers and config watcher.
     fn cleanup(&mut self) {
         self.psi_registry.shutdown();
         if let Some(handle) = self.watcher_handle.take() {
