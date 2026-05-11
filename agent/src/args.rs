@@ -64,25 +64,15 @@ pub(crate) struct Args {
         long,
         env = "BISTOURI_CONFIG",
         default_value = DEFAULT_CONFIG_PATH,
-        conflicts_with_all = ["namespace", "cr_name"]
+        conflicts_with = "cr_name"
     )]
     pub config: PathBuf,
-
-    /// Kubernetes namespace of the BistouriConfig CR to watch.
-    ///
-    /// Used when `--config-source=kube` (or `auto` resolves to kube).
-    /// Defaults to the in-cluster namespace from the service account token.
-    #[arg(
-        long,
-        env = "BISTOURI_NAMESPACE",
-        conflicts_with = "config",
-        value_name = "NS"
-    )]
-    pub namespace: Option<String>,
 
     /// Name of the BistouriConfig CR to watch.
     ///
     /// Used when `--config-source=kube` (or `auto` resolves to kube).
+    /// The CR must exist in the same namespace as the agent pod (derived
+    /// from the in-cluster service account token).
     #[arg(
         long,
         env = "BISTOURI_CR_NAME",

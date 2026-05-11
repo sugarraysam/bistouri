@@ -74,11 +74,9 @@ pub(crate) async fn build_watcher(args: &Args) -> Box<dyn ConfigWatcher> {
                 .await
                 .expect("failed to build kube client — is the pod running with a ServiceAccount?");
 
-            let namespace = args.namespace.clone().unwrap_or_else(|| {
-                std::fs::read_to_string(KUBE_SA_NAMESPACE_PATH)
-                    .map(|s| s.trim().to_owned())
-                    .unwrap_or_else(|_| "default".to_owned())
-            });
+            let namespace = std::fs::read_to_string(KUBE_SA_NAMESPACE_PATH)
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_else(|_| "default".to_owned());
 
             info!(
                 namespace = %namespace,
