@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
-use super::trace::StackTrace;
+use super::trace::{SampleKind, StackTrace};
 use crate::sys::kernel::KernelMeta;
 use crate::trigger::config::PsiResource;
 use bistouri_api::v1 as proto;
@@ -44,7 +44,14 @@ pub(crate) struct CaptureRequest {
 /// Active capture session: one PID, one resource, bounded duration.
 ///
 /// Per-session dictionary encoding: unique `StackTrace`s are stored once in
-/// `traces`, and `counts[i]` records how many samples matched `traces[i]`.
+/// `traces`. Each trace has two independent sample counters:
+///   - `on_cpu_counts[i]`  — fired by the `perf_event` program (process on CPU)
+///   - `off_cpu_counts[i]` — fired by `sched_switch` (process entering D state)
+///
+/// Keeping separate counters instead of a parallel `kind` vec avoids
+/// dictionary-encoding a 2-value flag. The symbolizer uses the counts
+/// directly: sum both for a combined flamegraph, use each independently
+/// for on-CPU vs off-CPU split views.
 pub(crate) struct CaptureSession {
     id: SessionId,
     pid: u32,
@@ -53,11 +60,12 @@ pub(crate) struct CaptureSession {
     kernel_meta: Arc<KernelMeta>,
     started_at: Instant,
     traces: Vec<StackTrace>,
-    /// Maps trace content → index in `traces` vec. Uses pre-computed hash:
-    /// `StackTrace` caches its content hash at construction, so HashMap lookups
-    /// cost one `u64` hash instead of re-hashing all frames.
+    /// Maps trace content → index in `traces` vec.
     dedup: HashMap<StackTrace, usize>,
-    counts: Vec<u64>,
+    /// On-CPU sample count per unique trace (perf_event, process running).
+    on_cpu_counts: Vec<u64>,
+    /// Off-CPU sample count per unique trace (sched_switch, process in D state).
+    off_cpu_counts: Vec<u64>,
     total_samples: u64,
 }
 
@@ -77,7 +85,8 @@ impl CaptureSession {
             started_at: Instant::now(),
             traces: Vec::new(),
             dedup: HashMap::new(),
-            counts: Vec::new(),
+            on_cpu_counts: Vec::new(),
+            off_cpu_counts: Vec::new(),
             total_samples: 0,
         }
     }
@@ -94,17 +103,23 @@ impl CaptureSession {
         &self.source
     }
 
-    /// Records a stack trace sample. Deduplicates: if the same trace was
-    /// already seen, increments its count. Otherwise stores a new entry.
-    /// Clone cost: one `StackTrace` clone per unique trace (first occurrence only).
-    pub(crate) fn record(&mut self, trace: StackTrace) {
-        if let Some(&idx) = self.dedup.get(&trace) {
-            self.counts[idx] += 1;
+    /// Records a stack trace sample into the appropriate count bucket.
+    /// Deduplicates by trace content: the same call path from on-CPU and
+    /// off-CPU both map to the same trace entry, keeping separate counters.
+    pub(crate) fn record(&mut self, trace: StackTrace, kind: SampleKind) {
+        let idx = if let Some(&idx) = self.dedup.get(&trace) {
+            idx
         } else {
             let idx = self.traces.len();
             self.dedup.insert(trace.clone(), idx);
             self.traces.push(trace);
-            self.counts.push(1);
+            self.on_cpu_counts.push(0);
+            self.off_cpu_counts.push(0);
+            idx
+        };
+        match kind {
+            SampleKind::OnCpu => self.on_cpu_counts[idx] += 1,
+            SampleKind::OffCpu => self.off_cpu_counts[idx] += 1,
         }
         self.total_samples += 1;
     }
@@ -120,7 +135,8 @@ impl CaptureSession {
             kernel_meta: self.kernel_meta,
             started_at: self.started_at,
             stack_traces: self.traces,
-            counts: self.counts,
+            on_cpu_counts: self.on_cpu_counts,
+            off_cpu_counts: self.off_cpu_counts,
             total_samples: self.total_samples,
         }
     }
@@ -128,30 +144,23 @@ impl CaptureSession {
 
 /// Finalized capture result, ready for downstream delivery (symbolizer, storage).
 ///
-/// Contains dictionary-encoded stack traces: `stack_traces[i]` holds the unique
-/// trace, and `profile[i]` holds how many times it was sampled. Kernel frames
-/// are raw IPs (symbolized via /proc/kallsyms). User frames carry per-frame
-/// `(build_id, file_offset)` from `BPF_F_USER_BUILD_ID` — the symbolizer uses
-/// these for cross-host correlation and symbol lookup without /proc/pid/maps.
+/// `stack_traces[i]` holds the unique trace. Two parallel count vecs give
+/// separate on-CPU and off-CPU sample weights per trace — the symbolizer
+/// sums them for a combined flamegraph, or uses each independently.
 pub(crate) struct CompletedSession {
     pub session_id: SessionId,
     pub source: CaptureSource,
-    /// PID is host-local and ephemeral, but needed for local correlation.
-    /// For cross-host correlation, the symbolizer groups by build_id
-    /// (embedded per-frame in user stack entries).
     pub pid: u32,
-    /// Stable, human-readable process identifier. Unlike PID, meaningful
-    /// across hosts running the same binary.
     pub comm: String,
-    /// Host kernel metadata for kernel stack symbolization.
-    /// Shared across all sessions on this host (Arc = pointer bump).
     pub kernel_meta: Arc<KernelMeta>,
     #[allow(dead_code)] // consumed by symbolizer (TODO)
     pub started_at: Instant,
     // TODO: stall_total_usec delta — PSI violation severity.
     pub stack_traces: Vec<StackTrace>,
-    /// Dictionary-encoded profile: `counts[i]` = sample count for `stack_traces[i]`.
-    pub counts: Vec<u64>,
+    /// On-CPU sample count per trace (`perf_event`, process was running).
+    pub on_cpu_counts: Vec<u64>,
+    /// Off-CPU sample count per trace (`sched_switch` D-state, process blocked).
+    pub off_cpu_counts: Vec<u64>,
     pub total_samples: u64,
 }
 
@@ -160,7 +169,8 @@ impl CompletedSession {
         self,
     ) -> std::result::Result<proto::SessionPayload, bincode::Error> {
         let traces_payload = bincode::serialize(&self.stack_traces)?;
-        let counts_payload = bincode::serialize(&self.counts)?;
+        let on_cpu_counts_payload = bincode::serialize(&self.on_cpu_counts)?;
+        let off_cpu_counts_payload = bincode::serialize(&self.off_cpu_counts)?;
         let total_samples = self.total_samples;
 
         let source = match self.source {
@@ -193,7 +203,8 @@ impl CompletedSession {
             }),
             metadata: Some(metadata),
             traces_payload,
-            counts_payload,
+            on_cpu_counts_payload,
+            off_cpu_counts_payload,
             total_samples,
         })
     }
@@ -279,7 +290,7 @@ mod tests {
             mock_kernel_meta(),
         );
         for trace in traces {
-            session.record(trace);
+            session.record(trace, SampleKind::OnCpu);
         }
         assert_eq!(
             session.traces.len(),
@@ -308,16 +319,20 @@ mod tests {
         let cold_path = make_trace(&[0xC], &[frame(0x02, 0xD)]);
 
         for _ in 0..10 {
-            session.record(hot_path.clone());
+            session.record(hot_path.clone(), SampleKind::OnCpu);
         }
-        session.record(cold_path);
+        session.record(cold_path, SampleKind::OffCpu);
 
         let completed = session.finalize();
 
         assert_eq!(completed.total_samples, 11);
         assert_eq!(completed.stack_traces.len(), 2);
-        assert_eq!(completed.counts[0], 10, "hot path count");
-        assert_eq!(completed.counts[1], 1, "cold path count");
+        // hot path: 10 on-CPU samples, 0 off-CPU
+        assert_eq!(completed.on_cpu_counts[0], 10, "hot path on-cpu count");
+        assert_eq!(completed.off_cpu_counts[0], 0, "hot path off-cpu count");
+        // cold path: 0 on-CPU, 1 off-CPU
+        assert_eq!(completed.on_cpu_counts[1], 0, "cold path on-cpu count");
+        assert_eq!(completed.off_cpu_counts[1], 1, "cold path off-cpu count");
         assert_eq!(completed.pid, 42);
         assert_eq!(completed.comm, "myapp");
         assert_eq!(completed.source, CaptureSource::Psi(PsiResource::Io));
@@ -335,7 +350,8 @@ mod tests {
 
         assert_eq!(completed.total_samples, 0);
         assert!(completed.stack_traces.is_empty());
-        assert!(completed.counts.is_empty());
+        assert!(completed.on_cpu_counts.is_empty());
+        assert!(completed.off_cpu_counts.is_empty());
     }
 
     #[test]

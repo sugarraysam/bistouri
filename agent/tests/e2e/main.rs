@@ -84,12 +84,11 @@ async fn bistouri_e2e() {
             .find(|s| s.metadata.as_ref().is_some_and(|m| m.comm == *comm))
             .unwrap_or_else(|| panic!("no session received for workload {comm}"));
 
-        // TODO: make this work (io and mem no stacks :( ), increase capture time?
-        //assert!(
-        //session.total_samples > 0,
-        //"{comm}: completed session has zero stack samples — \
-        //check BPF pid_filter_map insertion and process liveness during capture window"
-        //);
+        assert!(
+            session.total_samples > 0,
+            "{comm}: completed session has zero stack samples — \
+            check BPF pid_filter_map insertion and process liveness during capture window"
+        );
 
         info!(
             comm = %comm,
@@ -132,16 +131,15 @@ async fn bistouri_e2e() {
          check -fno-omit-frame-pointer in Dockerfile.stress"
     );
 
-    // TODO: no empty sessions in workloads
-    //for comm in EXPECTED_COMMS {
-    //let empty = snapshot.counter("bistouri_capture_sessions_empty", Some(("comm", comm)));
-    //assert!(
-    //empty == 0.0,
-    //"bistouri_capture_sessions_empty[{comm}] = {empty} — capture session \
-    //produced no samples; check for PID staleness or a short pressure window"
-    //);
-    //}
-    //info!("✅ bistouri_capture_sessions_empty = 0 for cpu-burner and mem-burner");
+    for comm in EXPECTED_COMMS {
+        let empty = snapshot.counter("bistouri_capture_sessions_empty", Some(("comm", comm)));
+        assert!(
+            empty == 0.0,
+            "bistouri_capture_sessions_empty[{comm}] = {empty} — capture session \
+            produced no samples; check for PID staleness or a short pressure window"
+        );
+    }
+    info!("✅ bistouri_capture_sessions_empty = 0 for all workloads");
 
     let completed_total = snapshot.counter("bistouri_capture_sessions_completed", None);
     info!(completed_total, "📊 Phase 1: completed sessions");

@@ -26,16 +26,14 @@ spec:
     image: bistouri-agent:local
     imagePullPolicy: Never
     args:
-    - "--proc-path=/host/proc"
-    - "--log-level=bistouri_agent=debug"
-    - "--symbolizer-endpoint=http://localhost:9500"
-    env:
-    # --config-source=auto detects the SA token and switches to kube watch mode.
-    # BISTOURI_NAMESPACE scopes the BistouriConfig CR watch to this pod's namespace.
-    - name: BISTOURI_NAMESPACE
-      valueFrom:
-        fieldRef:
-          fieldPath: metadata.namespace
+    - "--proc-path"
+    - "/host/proc"
+    - "--log-level"
+    - "bistouri_agent=debug"
+    - "--symbolizer-endpoint"
+    - "http://localhost:9500"
+    - "--capture-duration-secs"
+    - "5"
     ports:
     - containerPort: 9464
       hostPort: 9464

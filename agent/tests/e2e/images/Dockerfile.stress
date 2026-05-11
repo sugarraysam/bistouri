@@ -1,7 +1,7 @@
 # Stress workload image for Bistouri E2E integration tests.
 #
 # Produces three statically-linked binaries with distinct Linux `comm` names
-# (cpu-burner, io-burner, mem-hog) so Bistouri's comm-based matching can
+# (cpu-burner, io-burner, mem-burner) so Bistouri's comm-based matching can
 # differentiate them. Final image is FROM scratch (~200KB total).
 #
 # Uses Alpine (musl-libc) instead of Debian (glibc) because musl's syscall

@@ -47,10 +47,17 @@ message SessionPayload {
   Metadata metadata = 3;
 
   bytes traces_payload = 4;
-  bytes counts_payload = 5;
+
+  // Per-trace on-CPU sample counts (perf_event, process was running on CPU).
+  bytes on_cpu_counts_payload = 5;
 
   // Total stack samples collected during this capture window.
   // Surfaced here so consumers can assert on pipeline health
   // without deserializing the full bincode payloads.
   uint64 total_samples = 6;
+
+  // Per-trace off-CPU sample counts (sched_switch D-state, process blocked on IO).
+  // Parallel to traces_payload. The symbolizer sums on+off for a combined
+  // flamegraph, or uses each vec independently for split views.
+  bytes off_cpu_counts_payload = 7;
 }

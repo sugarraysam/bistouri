@@ -50,6 +50,11 @@ pub(crate) struct StackTraceEvent {
     pub comm: [u8; TASK_COMM_LEN],
     pub kernel_stack_sz: i32,
     pub user_stack_sz: i32,
+    /// STACK_KIND_ON_CPU (0) or STACK_KIND_OFF_CPU (1).
+    pub kind: u8,
+    /// Explicit padding — mirrors the `__u8 _pad[3]` in the C struct so that
+    /// the `kernel_stack` array remains 4-byte aligned in both layouts.
+    pub _pad: [u8; 3],
     pub kernel_stack: [u64; MAX_STACK_DEPTH],
     pub user_stack: [UserStackFrame; MAX_STACK_DEPTH],
 }
@@ -325,9 +330,17 @@ impl ProfilerAgent {
         let mut object = Box::new(std::mem::MaybeUninit::uninit());
         let builder = bpf::ProfilerSkelBuilder::default();
 
-        let open_skel = builder
+        let mut open_skel = builder
             .open(&mut object)
             .map_err(|e| AgentError::Bpf("failed to open BPF skeleton".into(), e))?;
+
+        // Set the off-CPU sampling period from the same --freq value used for
+        // perf_event, so both profilers stay in sync. The rodata section is
+        // writable here (open_skel.maps.rodata_data) and becomes read-only once
+        // the kernel loads the program — this is the standard libbpf pattern.
+        if let Some(rodata) = open_skel.maps.rodata_data.as_mut() {
+            rodata.off_cpu_period_ns = 1_000_000_000u64 / self.freq;
+        }
 
         let skel = open_skel.load().map_err(|e| {
             AgentError::Bpf(
@@ -361,6 +374,16 @@ impl ProfilerAgent {
 
         loaded.setup_ringbuffers(self.trigger_tx, self.stack_tx, self.vdso_cache)?;
         loaded.attach_perf_events(self.ncpus, self.freq)?;
+
+        // Attach the off-CPU profiler — captures stacks when a monitored PID
+        // transitions to TASK_UNINTERRUPTIBLE (D state, blocked on IO).
+        let link = loaded
+            .skel
+            .progs
+            .handle_sched_switch
+            .attach()
+            .map_err(|e| AgentError::Bpf("failed to attach handle_sched_switch".into(), e))?;
+        loaded.links.push(link);
 
         Ok(loaded)
     }

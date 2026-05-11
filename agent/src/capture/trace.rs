@@ -7,6 +7,30 @@ use crate::capture::vdso::{is_canonical_user_address, VdsoCache};
 use crate::telemetry::METRIC_USER_FRAMES;
 use tracing::debug;
 
+/// Distinguishes on-CPU samples (fired by `handle_perf` via perf_event) from
+/// off-CPU samples (fired by `handle_sched_switch` when a monitored PID enters
+/// TASK_UNINTERRUPTIBLE, i.e. blocks on IO or a kernel resource).
+///
+/// Stored per sample in `CompletedSession` so the symbolizer can produce
+/// separate on-CPU and off-CPU flamegraphs from a single session payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum SampleKind {
+    /// Process was executing on a CPU when the perf_event counter fired.
+    OnCpu,
+    /// Process transitioned to TASK_UNINTERRUPTIBLE (D state) — captured at
+    /// the scheduler context-switch point before the task went to sleep.
+    OffCpu,
+}
+
+impl SampleKind {
+    fn from_bpf_kind(kind: u8) -> Self {
+        match kind {
+            1 => Self::OffCpu,
+            _ => Self::OnCpu, // 0 and any unknown value default to on-CPU
+        }
+    }
+}
+
 /// Placeholder label for vDSO frames — kernel-provided syscall fast-path.
 const LABEL_VDSO: &str = "[vdso]";
 
@@ -225,6 +249,7 @@ impl StackTrace {
 /// raw BPF struct layout.
 pub(crate) struct StackSample {
     pub pid: u32,
+    pub kind: SampleKind,
     pub trace: StackTrace,
 }
 
@@ -232,6 +257,7 @@ impl StackSample {
     pub(crate) fn from_event(event: &StackTraceEvent, vdso_cache: &Arc<Mutex<VdsoCache>>) -> Self {
         Self {
             pid: event.pid,
+            kind: SampleKind::from_bpf_kind(event.kind),
             trace: StackTrace::from_event(event, vdso_cache),
         }
     }
@@ -265,6 +291,8 @@ mod tests {
             comm: [0u8; TASK_COMM_LEN],
             kernel_stack_sz: 0,
             user_stack_sz: 0,
+            kind: 0,
+            _pad: [0; 3],
             kernel_stack: [0u64; MAX_STACK_DEPTH],
             user_stack: [UserStackFrame {
                 status: 0,
@@ -581,13 +609,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn stack_sample_extracts_pid() {
-        let event = make_event(1, &[(VALID, bid(0xFF), 0x42)]);
+    fn stack_sample_extracts_pid_and_kind() {
+        let mut event = make_event(1, &[(VALID, bid(0xFF), 0x42)]);
         let cache = empty_vdso_cache();
-        let sample = StackSample::from_event(&event, &cache);
-        assert_eq!(sample.pid, 42);
-        assert_eq!(sample.trace.kernel_frames.len(), 1);
-        assert_eq!(sample.trace.user_frames.len(), 1);
+
+        event.kind = 0;
+        let on_cpu = StackSample::from_event(&event, &cache);
+        assert_eq!(on_cpu.pid, 42);
+        assert_eq!(on_cpu.kind, SampleKind::OnCpu);
+        assert_eq!(on_cpu.trace.kernel_frames.len(), 1);
+
+        event.kind = 1;
+        let off_cpu = StackSample::from_event(&event, &cache);
+        assert_eq!(off_cpu.kind, SampleKind::OffCpu);
+
+        // Unknown kind values default to OnCpu
+        event.kind = 99;
+        let unknown = StackSample::from_event(&event, &cache);
+        assert_eq!(unknown.kind, SampleKind::OnCpu);
     }
 
     // -----------------------------------------------------------------------
@@ -617,6 +656,24 @@ mod tests {
             std::mem::size_of::<UserStackFrame>(),
             32,
             "UserStackFrame must be 32 bytes to match C struct user_stack_frame"
+        );
+    }
+
+    #[test]
+    fn stack_trace_event_layout() {
+        // pid(4) + comm(16) + kernel_stack_sz(4) + user_stack_sz(4) +
+        // kind(1) + _pad(3) = 32 bytes header, then:
+        // kernel_stack(127*8=1016) + user_stack(127*32=4064) = 5080 bytes arrays.
+        // Total = 32 + 5080 = 5112 bytes.
+        //
+        // This assertion catches any C/Rust struct layout drift at test time
+        // rather than silently misreading ring-buffer events at runtime.
+        let header = 4 + 16 + 4 + 4 + 1 + 3;
+        let arrays = MAX_STACK_DEPTH * 8 + MAX_STACK_DEPTH * 32;
+        assert_eq!(
+            std::mem::size_of::<StackTraceEvent>(),
+            header + arrays,
+            "StackTraceEvent C/Rust layout mismatch"
         );
     }
 }

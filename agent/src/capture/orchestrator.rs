@@ -214,6 +214,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             return;
         };
 
+        let kind = sample.kind;
         let trace = sample.trace;
 
         match session_ids.len() {
@@ -221,7 +222,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             1 => {
                 // Common case: single session per PID. Zero clones.
                 if let Some(session) = self.sessions.get_mut(&session_ids[0]) {
-                    session.record(trace);
+                    session.record(trace, kind);
                     metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                 }
             }
@@ -230,12 +231,12 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
                 let last_idx = session_ids.len() - 1;
                 for session_id in &session_ids[..last_idx] {
                     if let Some(session) = self.sessions.get_mut(session_id) {
-                        session.record(trace.clone());
+                        session.record(trace.clone(), kind);
                         metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                     }
                 }
                 if let Some(session) = self.sessions.get_mut(&session_ids[last_idx]) {
-                    session.record(trace);
+                    session.record(trace, kind);
                     metrics::counter!(METRIC_SAMPLES_INGESTED, "resource" => source_label(session.source())).increment(1);
                 }
             }
@@ -378,7 +379,7 @@ impl CaptureOrchestrator<BpfPidFilter> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::trace::{StackTrace, UserFrame};
+    use super::super::trace::{SampleKind, StackTrace, UserFrame};
     use super::*;
     use crate::agent::profiler::BUILD_ID_SIZE;
     use crate::trigger::config::PsiResource;
@@ -414,6 +415,7 @@ mod tests {
     fn make_sample(pid: u32, trace_id: u64) -> StackSample {
         StackSample {
             pid,
+            kind: SampleKind::OnCpu,
             trace: StackTrace::new(
                 vec![trace_id],
                 vec![UserFrame::Resolved {

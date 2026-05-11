@@ -26,11 +26,16 @@ struct user_stack_frame {
     };
 };
 
+#define STACK_KIND_ON_CPU  0
+#define STACK_KIND_OFF_CPU 1
+
 struct stack_trace_event {
     __u32 pid;
     __u8 comm[TASK_COMM_LEN];
     __s32 kernel_stack_sz;
     __s32 user_stack_sz;
+    __u8 kind;      /* STACK_KIND_ON_CPU or STACK_KIND_OFF_CPU */
+    __u8 _pad[3];   /* explicit padding — keeps arrays 4-byte aligned */
     __u64 kernel_stack[MAX_STACK_DEPTH];
     struct user_stack_frame user_stack[MAX_STACK_DEPTH];
 };
