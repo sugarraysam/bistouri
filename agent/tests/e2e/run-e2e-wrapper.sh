@@ -9,34 +9,34 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # 1. Clean slate: Kill any stale k3s processes
 function cleanup() {
-    sudo k3s kubectl delete all --all -n default || true
-    sudo k3s-killall.sh || true
-    sudo pkill -9 "k3s" 2>/dev/null || true
-    sudo rm -fr /var/lib/rancher/k3s/server/db || true
+	sudo k3s kubectl delete pods --all -n default || true
+	sudo k3s-killall.sh || true
+	sudo pkill -9 "k3s" 2>/dev/null || true
+	sudo rm -fr /var/lib/rancher/k3s/server/db || true
 
-    # fix terminal output
-    stty sane || true
+	# fix terminal output
+	stty sane || true
 }
 
 cleanup
 if systemctl is-active --quiet k3s 2>/dev/null; then
-    sudo systemctl stop k3s
+	sudo systemctl stop k3s
 fi
 
 # 2. Start k3s fresh with standard defaults (Watch strategy is already native and fast)
 sudo nohup k3s server --disable=traefik \
-    --disable=servicelb \
-    --write-kubeconfig-mode=644 \
-    --kubelet-arg="sync-frequency=3s" \
-    >/tmp/k3s.log 2>&1 &
+	--disable=servicelb \
+	--write-kubeconfig-mode=644 \
+	--kubelet-arg="sync-frequency=3s" \
+	>/tmp/k3s.log 2>&1 &
 
 until sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -q .; do sleep 2; done
 sudo k3s kubectl wait --for=condition=Ready node --all --timeout=60s
 
 trap_cleanup() {
-    if [[ "${SKIP_CLEANUP}" != "true" ]]; then
-        cleanup
-    fi
+	if [[ "${SKIP_CLEANUP}" != "true" ]]; then
+		cleanup
+	fi
 }
 trap trap_cleanup EXIT
 
@@ -53,9 +53,9 @@ make -C "$REPO_ROOT" validate-deployment
 
 # 5. Build + load images
 if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
-    DOCKER_BUILDKIT=1 docker build -t bistouri-agent:local -f "${REPO_ROOT}/agent/Dockerfile" "$REPO_ROOT"
-    docker build -t bistouri-stress:local \
-        -f "${SCRIPT_DIR}/images/Dockerfile.stress" "${SCRIPT_DIR}/images/"
+	DOCKER_BUILDKIT=1 docker build -t bistouri-agent:local -f "${REPO_ROOT}/agent/Dockerfile" "$REPO_ROOT"
+	docker build -t bistouri-stress:local \
+		-f "${SCRIPT_DIR}/images/Dockerfile.stress" "${SCRIPT_DIR}/images/"
 fi
 docker save bistouri-agent:local | sudo k3s ctr images import -
 docker pull busybox:latest

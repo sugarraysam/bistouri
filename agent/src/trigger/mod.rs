@@ -83,7 +83,7 @@ impl PreparedTriggerAgent {
     /// deployments). `cgroup_path` overrides auto-detection from the mount
     /// table when set.
     pub(crate) async fn prepare(
-        watcher: Box<dyn ConfigWatcher>,
+        mut watcher: Box<dyn ConfigWatcher>,
         proc_path: PathBuf,
         cgroup_path: Option<PathBuf>,
     ) -> Result<Self> {
