@@ -26,9 +26,9 @@ metrics-exporter-prometheus = "0.18"
 bistouri-api = { path = "../api", features = ["kube"] }
 kube = { version = "3", default-features = false, features = ["client", "runtime", "rustls-tls"] }
 futures = "0.3"
-bincode = "1.3"
 lru = "0.18"
 tonic = { version = "0.14", features = ["transport"] }
+prost-types = "0.14"
 async-trait = "0.1"
 
 [build-dependencies]

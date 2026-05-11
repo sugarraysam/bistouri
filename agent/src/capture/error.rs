@@ -21,9 +21,6 @@ pub(crate) type Result<T> = std::result::Result<T, CaptureError>;
 
 #[derive(Debug, Error)]
 pub(crate) enum ExportError {
-    #[error("serialization failed: {0}")]
-    Serialize(#[from] bincode::Error),
-
     #[error("gRPC call failed: {0}")]
     Grpc(#[from] tonic::Status),
 }

@@ -1,11 +1,11 @@
 use crate::capture::error::ExportError;
-use crate::capture::session::CompletedSession;
 use async_trait::async_trait;
 use bistouri_api::v1::capture_service_client::CaptureServiceClient;
+use bistouri_api::v1::SessionPayload;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
-/// Downstream delivery contract for completed capture sessions.
+/// Downstream delivery contract for session payloads.
 ///
 /// This is the modularity boundary: the E2E `SessionSink`, the real
 /// symbolizer service, and any future consumer all implement this trait.
@@ -13,25 +13,25 @@ use tracing::{info, warn};
 /// implementations requires no changes to the agent core.
 #[async_trait]
 pub(crate) trait SessionExporter: Send + Sync + 'static {
-    async fn export(&self, session: CompletedSession) -> Result<(), ExportError>;
+    async fn export(&self, payload: SessionPayload) -> Result<(), ExportError>;
 }
 
 // ── Log-only exporter (default when no endpoint is configured) ────────────
 
-/// Placeholder exporter that logs completed sessions and discards them.
+/// Placeholder exporter that logs session payloads and discards them.
 /// Used until a symbolizer endpoint is configured.
 pub(crate) struct NullExporter;
 
 #[async_trait]
 impl SessionExporter for NullExporter {
-    async fn export(&self, session: CompletedSession) -> Result<(), ExportError> {
+    async fn export(&self, payload: SessionPayload) -> Result<(), ExportError> {
+        let meta = payload.metadata.as_ref();
         info!(
-            session_id = %session.session_id,
-            pid = session.pid,
-            comm = %session.comm,
-            source = ?session.source,
-            total_samples = session.total_samples,
-            unique_traces = session.stack_traces.len(),
+            session_id = %payload.session_id,
+            pid = meta.map(|m| m.pid).unwrap_or(0),
+            comm = %meta.map(|m| m.comm.as_str()).unwrap_or("<unknown>"),
+            total_samples = payload.total_samples,
+            unique_traces = payload.traces.len(),
             "completed session ready for symbolization (no endpoint configured)",
         );
         Ok(())
@@ -40,7 +40,7 @@ impl SessionExporter for NullExporter {
 
 // ── gRPC exporter (production + E2E) ─────────────────────────────────────
 
-/// Ships `CompletedSession`s to a downstream `CaptureService` gRPC endpoint.
+/// Ships `SessionPayload`s to a downstream `CaptureService` gRPC endpoint.
 ///
 /// The channel is created once and re-used across sessions — tonic manages
 /// connection health and reconnects transparently. The TCP connection is
@@ -70,15 +70,11 @@ impl GrpcExporter {
 
 #[async_trait]
 impl SessionExporter for GrpcExporter {
-    async fn export(&self, session: CompletedSession) -> Result<(), ExportError> {
-        // session_id and total_samples are Copy — grab them before the move.
-        let session_id = session.session_id;
-        let total_samples = session.total_samples;
+    async fn export(&self, payload: SessionPayload) -> Result<(), ExportError> {
+        let session_id = payload.session_id.clone();
+        let total_samples = payload.total_samples;
 
-        let payload = session.into_grpc_payload()?;
-
-        // Read comm before moving payload into the RPC call. One String per
-        // session (every ~3 s) — acceptable at this granularity.
+        // Read comm before moving payload into the RPC call.
         let comm = payload
             .metadata
             .as_ref()

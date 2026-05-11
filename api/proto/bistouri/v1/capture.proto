@@ -1,6 +1,7 @@
 syntax = "proto3";
 package bistouri.v1;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 
 // Downstream consumer contract.
@@ -11,6 +12,50 @@ import "google/protobuf/empty.proto";
 service CaptureService {
   rpc ReportSession(SessionPayload) returns (google.protobuf.Empty);
 }
+
+// ── Session payload ──────────────────────────────────────────────────
+
+message SessionPayload {
+  string session_id = 1;
+  CaptureSource source = 2;
+  Metadata metadata = 3;
+
+  // Deduplicated stack traces with per-trace sample counts.
+  // traces[i].on_cpu_count + traces[i].off_cpu_count = samples from trace i.
+  repeated CountedTrace traces = 4;
+
+  // Sum of all on_cpu + off_cpu counts across all traces.
+  // Validation invariant: consumers SHOULD verify this equals the computed sum.
+  // Allows cheap pipeline health checks without iterating traces.
+  uint64 total_samples = 5;
+
+  // Capture window duration. Required for computing rates (samples/sec).
+  google.protobuf.Duration capture_duration = 6;
+
+  // Sampling period in nanoseconds (1/freq). e.g. 52_631_578 ns for 19 Hz.
+  // Enables the symbolizer to reconstruct time-weighted flamegraphs.
+  uint64 sample_period_nanos = 7;
+
+  // Deduplicated DSO/binary mapping table. ResolvedFrame.mapping_index
+  // references entries in this table, avoiding per-frame build_id repetition.
+  repeated Mapping mappings = 8;
+}
+
+// ── Metadata ─────────────────────────────────────────────────────────
+
+message Metadata {
+  uint32 pid = 1;
+  string comm = 2;
+  KernelMeta kernel_meta = 3;
+}
+
+message KernelMeta {
+  string release = 1;
+  bytes build_id = 2;
+  fixed64 kaslr_offset = 3;
+}
+
+// ── Capture source ───────────────────────────────────────────────────
 
 message CaptureSource {
   oneof source {
@@ -29,35 +74,57 @@ message PsiTrigger {
   PsiResourceType resource = 1;
 }
 
-message Metadata {
-  uint32 pid = 1;
-  string comm = 2;
-  KernelMeta kernel_meta = 3;
+// ── Stack traces ─────────────────────────────────────────────────────
+
+// A unique stack trace bundled with its sample counts.
+// Replaces the fragile parallel-vec pattern (traces[i] ↔ counts[i]).
+message CountedTrace {
+  StackTrace trace = 1;
+  uint64 on_cpu_count = 2;
+  uint64 off_cpu_count = 3;
 }
 
-message KernelMeta {
-  string release = 1;
-  bytes build_id = 2;
-  uint64 kaslr_offset = 3;
+message StackTrace {
+  // Kernel instruction pointers (raw, KASLR-offset).
+  // Symbolizer subtracts KernelMeta.kaslr_offset → vmlinux-relative.
+  repeated fixed64 kernel_frames = 1;
+
+  // User-space frames with build_id-based addressing.
+  repeated UserFrame user_frames = 2;
 }
 
-message SessionPayload {
-  string session_id = 1;
-  CaptureSource source = 2;
-  Metadata metadata = 3;
+message UserFrame {
+  oneof frame {
+    ResolvedFrame resolved = 1;
+    PlaceholderFrame placeholder = 2;
+  }
+}
 
-  bytes traces_payload = 4;
+// Kernel resolved build_id + file_offset. Ready for symbolization.
+// The kernel computed the file offset from the VMA — ASLR is already handled.
+// The symbolizer adjusts by (p_vaddr - p_offset) for symbol table lookup.
+message ResolvedFrame {
+  // Index into SessionPayload.mappings (deduplicated build_id table).
+  uint32 mapping_index = 1;
+  // File offset within the DSO.
+  fixed64 file_offset = 2;
+}
 
-  // Per-trace on-CPU sample counts (perf_event, process was running on CPU).
-  bytes on_cpu_counts_payload = 5;
+// Placeholder for frames the kernel couldn't resolve.
+// Preserves call chain structure in flamegraphs.
+message PlaceholderFrame {
+  // Classification: "vdso", "unknown".
+  string label = 1;
+  // Raw instruction pointer for diagnostic/correlation.
+  fixed64 ip = 2;
+}
 
-  // Total stack samples collected during this capture window.
-  // Surfaced here so consumers can assert on pipeline health
-  // without deserializing the full bincode payloads.
-  uint64 total_samples = 6;
+// ── Mapping table ────────────────────────────────────────────────────
 
-  // Per-trace off-CPU sample counts (sched_switch D-state, process blocked on IO).
-  // Parallel to traces_payload. The symbolizer sums on+off for a combined
-  // flamegraph, or uses each vec independently for split views.
-  bytes off_cpu_counts_payload = 7;
+// A memory-mapped object (DSO/binary) identified by its ELF build ID.
+// Equivalent to pprof's Mapping message. Stored once per unique build_id
+// in SessionPayload.mappings; frames reference entries by index.
+message Mapping {
+  // ELF build ID (20 bytes, SHA-1). Identifies the DSO/binary.
+  bytes build_id = 1;
 }

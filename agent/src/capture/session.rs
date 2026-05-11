@@ -4,10 +4,15 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
-use super::trace::{SampleKind, StackTrace};
+use super::trace::{SampleKind, StackTrace, UserFrame};
+use crate::agent::profiler::BUILD_ID_SIZE;
 use crate::sys::kernel::KernelMeta;
 use crate::trigger::config::PsiResource;
 use bistouri_api::v1 as proto;
+
+/// Initial capacity for mapping (build_id dedup) collections.
+/// Most processes link <10 DSOs (libc, ld-linux, app binary, a few .so's).
+const INITIAL_MAPPING_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SessionId(Uuid);
@@ -41,32 +46,90 @@ pub(crate) struct CaptureRequest {
     //       time to quantify PSI violation severity.
 }
 
+/// Converts a `CaptureSource` into the proto `capture_source::Source`.
+fn to_proto_source(source: &CaptureSource) -> proto::capture_source::Source {
+    match source {
+        CaptureSource::Psi(res) => {
+            let resource_type = match res {
+                PsiResource::Memory => proto::PsiResourceType::Memory,
+                PsiResource::Cpu => proto::PsiResourceType::Cpu,
+                PsiResource::Io => proto::PsiResourceType::Io,
+            };
+            proto::capture_source::Source::Psi(proto::PsiTrigger {
+                resource: resource_type as i32,
+            })
+        }
+    }
+}
+
+/// Converts a user-space stack frame into its proto representation,
+/// incrementally building the `Mapping` table for build_id deduplication.
+fn to_proto_frame(
+    frame: &UserFrame,
+    mapping_index: &mut HashMap<[u8; BUILD_ID_SIZE], u32>,
+    mappings: &mut Vec<proto::Mapping>,
+) -> proto::UserFrame {
+    match frame {
+        UserFrame::Resolved {
+            build_id,
+            file_offset,
+        } => {
+            let idx = *mapping_index.entry(*build_id).or_insert_with(|| {
+                let idx = mappings.len() as u32;
+                mappings.push(proto::Mapping {
+                    build_id: build_id.to_vec(),
+                });
+                idx
+            });
+            proto::UserFrame {
+                frame: Some(proto::user_frame::Frame::Resolved(proto::ResolvedFrame {
+                    mapping_index: idx,
+                    file_offset: *file_offset,
+                })),
+            }
+        }
+        UserFrame::Placeholder { label, ip } => proto::UserFrame {
+            frame: Some(proto::user_frame::Frame::Placeholder(
+                proto::PlaceholderFrame {
+                    label: label.to_string(),
+                    ip: *ip,
+                },
+            )),
+        },
+    }
+}
+
 /// Active capture session: one PID, one resource, bounded duration.
 ///
-/// Per-session dictionary encoding: unique `StackTrace`s are stored once in
-/// `traces`. Each trace has two independent sample counters:
-///   - `on_cpu_counts[i]`  — fired by the `perf_event` program (process on CPU)
-///   - `off_cpu_counts[i]` — fired by `sched_switch` (process entering D state)
+/// Builds the gRPC `SessionPayload` incrementally during recording —
+/// no intermediate storage, no batch conversion at finalize time.
 ///
-/// Keeping separate counters instead of a parallel `kind` vec avoids
-/// dictionary-encoding a 2-value flag. The symbolizer uses the counts
-/// directly: sum both for a combined flamegraph, use each independently
-/// for on-CPU vs off-CPU split views.
+/// Deduplication: unique traces are identified via a `HashMap<StackTrace, usize>`
+/// keyed on the Rust `StackTrace` type (which implements `Hash`/`Eq`). The
+/// proto-encoded trace and its counts live directly in `payload.traces[idx]`.
+/// Build IDs are deduplicated into `payload.mappings` via `mapping_index`.
+///
+/// On the hot path (`record()`), a new unique trace triggers:
+///   1. Proto conversion of the trace (clones `kernel_frames` — needed in
+///      both the proto message and the dedup HashMap key)
+///   2. Move of the original `StackTrace` into the dedup map
+///
+/// A duplicate trace is O(1): HashMap lookup + counter increment.
 pub(crate) struct CaptureSession {
     id: SessionId,
     pid: u32,
-    comm: String,
     source: CaptureSource,
-    kernel_meta: Arc<KernelMeta>,
     started_at: Instant,
-    traces: Vec<StackTrace>,
-    /// Maps trace content → index in `traces` vec.
+    /// Maps trace content → index in `payload.traces`.
+    /// Proto types don't implement `Hash`, so we keep the Rust `StackTrace`
+    /// as the lookup key and discard it at finalize time.
     dedup: HashMap<StackTrace, usize>,
-    /// On-CPU sample count per unique trace (perf_event, process running).
-    on_cpu_counts: Vec<u64>,
-    /// Off-CPU sample count per unique trace (sched_switch, process in D state).
-    off_cpu_counts: Vec<u64>,
-    total_samples: u64,
+    /// Maps `[u8; BUILD_ID_SIZE]` → index in `payload.mappings`.
+    /// Incrementally built during `record()` so each unique build_id
+    /// is stored exactly once in the wire payload.
+    mapping_index: HashMap<[u8; BUILD_ID_SIZE], u32>,
+    /// The proto payload being built incrementally.
+    payload: proto::SessionPayload,
 }
 
 impl CaptureSession {
@@ -75,19 +138,44 @@ impl CaptureSession {
         comm: String,
         source: CaptureSource,
         kernel_meta: Arc<KernelMeta>,
+        sample_period_nanos: u64,
+        trace_capacity: usize,
     ) -> Self {
-        Self {
-            id: SessionId::new(),
+        let metadata = proto::Metadata {
             pid,
             comm,
-            source,
-            kernel_meta,
-            started_at: Instant::now(),
-            traces: Vec::new(),
-            dedup: HashMap::new(),
-            on_cpu_counts: Vec::new(),
-            off_cpu_counts: Vec::new(),
+            kernel_meta: Some(proto::KernelMeta {
+                release: kernel_meta.release.clone(),
+                build_id: kernel_meta.build_id.to_vec(),
+                kaslr_offset: kernel_meta.kaslr_offset,
+            }),
+        };
+
+        let id = SessionId::new();
+        // Pre-allocate based on the computed capacity hint (freq × capture_duration).
+        // Trace capacity scales with the user's sampling configuration.
+        // Mapping capacity is fixed — DSO count is independent of sampling rate.
+        let payload = proto::SessionPayload {
+            session_id: id.to_string(),
+            source: Some(proto::CaptureSource {
+                source: Some(to_proto_source(&source)),
+            }),
+            metadata: Some(metadata),
+            traces: Vec::with_capacity(trace_capacity),
             total_samples: 0,
+            capture_duration: None,
+            sample_period_nanos,
+            mappings: Vec::with_capacity(INITIAL_MAPPING_CAPACITY),
+        };
+
+        Self {
+            id,
+            pid,
+            source,
+            started_at: Instant::now(),
+            dedup: HashMap::with_capacity(trace_capacity),
+            mapping_index: HashMap::with_capacity(INITIAL_MAPPING_CAPACITY),
+            payload,
         }
     }
 
@@ -103,118 +191,86 @@ impl CaptureSession {
         &self.source
     }
 
-    /// Records a stack trace sample into the appropriate count bucket.
-    /// Deduplicates by trace content: the same call path from on-CPU and
-    /// off-CPU both map to the same trace entry, keeping separate counters.
+    /// Records a stack trace sample, building the proto payload incrementally.
+    ///
+    /// New unique traces are converted to proto once and moved into the dedup
+    /// map (zero clones). Duplicate traces are O(1): HashMap lookup + counter
+    /// increment. The mapping table grows only when a previously unseen
+    /// build_id appears.
     pub(crate) fn record(&mut self, trace: StackTrace, kind: SampleKind) {
         let idx = if let Some(&idx) = self.dedup.get(&trace) {
             idx
         } else {
-            let idx = self.traces.len();
-            self.dedup.insert(trace.clone(), idx);
-            self.traces.push(trace);
-            self.on_cpu_counts.push(0);
-            self.off_cpu_counts.push(0);
+            let idx = self.payload.traces.len();
+
+            // Clone kernel_frames — unavoidable because the data must exist
+            // in both the proto message (payload.traces) and the dedup HashMap
+            // key (moved below). Only happens once per unique trace.
+            let kernel_frames = trace.kernel_frames.clone();
+            let user_frames: Vec<proto::UserFrame> = trace
+                .user_frames
+                .iter()
+                .map(|f| to_proto_frame(f, &mut self.mapping_index, &mut self.payload.mappings))
+                .collect();
+
+            self.payload.traces.push(proto::CountedTrace {
+                trace: Some(proto::StackTrace {
+                    kernel_frames,
+                    user_frames,
+                }),
+                on_cpu_count: 0,
+                off_cpu_count: 0,
+            });
+
+            self.dedup.insert(trace, idx);
             idx
         };
+
         match kind {
-            SampleKind::OnCpu => self.on_cpu_counts[idx] += 1,
-            SampleKind::OffCpu => self.off_cpu_counts[idx] += 1,
+            SampleKind::OnCpu => self.payload.traces[idx].on_cpu_count += 1,
+            SampleKind::OffCpu => self.payload.traces[idx].off_cpu_count += 1,
         }
-        self.total_samples += 1;
+        self.payload.total_samples += 1;
     }
 
-    /// Consumes the session and produces a `CompletedSession` ready for
-    /// downstream delivery.
-    pub(crate) fn finalize(self) -> CompletedSession {
-        CompletedSession {
+    /// Consumes the session, stamps the capture duration, and returns
+    /// a `FinalizedSession` ready for downstream delivery.
+    ///
+    /// Near zero-cost: sets the duration field on the already-built payload,
+    /// drops the dedup map and mapping index.
+    pub(crate) fn finalize(mut self) -> FinalizedSession {
+        let elapsed = self.started_at.elapsed();
+        self.payload.capture_duration = Some(prost_types::Duration {
+            seconds: elapsed.as_secs() as i64,
+            nanos: elapsed.subsec_nanos() as i32,
+        });
+
+        FinalizedSession {
             session_id: self.id,
-            source: self.source,
             pid: self.pid,
-            comm: self.comm,
-            kernel_meta: self.kernel_meta,
-            started_at: self.started_at,
-            stack_traces: self.traces,
-            on_cpu_counts: self.on_cpu_counts,
-            off_cpu_counts: self.off_cpu_counts,
-            total_samples: self.total_samples,
+            source: self.source,
+            payload: self.payload,
         }
     }
 }
 
-/// Finalized capture result, ready for downstream delivery (symbolizer, storage).
+/// Finalized capture result, ready for downstream delivery.
 ///
-/// `stack_traces[i]` holds the unique trace. Two parallel count vecs give
-/// separate on-CPU and off-CPU sample weights per trace — the symbolizer
-/// sums them for a combined flamegraph, or uses each independently.
-pub(crate) struct CompletedSession {
+/// The `payload` is a fully-built `SessionPayload` proto message —
+/// the exporter sends it directly over the wire with zero conversion.
+/// Session metadata fields (`session_id`, `pid`, `source`) are kept
+/// alongside for orchestrator logging and metric labels.
+pub(crate) struct FinalizedSession {
     pub session_id: SessionId,
-    pub source: CaptureSource,
     pub pid: u32,
-    pub comm: String,
-    pub kernel_meta: Arc<KernelMeta>,
-    #[allow(dead_code)] // consumed by symbolizer (TODO)
-    pub started_at: Instant,
-    // TODO: stall_total_usec delta — PSI violation severity.
-    pub stack_traces: Vec<StackTrace>,
-    /// On-CPU sample count per trace (`perf_event`, process was running).
-    pub on_cpu_counts: Vec<u64>,
-    /// Off-CPU sample count per trace (`sched_switch` D-state, process blocked).
-    pub off_cpu_counts: Vec<u64>,
-    pub total_samples: u64,
-}
-
-impl CompletedSession {
-    pub(crate) fn into_grpc_payload(
-        self,
-    ) -> std::result::Result<proto::SessionPayload, bincode::Error> {
-        let traces_payload = bincode::serialize(&self.stack_traces)?;
-        let on_cpu_counts_payload = bincode::serialize(&self.on_cpu_counts)?;
-        let off_cpu_counts_payload = bincode::serialize(&self.off_cpu_counts)?;
-        let total_samples = self.total_samples;
-
-        let source = match self.source {
-            CaptureSource::Psi(res) => {
-                let resource_type = match res {
-                    PsiResource::Memory => proto::PsiResourceType::Memory,
-                    PsiResource::Cpu => proto::PsiResourceType::Cpu,
-                    PsiResource::Io => proto::PsiResourceType::Io,
-                };
-                proto::capture_source::Source::Psi(proto::PsiTrigger {
-                    resource: resource_type as i32,
-                })
-            }
-        };
-
-        let metadata = proto::Metadata {
-            pid: self.pid,
-            comm: self.comm,
-            kernel_meta: Some(proto::KernelMeta {
-                release: self.kernel_meta.release.clone(),
-                build_id: self.kernel_meta.build_id.to_vec(),
-                kaslr_offset: self.kernel_meta.kaslr_offset,
-            }),
-        };
-
-        Ok(proto::SessionPayload {
-            session_id: self.session_id.to_string(),
-            source: Some(proto::CaptureSource {
-                source: Some(source),
-            }),
-            metadata: Some(metadata),
-            traces_payload,
-            on_cpu_counts_payload,
-            off_cpu_counts_payload,
-            total_samples,
-        })
-    }
+    pub source: CaptureSource,
+    pub payload: proto::SessionPayload,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::profiler::BUILD_ID_SIZE;
-    use crate::capture::trace::UserFrame;
     use rstest::rstest;
 
     fn mock_kernel_meta() -> Arc<KernelMeta> {
@@ -241,6 +297,20 @@ mod tests {
             file_offset: offset,
         }
     }
+
+    fn make_session() -> CaptureSession {
+        CaptureSession::new(
+            42,
+            "test".into(),
+            CaptureSource::Psi(PsiResource::Memory),
+            mock_kernel_meta(),
+            TEST_SAMPLE_PERIOD_NANOS,
+            16, // matches compute_trace_capacity(19, 3)
+        )
+    }
+
+    /// Default sample period for tests (19 Hz).
+    const TEST_SAMPLE_PERIOD_NANOS: u64 = 1_000_000_000 / 19;
 
     // -----------------------------------------------------------------------
     // Deduplication — rstest table
@@ -283,75 +353,97 @@ mod tests {
         #[case] expected_total: u64,
         #[case] description: &str,
     ) {
-        let mut session = CaptureSession::new(
-            42,
-            "test".into(),
-            CaptureSource::Psi(PsiResource::Memory),
-            mock_kernel_meta(),
-        );
+        let mut session = make_session();
         for trace in traces {
             session.record(trace, SampleKind::OnCpu);
         }
         assert_eq!(
-            session.traces.len(),
+            session.payload.traces.len(),
             expected_unique,
             "{description}: unique trace count"
         );
         assert_eq!(
-            session.total_samples, expected_total,
+            session.payload.total_samples, expected_total,
             "{description}: total sample count"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Finalize lifecycle
+    // Finalize lifecycle — rstest table
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn finalize_produces_correct_profile() {
-        let mut session = CaptureSession::new(
-            42,
-            "myapp".into(),
-            CaptureSource::Psi(PsiResource::Io),
-            mock_kernel_meta(),
-        );
-        let hot_path = make_trace(&[0xA], &[frame(0x01, 0xB)]);
-        let cold_path = make_trace(&[0xC], &[frame(0x02, 0xD)]);
-
-        for _ in 0..10 {
-            session.record(hot_path.clone(), SampleKind::OnCpu);
+    #[rstest]
+    #[case::with_samples(
+        vec![
+            (make_trace(&[0xA], &[frame(0x01, 0xB)]), SampleKind::OnCpu, 10),
+            (make_trace(&[0xC], &[frame(0x02, 0xD)]), SampleKind::OffCpu, 1),
+        ],
+        11,  // total_samples
+        2,   // unique traces
+        "mixed on-cpu and off-cpu samples"
+    )]
+    #[case::empty_session(
+        vec![],
+        0,   // total_samples
+        0,   // unique traces
+        "empty session finalizes cleanly"
+    )]
+    #[case::single_hot_path(
+        vec![
+            (make_trace(&[0xA], &[frame(0x01, 0xB)]), SampleKind::OnCpu, 100),
+        ],
+        100,  // total_samples
+        1,    // unique traces
+        "single hot path with many samples"
+    )]
+    fn finalize_lifecycle(
+        #[case] samples: Vec<(StackTrace, SampleKind, usize)>,
+        #[case] expected_total: u64,
+        #[case] expected_unique: usize,
+        #[case] description: &str,
+    ) {
+        let mut session = make_session();
+        for (trace, kind, count) in samples {
+            for _ in 0..count {
+                session.record(trace.clone(), kind);
+            }
         }
-        session.record(cold_path, SampleKind::OffCpu);
 
-        let completed = session.finalize();
+        let finalized = session.finalize();
 
-        assert_eq!(completed.total_samples, 11);
-        assert_eq!(completed.stack_traces.len(), 2);
-        // hot path: 10 on-CPU samples, 0 off-CPU
-        assert_eq!(completed.on_cpu_counts[0], 10, "hot path on-cpu count");
-        assert_eq!(completed.off_cpu_counts[0], 0, "hot path off-cpu count");
-        // cold path: 0 on-CPU, 1 off-CPU
-        assert_eq!(completed.on_cpu_counts[1], 0, "cold path on-cpu count");
-        assert_eq!(completed.off_cpu_counts[1], 1, "cold path off-cpu count");
-        assert_eq!(completed.pid, 42);
-        assert_eq!(completed.comm, "myapp");
-        assert_eq!(completed.source, CaptureSource::Psi(PsiResource::Io));
+        assert_eq!(
+            finalized.payload.total_samples, expected_total,
+            "{description}: total_samples"
+        );
+        assert_eq!(
+            finalized.payload.traces.len(),
+            expected_unique,
+            "{description}: unique traces"
+        );
+        assert!(
+            finalized.payload.capture_duration.is_some(),
+            "{description}: capture_duration must be set"
+        );
+        assert_eq!(finalized.pid, 42, "{description}: pid preserved");
     }
 
     #[test]
-    fn empty_session_finalizes_cleanly() {
-        let session = CaptureSession::new(
-            1,
-            "idle".into(),
-            CaptureSource::Psi(PsiResource::Memory),
-            mock_kernel_meta(),
-        );
-        let completed = session.finalize();
+    fn finalize_preserves_count_split() {
+        let mut session = make_session();
+        let path = make_trace(&[0xA], &[frame(0x01, 0xB)]);
 
-        assert_eq!(completed.total_samples, 0);
-        assert!(completed.stack_traces.is_empty());
-        assert!(completed.on_cpu_counts.is_empty());
-        assert!(completed.off_cpu_counts.is_empty());
+        for _ in 0..10 {
+            session.record(path.clone(), SampleKind::OnCpu);
+        }
+        for _ in 0..3 {
+            session.record(path.clone(), SampleKind::OffCpu);
+        }
+
+        let finalized = session.finalize();
+        assert_eq!(finalized.payload.traces.len(), 1);
+        assert_eq!(finalized.payload.traces[0].on_cpu_count, 10);
+        assert_eq!(finalized.payload.traces[0].off_cpu_count, 3);
+        assert_eq!(finalized.payload.total_samples, 13);
     }
 
     #[test]
@@ -359,5 +451,109 @@ mod tests {
         let a = SessionId::new();
         let b = SessionId::new();
         assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mapping table — build_id deduplication (rstest table)
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::single_dso(
+        vec![
+            make_trace(&[0x1000], &[frame(0xAA, 0x100), frame(0xAA, 0x200)]),
+        ],
+        1,  // expected unique mappings
+        "all frames from one DSO → one mapping entry"
+    )]
+    #[case::two_dsos(
+        vec![
+            make_trace(&[0x1000], &[frame(0xAA, 0x100), frame(0xBB, 0x200)]),
+        ],
+        2,  // expected unique mappings
+        "two distinct build_ids → two mapping entries"
+    )]
+    #[case::cross_trace_dedup(
+        vec![
+            make_trace(&[0x1000], &[frame(0xAA, 0x100)]),
+            make_trace(&[0x2000], &[frame(0xAA, 0x200), frame(0xBB, 0x300)]),
+        ],
+        2,  // expected unique mappings
+        "same build_id across traces → deduplicated"
+    )]
+    #[case::no_resolved_frames(
+        vec![
+            make_trace(&[0x1000], &[UserFrame::Placeholder { label: "[vdso]", ip: 0x7000 }]),
+        ],
+        0,  // expected unique mappings
+        "placeholder-only trace → no mappings"
+    )]
+    fn mapping_table_dedup(
+        #[case] traces: Vec<StackTrace>,
+        #[case] expected_mappings: usize,
+        #[case] description: &str,
+    ) {
+        let mut session = make_session();
+        for trace in traces {
+            session.record(trace, SampleKind::OnCpu);
+        }
+
+        let finalized = session.finalize();
+        assert_eq!(
+            finalized.payload.mappings.len(),
+            expected_mappings,
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn mapping_index_references_are_consistent() {
+        let mut session = make_session();
+        session.record(
+            make_trace(&[0x1000], &[frame(0xAA, 0x100), frame(0xBB, 0x200)]),
+            SampleKind::OnCpu,
+        );
+
+        let finalized = session.finalize();
+        let trace = finalized.payload.traces[0].trace.as_ref().unwrap();
+
+        // Each resolved frame's mapping_index must point to a valid mapping
+        // with the correct build_id.
+        for uf in &trace.user_frames {
+            if let Some(proto::user_frame::Frame::Resolved(ref resolved)) = uf.frame {
+                let mapping = &finalized.payload.mappings[resolved.mapping_index as usize];
+                assert_eq!(mapping.build_id.len(), BUILD_ID_SIZE);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Payload metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn payload_includes_capture_metadata() {
+        let session = CaptureSession::new(
+            99,
+            "meta-test".into(),
+            CaptureSource::Psi(PsiResource::Io),
+            mock_kernel_meta(),
+            TEST_SAMPLE_PERIOD_NANOS,
+            16,
+        );
+
+        let finalized = session.finalize();
+        let payload = &finalized.payload;
+
+        assert_eq!(payload.sample_period_nanos, TEST_SAMPLE_PERIOD_NANOS);
+        assert!(payload.capture_duration.is_some());
+
+        let meta = payload.metadata.as_ref().unwrap();
+        assert_eq!(meta.pid, 99);
+        assert_eq!(meta.comm, "meta-test");
+
+        let kernel = meta.kernel_meta.as_ref().unwrap();
+        assert_eq!(kernel.release, "6.8.0-test");
+        assert_eq!(kernel.build_id, vec![0xAA; 20]);
+        assert_eq!(kernel.kaslr_offset, 0xffffffff81000000);
     }
 }

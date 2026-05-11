@@ -1,4 +1,3 @@
-use serde::Serialize;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -11,9 +10,9 @@ use tracing::debug;
 /// off-CPU samples (fired by `handle_sched_switch` when a monitored PID enters
 /// TASK_UNINTERRUPTIBLE, i.e. blocks on IO or a kernel resource).
 ///
-/// Stored per sample in `CompletedSession` so the symbolizer can produce
+/// Stored per sample in `SessionPayload` so the symbolizer can produce
 /// separate on-CPU and off-CPU flamegraphs from a single session payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SampleKind {
     /// Process was executing on a CPU when the perf_event counter fired.
     OnCpu,
@@ -65,7 +64,7 @@ impl TryFrom<i32> for BuildIdStatus {
 /// for addresses the kernel couldn't resolve. Placeholders preserve call chain
 /// structure in flamegraphs — production profilers (`perf`, Strobelight, Parca)
 /// use the same approach.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum UserFrame {
     /// Kernel resolved build_id + file_offset. Ready for symbolization.
     /// The kernel computed the file offset from the VMA — ASLR is already handled.
@@ -95,7 +94,7 @@ pub(crate) enum UserFrame {
 /// construction and cached in `cached_hash`. The `Hash` impl feeds only
 /// this `u64`, eliminating repeated ~400-byte hashing on every `HashMap`
 /// lookup during deduplication.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct StackTrace {
     cached_hash: u64,
     pub kernel_frames: Vec<u64>,

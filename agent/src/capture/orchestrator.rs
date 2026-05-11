@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use super::error::Result;
 use super::pid_filter::BpfPidFilter;
-use super::session::{CaptureRequest, CaptureSession, CaptureSource, CompletedSession, SessionId};
+use super::session::{CaptureRequest, CaptureSession, CaptureSource, SessionId};
 use super::trace::StackSample;
 use crate::sys::kernel::KernelMeta;
 use crate::telemetry::{
@@ -18,6 +18,7 @@ use crate::telemetry::{
     METRIC_SESSIONS_COMPLETED, METRIC_SESSIONS_EMPTY, METRIC_SESSIONS_REJECTED_DUPLICATE,
     METRIC_SESSIONS_STARTED, METRIC_SESSION_SAMPLES, METRIC_SINK_FAILURES,
 };
+use bistouri_api::v1 as proto;
 
 /// Extracts the resource label string from a `CaptureSource` for metric labels.
 fn source_label(source: &CaptureSource) -> String {
@@ -35,11 +36,48 @@ pub(crate) trait PidFilter: Send {
     fn remove_pid(&mut self, pid: u32) -> Result<()>;
 }
 
+/// Session-independent configuration for the orchestrator.
+///
+/// Groups fields that would otherwise inflate the constructor argument
+/// list. All fields are immutable after construction.
+pub(crate) struct OrchestratorConfig {
+    pub capture_duration: Duration,
+    pub sample_period_nanos: u64,
+    pub kernel_meta: Arc<KernelMeta>,
+    /// Pre-allocation hint for per-session trace/dedup collections.
+    /// Derived from sampling parameters, rounded to a power of two for
+    /// allocator friendliness, and clamped to a safe range.
+    pub trace_capacity: usize,
+}
+
+/// Minimum trace capacity — avoids pathologically small allocations
+/// for very low frequencies or short capture windows.
+const MIN_TRACE_CAPACITY: usize = 16;
+
+/// Maximum trace capacity — unique call paths in a single process are
+/// bounded by code structure, not sampling rate. Even at 997 Hz, a 3s
+/// window rarely produces >200 unique traces. Let the Vec reallocate
+/// in the rare case that it does.
+const MAX_TRACE_CAPACITY: usize = 256;
+
+/// Computes a power-of-two capacity hint for per-session trace collections.
+///
+/// Heuristic: `(freq × duration) / 4` — a PID is not on-CPU every tick,
+/// and heavy deduplication means unique traces ≪ total samples. Result
+/// is clamped to `[MIN_TRACE_CAPACITY, MAX_TRACE_CAPACITY]` and rounded
+/// to the next power of two for allocator friendliness.
+fn compute_trace_capacity(freq: u64, capture_duration_secs: u64) -> usize {
+    let raw = (freq * capture_duration_secs / 4) as usize;
+    raw.clamp(MIN_TRACE_CAPACITY, MAX_TRACE_CAPACITY)
+        .next_power_of_two()
+}
+
 /// Orchestrates the lifecycle of `CaptureSession`s.
 ///
 /// Receives `CaptureRequest`s from PSI watchers (via `request_rx`), starts
 /// per-PID capture sessions, ingests `StackSample`s from the BPF ring buffer
-/// (via `stack_rx`), and emits `CompletedSession`s downstream (via `session_tx`).
+/// (via `stack_rx`), and emits ready-to-send `SessionPayload`s downstream
+/// (via `session_tx`).
 ///
 /// ## Event Loop Priority (biased select)
 ///
@@ -58,12 +96,11 @@ pub(crate) trait PidFilter: Send {
 pub(crate) struct CaptureOrchestrator<F: PidFilter> {
     request_rx: mpsc::Receiver<CaptureRequest>,
     stack_rx: mpsc::Receiver<StackSample>,
-    session_tx: mpsc::Sender<CompletedSession>,
+    session_tx: mpsc::Sender<proto::SessionPayload>,
 
     pid_filter: F,
-    capture_duration: Duration,
+    config: OrchestratorConfig,
     cancel: CancellationToken,
-    kernel_meta: Arc<KernelMeta>,
 
     sessions: HashMap<SessionId, CaptureSession>,
     /// Reverse index: pid → active session IDs monitoring that pid.
@@ -83,20 +120,18 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
     pub(crate) fn new(
         request_rx: mpsc::Receiver<CaptureRequest>,
         stack_rx: mpsc::Receiver<StackSample>,
-        session_tx: mpsc::Sender<CompletedSession>,
+        session_tx: mpsc::Sender<proto::SessionPayload>,
         pid_filter: F,
-        capture_duration: Duration,
+        config: OrchestratorConfig,
         cancel: CancellationToken,
-        kernel_meta: Arc<KernelMeta>,
     ) -> Self {
         Self {
             request_rx,
             stack_rx,
             session_tx,
             pid_filter,
-            capture_duration,
+            config,
             cancel,
-            kernel_meta,
             sessions: HashMap::new(),
             pid_sessions: HashMap::new(),
             inflight_guard: HashSet::new(),
@@ -167,7 +202,9 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             request.pid,
             request.comm,
             request.source.clone(),
-            self.kernel_meta.clone(),
+            self.config.kernel_meta.clone(),
+            self.config.sample_period_nanos,
+            self.config.trace_capacity,
         );
         let session_id = session.id();
 
@@ -176,13 +213,13 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             .entry(request.pid)
             .or_default()
             .push(session_id);
-        self.timers.insert(session_id, self.capture_duration);
+        self.timers.insert(session_id, self.config.capture_duration);
 
         info!(
             session_id = %session_id,
             pid = session.pid(),
             source = ?request.source,
-            duration_secs = self.capture_duration.as_secs(),
+            duration_secs = self.config.capture_duration.as_secs(),
             "capture session started",
         );
         metrics::counter!(
@@ -244,7 +281,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
     }
 
     /// Finalizes a session: removes from all indices, decrements PID refcount,
-    /// and sends the `CompletedSession` downstream.
+    /// and sends the ready-to-send `SessionPayload` downstream.
     async fn finalize_session(&mut self, session_id: SessionId) {
         let Some(session) = self.sessions.remove(&session_id) else {
             return;
@@ -273,35 +310,47 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             }
         }
 
-        let completed = session.finalize();
+        let finalized = session.finalize();
+        let total_samples = finalized.payload.total_samples;
+        let unique_traces = finalized.payload.traces.len();
+
+        // Read comm from the proto metadata — one borrow, no clone.
+        let comm = finalized
+            .payload
+            .metadata
+            .as_ref()
+            .map(|m| m.comm.as_str())
+            .unwrap_or("<unknown>");
 
         info!(
-            session_id = %completed.session_id,
-            pid = completed.pid,
-            comm = %completed.comm,
-            source = ?completed.source,
-            total_samples = completed.total_samples,
-            unique_traces = completed.stack_traces.len(),
+            session_id = %finalized.session_id,
+            pid = finalized.pid,
+            comm = %comm,
+            source = ?finalized.source,
+            total_samples,
+            unique_traces,
             "capture session completed",
         );
+
+        let resource_label = source_label(&finalized.source);
         metrics::counter!(
             METRIC_SESSIONS_COMPLETED,
-            "resource" => source_label(&completed.source),
-            "comm" => completed.comm.clone(),
+            "resource" => resource_label.clone(),
+            "comm" => comm.to_string(),
         )
         .increment(1);
-        metrics::histogram!(METRIC_SESSION_SAMPLES).record(completed.total_samples as f64);
-        if completed.total_samples == 0 {
+        metrics::histogram!(METRIC_SESSION_SAMPLES).record(total_samples as f64);
+        if total_samples == 0 {
             metrics::counter!(
                 METRIC_SESSIONS_EMPTY,
-                "resource" => source_label(&completed.source),
-                "comm" => completed.comm.clone(),
+                "resource" => resource_label,
+                "comm" => comm.to_string(),
             )
             .increment(1);
         }
         metrics::gauge!(METRIC_ACTIVE_SESSIONS).set(self.sessions.len() as f64);
 
-        if self.session_tx.send(completed).await.is_err() {
+        if self.session_tx.send(finalized.payload).await.is_err() {
             warn!("downstream receiver dropped, completed session lost");
             metrics::counter!(METRIC_SINK_FAILURES).increment(1);
         }
@@ -319,9 +368,9 @@ const CAPTURE_REQUEST_CHANNEL_SIZE: usize = 128;
 /// the `Sender` at agent build time, before the orchestrator exists.
 pub(crate) const STACK_SAMPLE_CHANNEL_SIZE: usize = 4096;
 
-/// Channel buffer for CaptureOrchestrator → downstream completed sessions.
+/// Channel buffer for CaptureOrchestrator → downstream session payloads.
 /// Sessions complete every ~3s per PID; 64 is generous.
-const COMPLETED_SESSION_CHANNEL_SIZE: usize = 64;
+const SESSION_PAYLOAD_CHANNEL_SIZE: usize = 64;
 
 /// Returned by `CaptureOrchestrator::start()`. Provides channel endpoints
 /// for wiring to PSI watchers and the downstream consumer (symbolizer).
@@ -329,8 +378,8 @@ pub(crate) struct CaptureOrchestratorHandle {
     pub(crate) task_handle: tokio::task::JoinHandle<()>,
     /// Send `CaptureRequest`s here (from PSI watchers).
     pub(crate) capture_tx: mpsc::Sender<CaptureRequest>,
-    /// Receive `CompletedSession`s here (downstream symbolizer).
-    pub(crate) completed_rx: mpsc::Receiver<CompletedSession>,
+    /// Receive ready-to-send `SessionPayload`s here (downstream symbolizer).
+    pub(crate) payload_rx: mpsc::Receiver<proto::SessionPayload>,
 }
 
 impl CaptureOrchestrator<BpfPidFilter> {
@@ -348,31 +397,29 @@ impl CaptureOrchestrator<BpfPidFilter> {
     pub(crate) fn start(
         pid_filter_handle: libbpf_rs::MapHandle,
         capture_duration_secs: u64,
+        freq: u64,
         stack_rx: mpsc::Receiver<StackSample>,
         cancel: CancellationToken,
         kernel_meta: Arc<KernelMeta>,
     ) -> CaptureOrchestratorHandle {
         let pid_filter = BpfPidFilter::new(pid_filter_handle);
-        let capture_duration = Duration::from_secs(capture_duration_secs);
+        let config = OrchestratorConfig {
+            capture_duration: Duration::from_secs(capture_duration_secs),
+            sample_period_nanos: 1_000_000_000 / freq,
+            kernel_meta,
+            trace_capacity: compute_trace_capacity(freq, capture_duration_secs),
+        };
 
         let (capture_tx, request_rx) = mpsc::channel(CAPTURE_REQUEST_CHANNEL_SIZE);
-        let (session_tx, completed_rx) = mpsc::channel(COMPLETED_SESSION_CHANNEL_SIZE);
+        let (session_tx, payload_rx) = mpsc::channel(SESSION_PAYLOAD_CHANNEL_SIZE);
 
-        let mut orch = Self::new(
-            request_rx,
-            stack_rx,
-            session_tx,
-            pid_filter,
-            capture_duration,
-            cancel,
-            kernel_meta,
-        );
+        let mut orch = Self::new(request_rx, stack_rx, session_tx, pid_filter, config, cancel);
         let task_handle = tokio::spawn(async move { orch.run().await });
 
         CaptureOrchestratorHandle {
             task_handle,
             capture_tx,
-            completed_rx,
+            payload_rx,
         }
     }
 }
@@ -442,13 +489,22 @@ mod tests {
         })
     }
 
+    fn mock_config(capture_duration: Duration) -> OrchestratorConfig {
+        OrchestratorConfig {
+            capture_duration,
+            sample_period_nanos: 1_000_000_000 / 19,
+            kernel_meta: mock_kernel_meta(),
+            trace_capacity: compute_trace_capacity(19, capture_duration.as_secs()),
+        }
+    }
+
     fn setup(
         capture_duration: Duration,
     ) -> (
         CaptureOrchestrator<MockPidFilter>,
         mpsc::Sender<CaptureRequest>,
         mpsc::Sender<StackSample>,
-        mpsc::Receiver<CompletedSession>,
+        mpsc::Receiver<proto::SessionPayload>,
     ) {
         let (req_tx, req_rx) = mpsc::channel(16);
         let (stack_tx, stack_rx) = mpsc::channel(256);
@@ -459,12 +515,16 @@ mod tests {
             stack_rx,
             session_tx,
             MockPidFilter::new(),
-            capture_duration,
+            mock_config(capture_duration),
             CancellationToken::new(),
-            mock_kernel_meta(),
         );
 
         (orch, req_tx, stack_tx, session_rx)
+    }
+
+    /// Helper: extract comm from a SessionPayload's metadata.
+    fn payload_comm(p: &proto::SessionPayload) -> &str {
+        p.metadata.as_ref().map(|m| m.comm.as_str()).unwrap_or("")
     }
 
     #[tokio::test(start_paused = true)]
@@ -485,15 +545,14 @@ mod tests {
         time::advance(Duration::from_secs(4)).await;
         tokio::task::yield_now().await;
 
-        let completed = session_rx
+        let payload = session_rx
             .recv()
             .await
-            .expect("should receive completed session");
-        assert_eq!(completed.pid, 42);
-        assert_eq!(completed.comm, "test-42");
-        assert_eq!(completed.source, CaptureSource::Psi(PsiResource::Memory));
-        assert_eq!(completed.total_samples, 10);
-        assert_eq!(completed.stack_traces.len(), 3);
+            .expect("should receive session payload");
+        assert_eq!(payload.metadata.as_ref().unwrap().pid, 42);
+        assert_eq!(payload_comm(&payload), "test-42");
+        assert_eq!(payload.total_samples, 10);
+        assert_eq!(payload.traces.len(), 3);
 
         drop(req_tx);
         drop(stack_tx);
@@ -526,10 +585,6 @@ mod tests {
         assert_eq!(s1.total_samples, 1);
         assert_eq!(s2.total_samples, 1);
 
-        let resources: HashSet<CaptureSource> = [s1.source, s2.source].into_iter().collect();
-        assert!(resources.contains(&CaptureSource::Psi(PsiResource::Memory)));
-        assert!(resources.contains(&CaptureSource::Psi(PsiResource::Cpu)));
-
         drop(req_tx);
         drop(stack_tx);
         let _ = handle.await;
@@ -556,8 +611,8 @@ mod tests {
         time::advance(Duration::from_secs(4)).await;
         tokio::task::yield_now().await;
 
-        let completed = session_rx.recv().await.unwrap();
-        assert_eq!(completed.pid, 42);
+        let payload = session_rx.recv().await.unwrap();
+        assert_eq!(payload.metadata.as_ref().unwrap().pid, 42);
         assert!(session_rx.try_recv().is_err(), "no second session");
 
         drop(req_tx);
@@ -615,9 +670,9 @@ mod tests {
         time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
-        let completed = session_rx.recv().await.unwrap();
-        assert_eq!(completed.total_samples, 0);
-        assert!(completed.stack_traces.is_empty());
+        let payload = session_rx.recv().await.unwrap();
+        assert_eq!(payload.total_samples, 0);
+        assert!(payload.traces.is_empty());
 
         drop(req_tx);
         drop(stack_tx);

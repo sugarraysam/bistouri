@@ -51,7 +51,7 @@ pub(crate) enum KernelMetaError {
 
 /// Host kernel metadata collected once at startup.
 ///
-/// Carried through to every `CompletedSession` for remote symbolization.
+/// Carried through to every `FinalizedSession` for remote symbolization.
 /// The symbolizer uses these fields to resolve raw kernel instruction
 /// pointers into function names:
 ///

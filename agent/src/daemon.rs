@@ -2,13 +2,13 @@ use crate::agent::profiler::{LoadedProfilerAgent, ProfilerAgentBuilder};
 use crate::args::Args;
 use crate::capture::exporter::{GrpcExporter, NullExporter, SessionExporter};
 use crate::capture::orchestrator::{CaptureOrchestrator, STACK_SAMPLE_CHANNEL_SIZE};
-use crate::capture::session::CompletedSession;
 use crate::capture::trace::StackSample;
 use crate::capture::vdso::VdsoCache;
 use crate::sys;
 use crate::telemetry;
 use crate::trigger;
 use crate::trigger::PreparedTriggerAgent;
+use bistouri_api::v1::SessionPayload;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -90,6 +90,7 @@ impl BistouriDaemon {
         let orch_handle = CaptureOrchestrator::start(
             pid_filter_handle,
             args.capture_duration_secs,
+            args.freq,
             stack_rx,
             cancel.clone(),
             kernel_meta,
@@ -97,7 +98,7 @@ impl BistouriDaemon {
 
         let capture_tx = orch_handle.capture_tx.clone();
         let orch_task = orch_handle.task_handle;
-        let completed_rx = orch_handle.completed_rx;
+        let payload_rx = orch_handle.payload_rx;
 
         // Phase 4: Start TriggerAgent with BPF trie handle and capture channel.
         // request_cooldown matches the capture window: a watcher cannot fire more
@@ -124,12 +125,12 @@ impl BistouriDaemon {
             let exporter = GrpcExporter::connect(endpoint)
                 .map_err(|e| anyhow::anyhow!("failed to build symbolizer channel: {e}"))?;
             tokio::spawn(async move {
-                Self::run_downstream(completed_rx, exporter, ds_cancel).await;
+                Self::run_downstream(payload_rx, exporter, ds_cancel).await;
             })
         } else {
             info!("no symbolizer endpoint configured — sessions will be logged locally");
             tokio::spawn(async move {
-                Self::run_downstream(completed_rx, NullExporter, ds_cancel).await;
+                Self::run_downstream(payload_rx, NullExporter, ds_cancel).await;
             })
         };
 
@@ -157,11 +158,11 @@ impl BistouriDaemon {
         // loaded_agent drops here — BPF skel, links, and object are released last.
     }
 
-    /// Drive the downstream consumer loop. Receives `CompletedSession`s from
+    /// Drive the downstream consumer loop. Receives `SessionPayload`s from
     /// the orchestrator and hands them to the configured `SessionExporter`.
     /// Export errors are logged and discarded — delivery is best-effort.
     async fn run_downstream<E: SessionExporter>(
-        mut completed_rx: mpsc::Receiver<CompletedSession>,
+        mut payload_rx: mpsc::Receiver<SessionPayload>,
         exporter: E,
         cancel: CancellationToken,
     ) {
@@ -169,9 +170,9 @@ impl BistouriDaemon {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                session = completed_rx.recv() => match session {
-                    Some(session) => {
-                        if let Err(e) = exporter.export(session).await {
+                payload = payload_rx.recv() => match payload {
+                    Some(payload) => {
+                        if let Err(e) = exporter.export(payload).await {
                             tracing::warn!(error = %e, "session export failed");
                         }
                     }
