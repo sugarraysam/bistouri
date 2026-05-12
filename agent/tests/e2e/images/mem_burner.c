@@ -1,30 +1,36 @@
 /*
  * mem-burner: memory-pressure workload for PSI integration tests.
  *
- * Generates sustained memory.pressure without triggering the OOM killer by
- * keeping total allocation well below the cgroup limit. With a 64Mi cgroup
- * limit, we allocate 40 MB and continuously force page reclaim by discarding
- * and re-faulting the same physical pages with MADV_PAGEOUT + sequential
- * memset.
- *
- * OOM protection:
- *   Writes -1000 to /proc/self/oom_score_adj at startup. This marks the
- *   process as the lowest-priority OOM victim, so the kernel will never
- *   choose it for termination even if memory pressure peaks unexpectedly.
- *   Combined with a 40 MB arena (62% of the 64 Mi limit), there is a
- *   comfortable 24 MB safety margin.
+ * Generates sustained memory.pressure by repeatedly allocating anonymous
+ * pages up to near the cgroup limit, then releasing them all and starting
+ * over.  This forces the kernel into direct reclaim on every cycle,
+ * generating memory.pressure stall time.
  *
  * Pressure generation mechanism:
- *   1. mmap() a 40 MB arena (MAP_PRIVATE | MAP_ANONYMOUS).
- *   2. Touch all pages sequentially (memset) to fault them in.
- *   3. madvise(MADV_PAGEOUT) to ask the kernel to reclaim those pages.
- *   4. Re-touch all pages — forces hard page faults, stalling the process
- *      while the kernel refaults the pages back in.
- *   5. Repeat indefinitely.
+ *   1. mmap() + memset() 56 × 1 MB chunks sequentially.
+ *      Each memset triggers minor page faults that allocate physical pages.
+ *      As the cgroup fills toward its 64 Mi limit, the kernel invokes
+ *      direct reclaim — the process stalls (on-CPU, running kernel reclaim
+ *      code) while the kernel scans LRU lists and evicts pages.
+ *   2. munmap() all chunks — releases physical pages instantly.
+ *   3. Repeat.
  *
- * This stall pattern is what generates memory.pressure (the kernel records
- * time the cgroup is stalled waiting for memory). The process stays on-CPU
- * during the memset phase, making it visible to the perf_event profiler.
+ * Profiler visibility:
+ *   memset() is genuine user-space CPU work (~250–500 µs per 1 MB chunk).
+ *   The kernel's page fault handler and direct reclaim path also run
+ *   on-CPU.  At 19 Hz perf_event sampling, each ~50–100 ms cycle contains
+ *   at least one sample opportunity, yielding dozens of captured stacks
+ *   over a 5-second capture window.
+ *
+ * OOM protection:
+ *   Writes -1000 to /proc/self/oom_score_adj at startup.  Combined with
+ *   a 56 MB arena (87.5% of the 64 Mi limit), there is a comfortable
+ *   ~8 MB safety margin.
+ *
+ * Why not MADV_PAGEOUT?
+ *   MADV_PAGEOUT is advisory and requires swap to evict anonymous pages.
+ *   On Kubernetes nodes with swap disabled (the default), it is a no-op —
+ *   pages stay resident and zero memory.pressure is generated.
  *
  * Helper functions are __attribute__((noinline)) to produce a multi-frame
  * stack trace, validating that the BPF frame-pointer unwinder can walk
@@ -35,15 +41,15 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define ARENA_SIZE (40 * 1024 * 1024)  /* 40 MB — 62% of 64 Mi limit */
-#define CHUNK      (4 * 1024)           /* 4 KB = one page */
+#define CHUNK_SIZE (1024 * 1024)  /* 1 MB per chunk */
+#define MAX_CHUNKS 56             /* 56 MB total — 87.5% of 64 Mi limit */
 
 /*
  * Lower this process's OOM priority to -1000 (never kill).
  *
  * Safety: writes to /proc/self/oom_score_adj which is always writable by
  * the process itself. The write() return value is intentionally ignored —
- * failure is non-fatal; the 24 MB safety margin is the primary guard.
+ * failure is non-fatal; the 8 MB safety margin is the primary guard.
  */
 static void oom_protect(void) {
     int fd = open("/proc/self/oom_score_adj", O_WRONLY);
@@ -54,35 +60,41 @@ static void oom_protect(void) {
     }
 }
 
-__attribute__((noinline)) static void evict_pages(void *p, size_t size) {
-    madvise(p, size, MADV_PAGEOUT);
+__attribute__((noinline)) static void touch_chunk(void *p, size_t size) {
+    memset(p, 0xAA, size);
 }
 
-__attribute__((noinline)) static void fault_pages(void *p, size_t size) {
-    /* Touch every page to force hard page faults after eviction. */
-    volatile char *ptr = (volatile char *)p;
-    for (size_t i = 0; i < size; i += CHUNK) {
-        ptr[i] = (char)i;
+__attribute__((noinline)) static void *alloc_chunk(void) {
+    void *p = mmap(NULL, CHUNK_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+        return NULL;
+    touch_chunk(p, CHUNK_SIZE);
+    return p;
+}
+
+__attribute__((noinline)) static void free_chunks(void **chunks, int n) {
+    for (int i = 0; i < n; i++) {
+        munmap(chunks[i], CHUNK_SIZE);
     }
 }
 
 int main(void) {
     oom_protect();
 
-    void *arena = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (arena == MAP_FAILED)
-        return 1;
-
-    /* Initial population: fault all pages in once. */
-    fault_pages(arena, ARENA_SIZE);
+    void *chunks[MAX_CHUNKS];
 
     for (;;) {
-        /* Ask the kernel to reclaim our pages → process stalls on refault. */
-        evict_pages(arena, ARENA_SIZE);
-
-        /* Re-touch all pages: generates hard page faults → memory.pressure. */
-        fault_pages(arena, ARENA_SIZE);
+        int n = 0;
+        /* Allocate chunks until the limit or mmap failure. */
+        for (; n < MAX_CHUNKS; n++) {
+            void *p = alloc_chunk();
+            if (!p)
+                break;
+            chunks[n] = p;
+        }
+        /* Release all at once — frees physical pages for the next cycle. */
+        free_chunks(chunks, n);
     }
 
     return 0;
