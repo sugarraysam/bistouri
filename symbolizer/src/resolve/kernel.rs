@@ -15,9 +15,14 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::build_id;
-use super::cache::{CachedObject, ObjectCache};
+use super::cache::{CacheEntry, CachedObject, ObjectCache};
 use crate::debuginfod::{ArtifactKind, DebuginfodClient};
 use crate::model::{ResolvedFrame, SymbolInfo};
+
+/// Default static `_text` virtual address for x86_64 vmlinux.
+/// Used as a fallback if the ELF symbol table doesn't contain `_text`.
+/// This is the standard kernel link-time address on x86_64.
+pub(crate) const DEFAULT_STATIC_TEXT_ADDR: u64 = 0xffff_ffff_8100_0000;
 
 /// Long-lived kernel frame resolver.
 ///
@@ -85,13 +90,13 @@ impl<C: DebuginfodClient> KernelResolver<C> {
 
         match CachedObject::from_elf_bytes(&bytes, &hex, static_text_addr) {
             Ok(parsed) => {
-                self.cache.insert(*bid, parsed);
+                self.cache.insert(*bid, CacheEntry::Parsed(parsed));
                 true
             }
             Err(e) => {
-                // Parse failure is definitive — negative cache.
-                warn!(build_id = %hex, error = %e, "vmlinux parse failed, negative caching");
-                self.cache.insert_negative(*bid);
+                // Parse failure is definitive — cache as unparseable sentinel.
+                warn!(build_id = %hex, error = %e, "vmlinux parse failed, caching as unparseable");
+                self.cache.insert(*bid, CacheEntry::Unparseable);
                 false
             }
         }

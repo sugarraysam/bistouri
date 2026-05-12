@@ -1,18 +1,26 @@
-//! LRU cache for parsed ELF objects, keyed by build ID.
+//! LRU caches for the symbolization pipeline.
 //!
-//! Build IDs are content-addressed (SHA-1 of the ELF), so cache entries
-//! never go stale — eviction is purely for memory pressure management.
+//! ## Object cache (L1)
 //!
-//! ## Negative cache policy
+//! Keyed by build ID (content-addressed SHA-1). Stores parsed ELF/DWARF
+//! contexts or `Unparseable` sentinels for ELFs that were fetched
+//! successfully but failed to parse (definitive failure — retrying the
+//! same bytes is pointless).
 //!
-//! Only **definitive failures** are negative-cached:
-//! - HTTP 404 from debuginfod (artifact doesn't exist)
-//! - ELF/DWARF parse failures (corrupt artifact)
+//! ## Negative cache (404 only)
+//!
+//! TTL-based cache for build IDs not found in debuginfod (HTTP 404).
+//! Only **not-found** results live here. Parse failures are stored as
+//! `CacheEntry::Unparseable` in the object cache, not here.
 //!
 //! **Transient failures** (network timeout, DNS failure, 500s) are NOT
-//! negative-cached — the caller should retry on the next session.
-//! Callers are responsible for calling `insert_negative()` on definitive
-//! failures; the cache itself never auto-populates negatives.
+//! cached at all — the caller should retry on the next session.
+//!
+//! ## Symbol cache (L2)
+//!
+//! Keyed by `(BuildId, u64)` — build ID plus either a file offset
+//! (user-space) or a vmlinux vaddr (kernel). Caches the resolved
+//! `ResolvedFrame` to skip DWARF walks on repeated lookups.
 
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -28,6 +36,16 @@ use crate::model::{ResolvedFrame, SymbolInfo};
 /// A reader type that owns its data via `Rc<[u8]>`.
 /// This allows the `addr2line::Context` to outlive the raw ELF bytes.
 pub(crate) type RcReader = gimli::EndianRcSlice<gimli::RunTimeEndian>;
+
+/// What the object cache stores for a given build ID.
+pub(crate) enum CacheEntry {
+    /// Successfully parsed ELF/DWARF — ready for symbolization.
+    Parsed(CachedObject),
+    /// ELF was fetched but parsing failed definitively.
+    /// Stored as a sentinel to prevent re-fetch and re-parse attempts.
+    /// Retrying is pointless — same bytes will always fail.
+    Unparseable,
+}
 
 /// A parsed and cached ELF object, ready for symbolization.
 ///
@@ -151,6 +169,7 @@ impl CachedObject {
 // The Mutex<ObjectCache> ensures exclusive access. No CachedObject
 // is ever shared across threads simultaneously.
 unsafe impl Send for CachedObject {}
+unsafe impl Send for CacheEntry {}
 
 /// Thread-safe LRU cache for parsed ELF objects.
 ///
@@ -158,10 +177,10 @@ unsafe impl Send for CachedObject {}
 /// `spawn_blocking` tasks. The cache is append-only (modulo LRU eviction)
 /// since build IDs are content-addressed.
 pub(crate) struct ObjectCache {
-    objects: Mutex<LruCache<BuildId, CachedObject>>,
-    /// Negative cache: build IDs where debuginfod returned 404 or ELF
-    /// parsing failed. TTL prevents permanent blacklisting if the artifact
-    /// appears later.
+    objects: Mutex<LruCache<BuildId, CacheEntry>>,
+    /// Negative cache: build IDs where debuginfod returned HTTP 404.
+    /// Only not-found results live here — parse failures are stored
+    /// as `CacheEntry::Unparseable` in the object cache.
     negative: Mutex<LruCache<BuildId, Instant>>,
     /// How long a negative cache entry stays valid.
     negative_ttl: std::time::Duration,
@@ -185,29 +204,42 @@ impl ObjectCache {
         }
     }
 
-    /// Returns `true` if the build ID is cached (parsed ELF available).
+    /// Returns `true` if the build ID has an entry in the object cache
+    /// (either `Parsed` or `Unparseable`).
     pub(crate) fn contains(&self, build_id: &BuildId) -> bool {
         self.objects.lock().unwrap().contains(build_id)
     }
 
-    /// Inserts a parsed object into the cache.
-    pub(crate) fn insert(&self, build_id: BuildId, object: CachedObject) {
-        self.objects.lock().unwrap().put(build_id, object);
+    /// Inserts a cache entry (parsed object or unparseable sentinel).
+    pub(crate) fn insert(&self, build_id: BuildId, entry: CacheEntry) {
+        self.objects.lock().unwrap().put(build_id, entry);
     }
 
-    /// Retrieves a cached object and applies a closure to it.
+    /// Returns `true` if the build ID is cached as `Unparseable`.
+    #[cfg(test)]
+    pub(crate) fn is_unparseable(&self, build_id: &BuildId) -> bool {
+        let mut cache = self.objects.lock().unwrap();
+        matches!(cache.get(build_id), Some(CacheEntry::Unparseable))
+    }
+
+    /// Retrieves a parsed object and applies a closure to it.
     ///
     /// Uses a closure pattern to avoid returning a reference through the Mutex.
-    /// The closure receives the `CachedObject` and can extract whatever it needs.
+    /// Returns `None` if the build ID is missing or `Unparseable`.
     pub(crate) fn with_object<F, R>(&self, build_id: &BuildId, f: F) -> Option<R>
     where
         F: FnOnce(&CachedObject) -> R,
     {
         let mut cache = self.objects.lock().unwrap();
-        cache.get(build_id).map(f)
+        match cache.get(build_id) {
+            Some(CacheEntry::Parsed(obj)) => Some(f(obj)),
+            _ => None,
+        }
     }
 
-    /// Records a negative cache entry (definitive failure: 404 or parse error).
+    /// Records a negative cache entry for a build ID not found in debuginfod
+    /// (HTTP 404). Do NOT call for parse failures — use
+    /// `insert(bid, CacheEntry::Unparseable)` instead.
     ///
     /// Do NOT call for transient errors (network timeout, 500s) — those
     /// should be retried on the next session.
@@ -230,6 +262,44 @@ impl ObjectCache {
             }
             None => false,
         }
+    }
+}
+
+/// Key for the symbol cache: `(build_id, address)`.
+///
+/// For user-space frames, `address` is the raw file offset from BPF.
+/// For kernel frames, `address` is the computed vmlinux vaddr.
+/// 28 bytes, `Copy`, no heap allocation.
+pub(crate) type SymbolKey = (BuildId, u64);
+
+/// LRU cache for resolved symbols, keyed by `(build_id, address)`.
+///
+/// Sits in front of the DWARF walk — if a `(build_id, offset)` pair has
+/// been resolved before, we return the cached `ResolvedFrame` without
+/// touching addr2line.
+pub(crate) struct SymbolCache {
+    entries: Mutex<LruCache<SymbolKey, ResolvedFrame>>,
+}
+
+impl SymbolCache {
+    /// Creates a new symbol cache with the given capacity.
+    pub(crate) fn new(capacity: usize) -> Self {
+        use std::num::NonZeroUsize;
+        Self {
+            entries: Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity).expect("symbol cache capacity must be > 0"),
+            )),
+        }
+    }
+
+    /// Returns a cached frame if present, cloned out through the mutex.
+    pub(crate) fn get(&self, key: &SymbolKey) -> Option<ResolvedFrame> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    /// Inserts a resolved frame into the cache.
+    pub(crate) fn insert(&self, key: SymbolKey, frame: ResolvedFrame) {
+        self.entries.lock().unwrap().put(key, frame);
     }
 }
 
@@ -256,5 +326,50 @@ mod tests {
     fn contains_returns_false_for_missing() {
         let cache = ObjectCache::new(16, 16);
         assert!(!cache.contains(&dummy_build_id(0xFF)));
+    }
+
+    #[test]
+    fn unparseable_sentinel_blocks_resolve() {
+        let cache = ObjectCache::new(16, 16);
+        let bid = dummy_build_id(0xBB);
+
+        cache.insert(bid, CacheEntry::Unparseable);
+
+        // contains() returns true for Unparseable entries.
+        assert!(cache.contains(&bid));
+        // is_unparseable() returns true.
+        assert!(cache.is_unparseable(&bid));
+        // with_object() returns None — no parsed object available.
+        assert!(cache.with_object(&bid, |_| ()).is_none());
+    }
+
+    use rstest::rstest;
+
+    /// Symbol cache behavior across capacity and access patterns.
+    ///
+    /// Each case inserts `keys_to_insert` into a cache of `capacity`,
+    /// then checks whether `lookup_key` is a hit or miss.
+    #[rstest]
+    #[case::miss_on_empty(16, &[], (0xCC, 0x1234), false, "empty cache always misses")]
+    #[case::hit_after_insert(16, &[(0xCC, 0x1234)], (0xCC, 0x1234), true, "inserted key is found")]
+    #[case::miss_different_key(16, &[(0xCC, 0x1234)], (0xCC, 0x5678), false, "different offset misses")]
+    #[case::eviction_oldest(2, &[(0xDD, 1), (0xDD, 2), (0xDD, 3)], (0xDD, 1), false, "oldest key evicted at capacity")]
+    #[case::eviction_keeps_recent(2, &[(0xDD, 1), (0xDD, 2), (0xDD, 3)], (0xDD, 3), true, "newest key survives eviction")]
+    fn symbol_cache_behavior(
+        #[case] capacity: usize,
+        #[case] keys_to_insert: &[(u8, u64)],
+        #[case] lookup_key: (u8, u64),
+        #[case] expect_hit: bool,
+        #[case] description: &str,
+    ) {
+        let cache = SymbolCache::new(capacity);
+        let frame = ResolvedFrame::Symbolized(SymbolInfo::unknown());
+
+        for &(bid_byte, offset) in keys_to_insert {
+            cache.insert((dummy_build_id(bid_byte), offset), frame.clone());
+        }
+
+        let key = (dummy_build_id(lookup_key.0), lookup_key.1);
+        assert_eq!(cache.get(&key).is_some(), expect_hit, "{description}");
     }
 }

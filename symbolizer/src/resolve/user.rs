@@ -6,7 +6,7 @@
 use tracing::{debug, warn};
 
 use super::build_id::{self, BuildId, BUILD_ID_SIZE};
-use super::cache::{CachedObject, ObjectCache};
+use super::cache::{CacheEntry, CachedObject, ObjectCache, SymbolCache};
 use super::elf::translate_file_offset;
 use crate::debuginfod::{ArtifactKind, DebuginfodClient};
 use crate::error::Result;
@@ -52,13 +52,13 @@ pub(crate) async fn ensure_cached(
 
     match CachedObject::from_elf_bytes(&elf_bytes, &hex, None) {
         Ok(parsed) => {
-            cache.insert(*build_id, parsed);
+            cache.insert(*build_id, CacheEntry::Parsed(parsed));
             true
         }
         Err(e) => {
-            // Parse failure is definitive — negative cache.
-            warn!(build_id = %hex, error = %e, "ELF parse failed, negative caching");
-            cache.insert_negative(*build_id);
+            // Parse failure is definitive — cache as unparseable sentinel.
+            warn!(build_id = %hex, error = %e, "ELF parse failed, caching as unparseable");
+            cache.insert(*build_id, CacheEntry::Unparseable);
             false
         }
     }
@@ -81,12 +81,23 @@ pub(crate) fn resolve_frame(
     build_id: &[u8; BUILD_ID_SIZE],
     file_offset: u64,
     cache: &ObjectCache,
+    symbols: &SymbolCache,
 ) -> ResolvedFrame {
-    let hex = build_id::to_hex(build_id);
+    let key = (*build_id, file_offset);
 
-    cache
+    // L2 symbol cache hit — skip DWARF entirely.
+    if let Some(cached) = symbols.get(&key) {
+        return cached;
+    }
+
+    let hex = build_id::to_hex(build_id);
+    let frame = cache
         .with_object(build_id, |obj| resolve_from_object(obj, file_offset, &hex))
-        .unwrap_or(ResolvedFrame::Symbolized(SymbolInfo::unknown()))
+        .unwrap_or(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
+
+    // Populate L2 for future lookups.
+    symbols.insert(key, frame.clone());
+    frame
 }
 
 /// Performs the actual symbolization against a cached ELF object.

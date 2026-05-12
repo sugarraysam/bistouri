@@ -11,7 +11,7 @@ use clap::Parser;
 use tracing::info;
 
 use crate::debuginfod::http::HttpDebuginfodClient;
-use crate::resolve::cache::ObjectCache;
+use crate::resolve::cache::{ObjectCache, SymbolCache};
 use crate::resolve::SessionResolver;
 use crate::server::SymbolizerService;
 use crate::sink::log::LogSink;
@@ -36,6 +36,10 @@ struct Args {
     /// Maximum number of negative cache entries (404'd build IDs).
     #[arg(long, default_value_t = 512, env = "SYMBOLIZER_NEGATIVE_CACHE_SIZE")]
     negative_cache_size: usize,
+
+    /// Maximum number of resolved symbols to cache (L2 symbol cache).
+    #[arg(long, default_value_t = 100_000, env = "SYMBOLIZER_SYMBOL_CACHE_SIZE")]
+    symbol_cache_size: usize,
 }
 
 #[tokio::main]
@@ -62,11 +66,14 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to create debuginfod client: {e}"))?,
     );
 
-    // Build the object cache.
+    // Build the object cache (L1: parsed ELF objects).
     let cache = Arc::new(ObjectCache::new(args.cache_size, args.negative_cache_size));
 
+    // Build the symbol cache (L2: resolved frames).
+    let symbols = Arc::new(SymbolCache::new(args.symbol_cache_size));
+
     // Build the resolver.
-    let resolver = Arc::new(SessionResolver::new(cache, client));
+    let resolver = Arc::new(SessionResolver::new(cache, client, symbols));
 
     // Build the sink (log sink for now — ClickHouse etc. behind the trait).
     let sink = Arc::new(LogSink);

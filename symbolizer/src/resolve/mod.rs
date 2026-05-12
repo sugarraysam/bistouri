@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use self::build_id::{BuildId, BUILD_ID_SIZE};
-use self::cache::ObjectCache;
+use self::cache::{ObjectCache, SymbolCache};
 use self::kernel::KernelResolver;
 use crate::debuginfod::DebuginfodClient;
 use crate::model::{ResolvedFrame, ResolvedSession, ResolvedTrace, SymbolInfo};
@@ -35,15 +35,17 @@ pub(crate) struct SessionResolver<C: DebuginfodClient> {
     cache: Arc<ObjectCache>,
     client: Arc<C>,
     kernel: KernelResolver<C>,
+    symbols: Arc<SymbolCache>,
 }
 
 impl<C: DebuginfodClient + 'static> SessionResolver<C> {
-    pub(crate) fn new(cache: Arc<ObjectCache>, client: Arc<C>) -> Self {
+    pub(crate) fn new(cache: Arc<ObjectCache>, client: Arc<C>, symbols: Arc<SymbolCache>) -> Self {
         let kernel = KernelResolver::new(cache.clone(), client.clone());
         Self {
             cache,
             client,
             kernel,
+            symbols,
         }
     }
 
@@ -83,8 +85,9 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
         // Phase 2: Symbolize in blocking context. Payload is moved, not cloned.
         let cache = self.cache.clone();
         let kernel_cache = self.kernel.cache_ref();
+        let symbols = self.symbols.clone();
         match tokio::task::spawn_blocking(move || {
-            resolve_session_blocking(payload, &cache, &kernel_cache)
+            resolve_session_blocking(payload, &cache, &kernel_cache, &symbols)
         })
         .await
         {
@@ -151,6 +154,7 @@ fn resolve_session_blocking(
     payload: proto::SessionPayload,
     cache: &ObjectCache,
     kernel_cache: &ObjectCache,
+    symbols: &SymbolCache,
 ) -> ResolvedSession {
     // Pre-extract kernel metadata once, not per-frame.
     let metadata = payload.metadata.as_ref();
@@ -174,6 +178,7 @@ fn resolve_session_blocking(
                                 runtime_text_addr,
                                 kernel_bid,
                                 kernel_cache,
+                                symbols,
                             )
                         })
                         .collect()
@@ -184,7 +189,7 @@ fn resolve_session_blocking(
                 .map(|t| {
                     t.user_frames
                         .iter()
-                        .map(|uf| resolve_user_frame(uf, &payload.mappings, cache))
+                        .map(|uf| resolve_user_frame(uf, &payload.mappings, cache, symbols))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -233,6 +238,7 @@ fn resolve_kernel_frame_blocking(
     runtime_text_addr: u64,
     kernel_bid: Option<&BuildId>,
     cache: &ObjectCache,
+    symbols: &SymbolCache,
 ) -> ResolvedFrame {
     let Some(bid) = kernel_bid else {
         return ResolvedFrame::Symbolized(SymbolInfo::unknown());
@@ -240,11 +246,22 @@ fn resolve_kernel_frame_blocking(
 
     cache
         .with_object(bid, |obj| {
-            let static_text = obj.static_text_addr.unwrap_or(0xffffffff81000000);
+            let static_text = obj
+                .static_text_addr
+                .unwrap_or(kernel::DEFAULT_STATIC_TEXT_ADDR);
             let vmlinux_vaddr = raw_ip
                 .wrapping_sub(runtime_text_addr)
                 .wrapping_add(static_text);
-            kernel::resolve_kernel_addr(obj, vmlinux_vaddr)
+
+            // L2 symbol cache check for kernel frames.
+            let key = (*bid, vmlinux_vaddr);
+            if let Some(cached) = symbols.get(&key) {
+                return cached;
+            }
+
+            let frame = kernel::resolve_kernel_addr(obj, vmlinux_vaddr);
+            symbols.insert(key, frame.clone());
+            frame
         })
         .unwrap_or(ResolvedFrame::Symbolized(SymbolInfo::unknown()))
 }
@@ -254,6 +271,7 @@ fn resolve_user_frame(
     frame: &proto::UserFrame,
     mappings: &[proto::Mapping],
     cache: &ObjectCache,
+    symbols: &SymbolCache,
 ) -> ResolvedFrame {
     match frame.frame.as_ref() {
         Some(proto::user_frame::Frame::Resolved(resolved)) => {
@@ -261,7 +279,7 @@ fn resolve_user_frame(
             match mapping {
                 Some(m) => {
                     if let Ok(build_id) = <&[u8; BUILD_ID_SIZE]>::try_from(m.build_id.as_slice()) {
-                        user::resolve_frame(build_id, resolved.file_offset, cache)
+                        user::resolve_frame(build_id, resolved.file_offset, cache, symbols)
                     } else {
                         ResolvedFrame::Symbolized(SymbolInfo::unknown())
                     }
