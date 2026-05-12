@@ -52,7 +52,11 @@ message Metadata {
 message KernelMeta {
   string release = 1;
   bytes build_id = 2;
-  fixed64 kaslr_offset = 3;
+  // Runtime virtual address of the kernel's `_text` symbol, read from
+  // `/proc/kallsyms`. The symbolizer computes vmlinux-relative offsets as:
+  //   vmlinux_vaddr = raw_ip - text_addr + vmlinux_static_text
+  // where vmlinux_static_text is the `_text` p_vaddr from the vmlinux ELF.
+  fixed64 text_addr = 3;
 }
 
 // ── Capture source ───────────────────────────────────────────────────
@@ -85,8 +89,8 @@ message CountedTrace {
 }
 
 message StackTrace {
-  // Kernel instruction pointers (raw, KASLR-offset).
-  // Symbolizer subtracts KernelMeta.kaslr_offset → vmlinux-relative.
+  // Kernel instruction pointers (raw, KASLR-randomized).
+  // Symbolizer uses KernelMeta.text_addr to compute vmlinux-relative addresses.
   repeated fixed64 kernel_frames = 1;
 
   // User-space frames with build_id-based addressing.

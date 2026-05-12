@@ -378,7 +378,7 @@ mod tests {
     fn mock_kernel_meta() -> Arc<KernelMeta> {
         Arc::new(KernelMeta {
             build_id: [0xAA; 20],
-            kaslr_offset: 0xffffffff81000000,
+            text_addr: 0xffffffff81000000,
             release: "6.8.0-test".into(),
         })
     }

@@ -13,7 +13,7 @@ pub(crate) async fn run_preflight_checks() -> anyhow::Result<Arc<KernelMeta>> {
 
     info!(
         kernel_release = %kernel_meta.release,
-        kaslr_offset = format_args!("{:#x}", kernel_meta.kaslr_offset),
+        text_addr = format_args!("{:#x}", kernel_meta.text_addr),
         build_id = format_args!("{}", hex_encode(&kernel_meta.build_id)),
         "kernel metadata collected",
     );

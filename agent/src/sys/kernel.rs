@@ -56,16 +56,17 @@ pub(crate) enum KernelMetaError {
 /// pointers into function names:
 ///
 /// 1. `build_id` → match the correct `vmlinux` debuginfo binary
-/// 2. `kaslr_offset` → subtract from raw IPs to get vmlinux-relative offsets
+/// 2. `text_addr` → compute vmlinux-relative addresses from raw IPs
 /// 3. `release` → human-readable secondary key / fallback for symbol lookup
 #[derive(Debug, Clone)]
 pub(crate) struct KernelMeta {
     /// 20-byte GNU build ID parsed from `/sys/kernel/notes`.
     pub build_id: [u8; BUILD_ID_SIZE],
-    /// Address of `_text` from `/proc/kallsyms` — the KASLR base.
-    /// The symbolizer subtracts this from raw kernel IPs to produce
-    /// vmlinux-relative offsets for symbol table lookup.
-    pub kaslr_offset: u64,
+    /// Runtime virtual address of the kernel's `_text` symbol, read from
+    /// `/proc/kallsyms`. Under KASLR this is randomized at each boot.
+    /// The symbolizer computes vmlinux-relative addresses as:
+    ///   `vmlinux_vaddr = raw_ip - text_addr + vmlinux_static_text`
+    pub text_addr: u64,
     /// Kernel release string (e.g. `6.8.0-40-generic`).
     pub release: String,
 }
@@ -80,12 +81,12 @@ impl KernelMeta {
     /// namespace-affected.
     pub(crate) fn collect() -> Result<Self, KernelMetaError> {
         let build_id = Self::read_build_id()?;
-        let kaslr_offset = Self::read_kaslr_offset(Path::new("/proc/kallsyms"))?;
+        let text_addr = Self::read_text_addr(Path::new("/proc/kallsyms"))?;
         let release = Self::read_release()?;
 
         Ok(Self {
             build_id,
-            kaslr_offset,
+            text_addr,
             release,
         })
     }
@@ -172,9 +173,9 @@ impl KernelMeta {
         Err(KernelMetaError::BuildIdNotFound)
     }
 
-    /// Reads the KASLR base address from `/proc/kallsyms` by finding
-    /// the `_text` symbol. Format: `<hex_addr> <type> <name>`.
-    fn read_kaslr_offset(kallsyms_path: &Path) -> Result<u64, KernelMetaError> {
+    /// Reads the runtime `_text` address from `/proc/kallsyms`.
+    /// Format: `<hex_addr> <type> <name>`.
+    fn read_text_addr(kallsyms_path: &Path) -> Result<u64, KernelMetaError> {
         let contents = fs::read_to_string(kallsyms_path).map_err(|e| KernelMetaError::Read {
             path: "/proc/kallsyms",
             source: e,

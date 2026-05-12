@@ -1,0 +1,260 @@
+//! LRU cache for parsed ELF objects, keyed by build ID.
+//!
+//! Build IDs are content-addressed (SHA-1 of the ELF), so cache entries
+//! never go stale — eviction is purely for memory pressure management.
+//!
+//! ## Negative cache policy
+//!
+//! Only **definitive failures** are negative-cached:
+//! - HTTP 404 from debuginfod (artifact doesn't exist)
+//! - ELF/DWARF parse failures (corrupt artifact)
+//!
+//! **Transient failures** (network timeout, DNS failure, 500s) are NOT
+//! negative-cached — the caller should retry on the next session.
+//! Callers are responsible for calling `insert_negative()` on definitive
+//! failures; the cache itself never auto-populates negatives.
+
+use std::rc::Rc;
+use std::sync::Mutex;
+use std::time::Instant;
+
+use lru::LruCache;
+
+use super::build_id::BuildId;
+use super::elf::{extract_load_segments, LoadSegment};
+use crate::error::{Result, SymbolizerError};
+use crate::model::{ResolvedFrame, SymbolInfo};
+
+/// A reader type that owns its data via `Rc<[u8]>`.
+/// This allows the `addr2line::Context` to outlive the raw ELF bytes.
+pub(crate) type RcReader = gimli::EndianRcSlice<gimli::RunTimeEndian>;
+
+/// A parsed and cached ELF object, ready for symbolization.
+///
+/// The `addr2line::Context` uses `Rc<[u8]>` internally via `EndianRcSlice`,
+/// so it owns its DWARF data and can outlive the raw ELF bytes.
+pub(crate) struct CachedObject {
+    /// addr2line context for DWARF symbolization.
+    pub(crate) context: addr2line::Context<RcReader>,
+    /// PT_LOAD segments for file_offset → vaddr translation.
+    pub(crate) segments: Vec<LoadSegment>,
+    /// Static `_text` virtual address from the ELF symbol table.
+    /// Only populated for vmlinux objects — used to avoid re-parsing
+    /// the ELF on every kernel frame resolution.
+    pub(crate) static_text_addr: Option<u64>,
+}
+
+impl CachedObject {
+    /// Parses raw ELF bytes into a `CachedObject`.
+    ///
+    /// This is the single entry point for ELF/DWARF parsing — both
+    /// user-space and kernel resolvers use this to avoid duplicating
+    /// the gimli/addr2line boilerplate.
+    ///
+    /// `static_text_addr` should be set for vmlinux objects (parsed by
+    /// the caller from the same `object::File`).
+    pub(crate) fn from_elf_bytes(
+        data: &[u8],
+        build_id_hex: &str,
+        static_text_addr: Option<u64>,
+    ) -> Result<Self> {
+        let object = object::read::File::parse(data).map_err(|e| SymbolizerError::ElfParse {
+            build_id: build_id_hex.into(),
+            reason: e.to_string(),
+        })?;
+
+        let segments = extract_load_segments(&object);
+
+        // Build gimli::Dwarf from the object file's DWARF sections.
+        // Each section is loaded into an Rc<[u8]> so the Context owns
+        // its data and can outlive the raw ELF bytes.
+        let dwarf = gimli::Dwarf::load(|section_id| -> std::result::Result<_, gimli::Error> {
+            use object::{Object, ObjectSection};
+            let data = object
+                .section_by_name(section_id.name())
+                .and_then(|s| s.uncompressed_data().ok())
+                .unwrap_or(std::borrow::Cow::Borrowed(&[]));
+            Ok(gimli::EndianRcSlice::new(
+                Rc::from(&*data),
+                gimli::RunTimeEndian::Little,
+            ))
+        })
+        .map_err(|e| SymbolizerError::ElfParse {
+            build_id: build_id_hex.into(),
+            reason: format!("DWARF section load failed: {e}"),
+        })?;
+
+        let context =
+            addr2line::Context::from_dwarf(dwarf).map_err(|e| SymbolizerError::ElfParse {
+                build_id: build_id_hex.into(),
+                reason: format!("DWARF context creation failed: {e}"),
+            })?;
+
+        Ok(Self {
+            context,
+            segments,
+            static_text_addr,
+        })
+    }
+
+    /// Looks up a virtual address in the DWARF context and returns
+    /// resolved symbols (including inlined frames).
+    ///
+    /// This is the single DWARF lookup entry point — both kernel and
+    /// user-space resolvers call this after translating their
+    /// domain-specific address (KASLR'd IP or file_offset) to a vaddr.
+    pub(crate) fn symbolize_vaddr(&self, vaddr: u64) -> ResolvedFrame {
+        let lookup = self.context.find_frames(vaddr);
+        let frames_result = lookup.skip_all_loads();
+
+        match frames_result {
+            Ok(mut frames) => {
+                let mut symbols = Vec::new();
+                while let Ok(Some(frame)) = frames.next() {
+                    let function = frame
+                        .function
+                        .as_ref()
+                        .and_then(|f| f.demangle().ok())
+                        .map(|cow| cow.into_owned())
+                        .unwrap_or_else(|| "[unknown]".into());
+
+                    let (file, line) = frame
+                        .location
+                        .map(|loc| (loc.file.map(|f| f.to_string()), loc.line))
+                        .unwrap_or((None, None));
+
+                    symbols.push(SymbolInfo {
+                        function,
+                        file,
+                        line,
+                    });
+                }
+
+                match symbols.len() {
+                    0 => ResolvedFrame::Symbolized(SymbolInfo::unknown()),
+                    1 => ResolvedFrame::Symbolized(symbols.into_iter().next().unwrap()),
+                    _ => ResolvedFrame::Inlined(symbols),
+                }
+            }
+            Err(_) => ResolvedFrame::Symbolized(SymbolInfo::unknown()),
+        }
+    }
+}
+
+// addr2line::Context is not Send due to Rc internals. We access it only
+// from spawn_blocking tasks (single-threaded per task), but the cache
+// itself needs Send for Arc<Mutex<_>>. We enforce single-threaded access
+// at the architectural level (cache.get() returns data, caller uses it
+// within the same spawn_blocking closure).
+//
+// SAFETY: CachedObject is only accessed within spawn_blocking tasks.
+// The Mutex<ObjectCache> ensures exclusive access. No CachedObject
+// is ever shared across threads simultaneously.
+unsafe impl Send for CachedObject {}
+
+/// Thread-safe LRU cache for parsed ELF objects.
+///
+/// Wraps `LruCache` in a `Mutex` for concurrent access from multiple
+/// `spawn_blocking` tasks. The cache is append-only (modulo LRU eviction)
+/// since build IDs are content-addressed.
+pub(crate) struct ObjectCache {
+    objects: Mutex<LruCache<BuildId, CachedObject>>,
+    /// Negative cache: build IDs where debuginfod returned 404 or ELF
+    /// parsing failed. TTL prevents permanent blacklisting if the artifact
+    /// appears later.
+    negative: Mutex<LruCache<BuildId, Instant>>,
+    /// How long a negative cache entry stays valid.
+    negative_ttl: std::time::Duration,
+}
+
+impl ObjectCache {
+    /// Creates a new cache with the given capacity.
+    ///
+    /// `capacity`: maximum number of parsed ELF objects to keep.
+    /// `negative_capacity`: maximum number of negative (404) entries.
+    pub(crate) fn new(capacity: usize, negative_capacity: usize) -> Self {
+        use std::num::NonZeroUsize;
+        Self {
+            objects: Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity).expect("cache capacity must be > 0"),
+            )),
+            negative: Mutex::new(LruCache::new(
+                NonZeroUsize::new(negative_capacity).expect("negative capacity must be > 0"),
+            )),
+            negative_ttl: std::time::Duration::from_secs(300), // 5 minutes
+        }
+    }
+
+    /// Returns `true` if the build ID is cached (parsed ELF available).
+    pub(crate) fn contains(&self, build_id: &BuildId) -> bool {
+        self.objects.lock().unwrap().contains(build_id)
+    }
+
+    /// Inserts a parsed object into the cache.
+    pub(crate) fn insert(&self, build_id: BuildId, object: CachedObject) {
+        self.objects.lock().unwrap().put(build_id, object);
+    }
+
+    /// Retrieves a cached object and applies a closure to it.
+    ///
+    /// Uses a closure pattern to avoid returning a reference through the Mutex.
+    /// The closure receives the `CachedObject` and can extract whatever it needs.
+    pub(crate) fn with_object<F, R>(&self, build_id: &BuildId, f: F) -> Option<R>
+    where
+        F: FnOnce(&CachedObject) -> R,
+    {
+        let mut cache = self.objects.lock().unwrap();
+        cache.get(build_id).map(f)
+    }
+
+    /// Records a negative cache entry (definitive failure: 404 or parse error).
+    ///
+    /// Do NOT call for transient errors (network timeout, 500s) — those
+    /// should be retried on the next session.
+    pub(crate) fn insert_negative(&self, build_id: BuildId) {
+        self.negative.lock().unwrap().put(build_id, Instant::now());
+    }
+
+    /// Returns `true` if the build ID is in the negative cache and hasn't expired.
+    pub(crate) fn is_negative(&self, build_id: &BuildId) -> bool {
+        let mut cache = self.negative.lock().unwrap();
+        match cache.get(build_id) {
+            Some(inserted_at) => {
+                if inserted_at.elapsed() < self.negative_ttl {
+                    true
+                } else {
+                    // Expired — remove and allow retry.
+                    cache.pop(build_id);
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolve::build_id::BUILD_ID_SIZE;
+
+    fn dummy_build_id(byte: u8) -> BuildId {
+        [byte; BUILD_ID_SIZE]
+    }
+
+    #[test]
+    fn negative_cache_blocks_lookup() {
+        let cache = ObjectCache::new(16, 16);
+        let bid = dummy_build_id(0xAA);
+
+        assert!(!cache.is_negative(&bid));
+        cache.insert_negative(bid);
+        assert!(cache.is_negative(&bid));
+    }
+
+    #[test]
+    fn contains_returns_false_for_missing() {
+        let cache = ObjectCache::new(16, 16);
+        assert!(!cache.contains(&dummy_build_id(0xFF)));
+    }
+}

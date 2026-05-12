@@ -132,7 +132,7 @@ impl CaptureSession {
             kernel_meta: Some(proto::KernelMeta {
                 release: kernel_meta.release.clone(),
                 build_id: kernel_meta.build_id.to_vec(),
-                kaslr_offset: kernel_meta.kaslr_offset,
+                text_addr: kernel_meta.text_addr,
             }),
         };
 
@@ -256,7 +256,7 @@ mod tests {
     fn mock_kernel_meta() -> Arc<KernelMeta> {
         Arc::new(KernelMeta {
             build_id: [0xAA; 20],
-            kaslr_offset: 0xffffffff81000000,
+            text_addr: 0xffffffff81000000,
             release: "6.8.0-test".into(),
         })
     }
@@ -534,6 +534,6 @@ mod tests {
         let kernel = meta.kernel_meta.as_ref().unwrap();
         assert_eq!(kernel.release, "6.8.0-test");
         assert_eq!(kernel.build_id, vec![0xAA; 20]);
-        assert_eq!(kernel.kaslr_offset, 0xffffffff81000000);
+        assert_eq!(kernel.text_addr, 0xffffffff81000000);
     }
 }
