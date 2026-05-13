@@ -36,7 +36,8 @@ if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
 else
 	e2e_info "Skipping Docker builds (SKIP_BUILD=true)"
 fi
-import_k3s_images bistouri-agent:local busybox:latest bistouri-stress:local
+
+import_k3s_images bistouri-agent:local bistouri-stress:local
 
 # ── Run tests ────────────────────────────────────────────────────────
 

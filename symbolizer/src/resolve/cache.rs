@@ -43,6 +43,7 @@
 //! for zero-clone cache hits — no string allocations on the hot path.
 //! Split into kernel and user-space pools.
 
+use object::{Object, ObjectSection};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -161,7 +162,6 @@ impl CachedObject {
         // Each section is loaded into an Arc<[u8]> so the Context owns
         // its data, is Send, and can outlive the raw ELF bytes.
         let dwarf = gimli::Dwarf::load(|section_id| -> std::result::Result<_, gimli::Error> {
-            use object::{Object, ObjectSection};
             let data = object
                 .section_by_name(section_id.name())
                 .and_then(|s| s.uncompressed_data().ok())
