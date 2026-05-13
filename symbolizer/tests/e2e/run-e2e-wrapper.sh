@@ -39,21 +39,22 @@ EOF
 		sudo apt-get update -qq
 	fi
 
-	local pkg="linux-image-$(uname -r)-dbgsym"
-	local unsigned_pkg="linux-image-unsigned-$(uname -r)-dbgsym"
+	local version="$(uname -r)"
+	local pkg
 
+	pkg=$(apt-cache search "linux-image.*${version}.*dbgsym" | awk '{print $1}' | head -n 1)
+
+	if [ -z "$pkg" ]; then
+		e2e_warn "Could not find any dbgsym packages for $version."
+		e2e_warn "Could not install debug symbols — Phase 2 skipped."
+		return
+	fi
+
+	e2e_info "Found matching debug package: $pkg"
 	if sudo apt-get install -y --no-install-recommends "$pkg"; then
 		e2e_info "Installed $pkg"
-	elif sudo apt-get install -y --no-install-recommends "$unsigned_pkg"; then
-		e2e_info "Installed $unsigned_pkg"
 	else
-		e2e_warn "Failed to find $pkg or $unsigned_pkg."
-
-		# To troubleshoot CI
-		e2e_warn "Available debug packages for this kernel version:"
-		apt-cache search "linux-image.*$(uname -r).*dbgsym" || true
-
-		e2e_warn "Could not install debug symbols — Phase 2 (kernel resolution) will be skipped"
+		e2e_warn "Could not install $pkg — Phase 2 (kernel resolution) skipped."
 	fi
 }
 
