@@ -56,4 +56,5 @@ validate-deployment:
 	@echo "==> All manifests valid"
 
 clean:
+	sudo rm -fr target/
 	cargo clean

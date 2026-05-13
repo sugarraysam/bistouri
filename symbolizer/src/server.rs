@@ -2,8 +2,16 @@
 
 use std::sync::Arc;
 
+use std::time::Instant;
+
+use metrics::{counter, histogram};
 use tonic::{Request, Response, Status};
-use tracing::{debug, warn};
+use tracing::{debug, error};
+
+use crate::telemetry::{
+    METRIC_LATENCY_SECONDS, METRIC_RESOLUTIONS_ERROR, METRIC_RESOLUTIONS_SUCCESS,
+    METRIC_RESOLUTIONS_TOTAL,
+};
 
 use crate::debuginfod::DebuginfodClient;
 use crate::resolve::SessionResolver;
@@ -35,6 +43,9 @@ impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> CaptureService
         &self,
         request: Request<proto::SessionPayload>,
     ) -> std::result::Result<Response<()>, Status> {
+        let start_time = Instant::now();
+        counter!(METRIC_RESOLUTIONS_TOTAL).increment(1);
+
         let payload = request.into_inner();
 
         // Extract lightweight metadata for logging before moving the payload.
@@ -64,13 +75,18 @@ impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> CaptureService
 
         // Phase 3: store via the configured sink.
         if let Err(e) = self.sink.store(resolved).await {
-            warn!(
+            error!(
                 session_id = %session_id,
                 error = %e,
                 "sink store failed"
             );
+            counter!(METRIC_RESOLUTIONS_ERROR).increment(1);
             return Err(Status::internal(format!("sink error: {e}")));
         }
+
+        histogram!(METRIC_LATENCY_SECONDS, "phase" => "total")
+            .record(start_time.elapsed().as_secs_f64());
+        counter!(METRIC_RESOLUTIONS_SUCCESS).increment(1);
 
         Ok(Response::new(()))
     }

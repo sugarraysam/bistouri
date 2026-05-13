@@ -94,7 +94,7 @@ pub(crate) fn build_user_payload(
         build_id: build_id_bytes,
     }];
 
-    let traces: Vec<proto::CountedTrace> = entry
+    let mut traces: Vec<proto::CountedTrace> = entry
         .symbols
         .values()
         .map(|sym| proto::CountedTrace {
@@ -111,6 +111,11 @@ pub(crate) fn build_user_payload(
             off_cpu_count: 0,
         })
         .collect();
+
+    // Duplicate the traces to guarantee L2 symbol cache hits during E2E.
+    // The first instance populates the cache; the second is a guaranteed hit.
+    let duplicated = traces.clone();
+    traces.extend(duplicated);
 
     let total_samples = traces.len() as u64;
 

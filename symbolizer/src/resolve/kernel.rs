@@ -12,7 +12,10 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use metrics::counter;
+use tracing::{debug, error, warn};
+
+use crate::telemetry::{METRIC_DEBUGINFOD_ERRORS, METRIC_PARSE_FAILURES};
 
 use super::build_id;
 use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache};
@@ -80,7 +83,8 @@ impl<C: DebuginfodClient> KernelResolver<C> {
             }
             Err(e) => {
                 // Transient error — do NOT negative cache, allow retry.
-                warn!(build_id = %hex, error = %e, "vmlinux fetch failed (transient, will retry)");
+                error!(build_id = %hex, error = %e, "vmlinux fetch failed (transient, will retry)");
+                counter!(METRIC_DEBUGINFOD_ERRORS).increment(1);
                 return false;
             }
         };
@@ -96,7 +100,8 @@ impl<C: DebuginfodClient> KernelResolver<C> {
             }
             Err(e) => {
                 // Parse failure is definitive — cache as unparseable sentinel.
-                warn!(build_id = %hex, error = %e, "vmlinux parse failed, caching as unparseable");
+                error!(build_id = %hex, error = %e, "vmlinux parse failed, caching as unparseable");
+                counter!(METRIC_PARSE_FAILURES).increment(1);
                 self.cache.insert(*bid, CacheEntry::Unparseable);
                 false
             }

@@ -26,4 +26,10 @@ pub(crate) enum E2eError {
 
     #[error("kernel metadata: {0}")]
     KernelMeta(String),
+
+    #[error("reqwest error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+
+    #[error("metrics parse error: {0}")]
+    MetricsParse(String),
 }

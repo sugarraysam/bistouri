@@ -21,6 +21,10 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:50051", env = "SYMBOLIZER_LISTEN_ADDR")]
     listen_addr: String,
 
+    /// Prometheus metrics port.
+    #[arg(long, default_value_t = 9091, env = "SYMBOLIZER_METRICS_PORT")]
+    metrics_port: u16,
+
     /// Debuginfod server URL.
     #[arg(long, default_value = "http://localhost:8002", env = "DEBUGINFOD_URL")]
     debuginfod_url: String,
@@ -98,8 +102,16 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
         .init();
 
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(([0, 0, 0, 0], args.metrics_port))
+        .install()
+        .map_err(|e| anyhow::anyhow!("metrics server on port {}: {e}", args.metrics_port))?;
+
+    bistouri_symbolizer::telemetry::describe_all();
+
     info!(
         listen_addr = %args.listen_addr,
+        metrics_port = args.metrics_port,
         debuginfod_url = %args.debuginfod_url,
         debuginfod_cache_path = ?args.debuginfod_cache_path,
         user_object_budget_mb = args.user_object_budget_bytes / (1024 * 1024),

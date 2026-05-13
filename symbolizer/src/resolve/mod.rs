@@ -13,7 +13,12 @@ pub(crate) mod user;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use std::time::Instant;
+
+use metrics::{counter, histogram};
 use tracing::{debug, error, info};
+
+use crate::telemetry::{METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_LATENCY_SECONDS};
 
 use self::build_id::{BuildId, BUILD_ID_SIZE};
 use self::cache::{NegativeCache, ObjectCache, SymbolCache};
@@ -269,13 +274,22 @@ fn resolve_kernel_frame_blocking(
     cache: &ObjectCache,
     symbols: &SymbolCache,
 ) -> ResolvedFrame {
+    let start_time = Instant::now();
+
     let Some(bid) = kernel_bid else {
+        counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "kernel").increment(1);
+        histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
+            .record(start_time.elapsed().as_secs_f64());
         return ResolvedFrame::Symbolized(SymbolInfo::unknown());
     };
 
     let Some(obj) = cache.get_object(bid) else {
+        counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "kernel").increment(1);
+        histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
+            .record(start_time.elapsed().as_secs_f64());
         return ResolvedFrame::Symbolized(SymbolInfo::unknown());
     };
+    counter!(METRIC_CACHE_HITS, "kind" => "object", "space" => "kernel").increment(1);
 
     // Lock-free metadata access — segments and static_text_addr are Sync.
     let static_text = obj
@@ -288,12 +302,18 @@ fn resolve_kernel_frame_blocking(
     // L2 symbol cache check — entirely lock-free.
     let key = (*bid, vmlinux_vaddr);
     if let Some(cached) = symbols.get(&key) {
+        counter!(METRIC_CACHE_HITS, "kind" => "symbol", "space" => "kernel").increment(1);
+        histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
+            .record(start_time.elapsed().as_secs_f64());
         return (*cached).clone();
     }
+    counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "kernel").increment(1);
 
     // Only the DWARF walk acquires the per-object context Mutex.
     let frame = kernel::resolve_kernel_addr(&obj, vmlinux_vaddr);
     symbols.insert(key, Arc::new(frame.clone()));
+    histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
+        .record(start_time.elapsed().as_secs_f64());
     frame
 }
 

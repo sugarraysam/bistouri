@@ -5,7 +5,15 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use std::time::Instant;
+
+use metrics::{counter, histogram};
+use tracing::{debug, error};
+
+use crate::telemetry::{
+    METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_DEBUGINFOD_ERRORS, METRIC_LATENCY_SECONDS,
+    METRIC_PARSE_FAILURES,
+};
 
 use super::build_id::{self, BuildId, BUILD_ID_SIZE};
 use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache, SymbolCache};
@@ -48,7 +56,8 @@ pub(crate) async fn ensure_cached(
         }
         Err(e) => {
             // Transient error — do NOT negative cache, allow retry.
-            warn!(build_id = %hex, error = %e, "debuginfod fetch failed (transient, will retry)");
+            error!(build_id = %hex, error = %e, "debuginfod fetch failed (transient, will retry)");
+            counter!(METRIC_DEBUGINFOD_ERRORS).increment(1);
             return false;
         }
     };
@@ -60,7 +69,8 @@ pub(crate) async fn ensure_cached(
         }
         Err(e) => {
             // Parse failure is definitive — cache as unparseable sentinel.
-            warn!(build_id = %hex, error = %e, "ELF parse failed, caching as unparseable");
+            error!(build_id = %hex, error = %e, "ELF parse failed, caching as unparseable");
+            counter!(METRIC_PARSE_FAILURES).increment(1);
             cache.insert(*build_id, CacheEntry::Unparseable);
             false
         }
@@ -89,18 +99,27 @@ pub(crate) fn resolve_frame(
     cache: &ObjectCache,
     symbols: &SymbolCache,
 ) -> ResolvedFrame {
+    let start_time = Instant::now();
     let key = (*build_id, file_offset);
 
     // L2 symbol cache hit — entirely lock-free.
     if let Some(cached) = symbols.get(&key) {
+        counter!(METRIC_CACHE_HITS, "kind" => "symbol", "space" => "user").increment(1);
+        histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
+            .record(start_time.elapsed().as_secs_f64());
         return (*cached).clone();
     }
+    counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "user").increment(1);
 
     let hex = build_id::to_hex(build_id);
 
     let Some(obj) = cache.get_object(build_id) else {
+        counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "user").increment(1);
+        histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
+            .record(start_time.elapsed().as_secs_f64());
         return ResolvedFrame::Symbolized(SymbolInfo::unknown());
     };
+    counter!(METRIC_CACHE_HITS, "kind" => "object", "space" => "user").increment(1);
 
     // Segment translation is lock-free — segments are Sync.
     // Only symbolize_vaddr acquires the per-object context Mutex.
@@ -108,6 +127,8 @@ pub(crate) fn resolve_frame(
 
     // Populate L2 for future lookups.
     symbols.insert(key, Arc::new(frame.clone()));
+    histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
+        .record(start_time.elapsed().as_secs_f64());
     frame
 }
 

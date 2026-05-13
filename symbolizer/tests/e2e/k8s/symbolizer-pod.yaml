@@ -36,10 +36,15 @@ spec:
     - "--user-object-budget-bytes=67108864"
     - "--kernel-object-budget-bytes=134217728"
     - "--negative-cache-entries=128"
+    - "--metrics-port=9091"
     ports:
     - containerPort: 50051
       hostPort: 50051
       name: grpc
+      protocol: TCP
+    - containerPort: 9091
+      hostPort: 9091
+      name: metrics
       protocol: TCP
   - name: debuginfod
     image: debuginfod-fixtures:local
