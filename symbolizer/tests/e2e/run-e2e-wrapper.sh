@@ -67,8 +67,7 @@ import_k3s_images bistouri-symbolizer:local debuginfod-fixtures:local
 e2e_info "Running symbolizer E2E tests..."
 
 # sudo is required so /proc/kallsyms exposes real addresses (kptr_restrict).
-# --preserve-env forwards KUBECONFIG, RUST_LOG, and cargo toolchain paths.
-sudo --preserve-env=KUBECONFIG,HOME,PATH \
+sudo --preserve-env=KUBECONFIG,RUST_LOG,HOME \
 	"$(which cargo)" +nightly test -p bistouri-symbolizer --test e2e -- --nocapture
 
 e2e_info "All symbolizer E2E tests passed!"
