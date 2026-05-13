@@ -23,8 +23,7 @@ ensure_kernel_dbgsym() {
 		return
 	fi
 
-	local pkg="linux-image-$(uname -r)-dbgsym"
-	e2e_info "Kernel debug symbols not found — installing $pkg..."
+	e2e_info "Kernel debug symbols not found, installing..."
 
 	# Ubuntu dbgsym packages live in a dedicated repo.
 	if ! grep -q ddebs /etc/apt/sources.list.d/*.list 2>/dev/null; then
@@ -40,17 +39,28 @@ EOF
 		sudo apt-get update -qq
 	fi
 
+	local pkg="linux-image-$(uname -r)-dbgsym"
+	local unsigned_pkg="linux-image-unsigned-$(uname -r)-dbgsym"
+
 	if sudo apt-get install -y --no-install-recommends "$pkg"; then
 		e2e_info "Installed $pkg"
+	elif sudo apt-get install -y --no-install-recommends "$unsigned_pkg"; then
+		e2e_info "Installed $unsigned_pkg"
 	else
-		e2e_warn "Could not install $pkg — Phase 2 (kernel resolution) will be skipped"
+		e2e_warn "Failed to find $pkg or $unsigned_pkg."
+
+		# To troubleshoot CI
+		e2e_warn "Available debug packages for this kernel version:"
+		apt-cache search "linux-image.*$(uname -r).*dbgsym" || true
+
+		e2e_warn "Could not install debug symbols — Phase 2 (kernel resolution) will be skipped"
 	fi
 }
 
 # ── k3s ──────────────────────────────────────────────────────────────
 
 ensure_kernel_dbgsym
-start_fresh_k3s
+start_fre sh_k3s
 register_cleanup_trap
 setup_kubeconfig
 
