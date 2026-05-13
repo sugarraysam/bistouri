@@ -2,7 +2,13 @@ use thiserror::Error;
 
 /// Errors originating from the symbolizer service.
 #[derive(Error, Debug)]
-pub(crate) enum SymbolizerError {
+pub enum SymbolizerError {
+    #[error("HTTP client initialization failed: {source}")]
+    HttpClientInit {
+        #[source]
+        source: reqwest::Error,
+    },
+
     #[error("debuginfod fetch failed for build_id {build_id}: {source}")]
     DebuginfodFetch {
         build_id: String,
@@ -28,4 +34,4 @@ pub(crate) enum SymbolizerError {
 }
 
 /// Result alias for the symbolizer crate.
-pub(crate) type Result<T> = std::result::Result<T, SymbolizerError>;
+pub type Result<T> = std::result::Result<T, SymbolizerError>;

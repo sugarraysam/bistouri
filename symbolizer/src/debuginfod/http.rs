@@ -13,7 +13,7 @@ const FETCH_TIMEOUT_SECS: u64 = 30;
 ///
 /// Expects a debuginfod-compatible server (e.g. `elfutils-debuginfod` sidecar)
 /// at the configured base URL.
-pub(crate) struct HttpDebuginfodClient {
+pub struct HttpDebuginfodClient {
     client: Client,
     base_url: String,
 }
@@ -23,14 +23,11 @@ impl HttpDebuginfodClient {
     ///
     /// `base_url` should be the root URL without trailing slash,
     /// e.g. `http://localhost:8002`.
-    pub(crate) fn new(base_url: String) -> Result<Self> {
+    pub fn new(base_url: String) -> Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
             .build()
-            .map_err(|e| SymbolizerError::DebuginfodFetch {
-                build_id: "client_init".into(),
-                source: e,
-            })?;
+            .map_err(|e| SymbolizerError::HttpClientInit { source: e })?;
 
         Ok(Self { client, base_url })
     }

@@ -4,8 +4,8 @@
 //! 1. **Fetch phase (async)**: ensure all required ELF objects are cached.
 //! 2. **Resolve phase (blocking)**: symbolize frames in `spawn_blocking`.
 
-pub(crate) mod build_id;
-pub(crate) mod cache;
+pub mod build_id;
+pub mod cache;
 pub(crate) mod elf;
 pub(crate) mod kernel;
 pub(crate) mod user;
@@ -31,7 +31,7 @@ const MAX_CONCURRENT_FETCHES: usize = 16;
 ///
 /// Generic over the debuginfod client type to enable static dispatch
 /// (monomorphized at compile time, no vtable overhead).
-pub(crate) struct SessionResolver<C: DebuginfodClient> {
+pub struct SessionResolver<C: DebuginfodClient> {
     cache: Arc<ObjectCache>,
     client: Arc<C>,
     kernel: KernelResolver<C>,
@@ -39,7 +39,7 @@ pub(crate) struct SessionResolver<C: DebuginfodClient> {
 }
 
 impl<C: DebuginfodClient + 'static> SessionResolver<C> {
-    pub(crate) fn new(cache: Arc<ObjectCache>, client: Arc<C>, symbols: Arc<SymbolCache>) -> Self {
+    pub fn new(cache: Arc<ObjectCache>, client: Arc<C>, symbols: Arc<SymbolCache>) -> Self {
         let kernel = KernelResolver::new(cache.clone(), client.clone());
         Self {
             cache,

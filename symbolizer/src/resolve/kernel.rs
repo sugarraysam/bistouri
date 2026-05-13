@@ -119,8 +119,10 @@ fn read_static_text_addr(data: &[u8]) -> Option<u64> {
 
 /// Symbolizes a vmlinux virtual address.
 pub(crate) fn resolve_kernel_addr(obj: &CachedObject, vaddr: u64) -> ResolvedFrame {
-    // Check if the address falls within any of the vmlinux's executable segments.
-    let in_text = obj.segments.iter().any(|seg| seg.contains(vaddr));
+    // Check if the address falls within any of the vmlinux's virtual address segments.
+    // Must use contains_vaddr (not contains) because kernel vaddrs are virtual
+    // addresses after KASLR correction, not file offsets.
+    let in_text = obj.segments.iter().any(|seg| seg.contains_vaddr(vaddr));
     if !in_text {
         // IP is outside vmlinux text — likely a kernel module.
         return ResolvedFrame::Symbolized(SymbolInfo::unresolved_module());

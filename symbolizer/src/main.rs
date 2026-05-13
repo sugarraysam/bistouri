@@ -1,20 +1,13 @@
-mod debuginfod;
-mod error;
-mod model;
-mod resolve;
-mod server;
-mod sink;
-
 use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
 
-use crate::debuginfod::http::HttpDebuginfodClient;
-use crate::resolve::cache::{ObjectCache, SymbolCache};
-use crate::resolve::SessionResolver;
-use crate::server::SymbolizerService;
-use crate::sink::log::LogSink;
+use bistouri_symbolizer::debuginfod::http::HttpDebuginfodClient;
+use bistouri_symbolizer::resolve::cache::{ObjectCache, SymbolCache};
+use bistouri_symbolizer::resolve::SessionResolver;
+use bistouri_symbolizer::server::SymbolizerService;
+use bistouri_symbolizer::sink::log::LogSink;
 
 /// Bistouri symbolizer service — resolves raw stack traces from agents
 /// into human-readable function names, source files, and line numbers.
@@ -63,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the debuginfod client.
     let client = Arc::new(
         HttpDebuginfodClient::new(args.debuginfod_url)
-            .map_err(|e| anyhow::anyhow!("failed to create debuginfod client: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("failed to create debuginfod client: {e:#}"))?,
     );
 
     // Build the object cache (L1: parsed ELF objects).
@@ -75,7 +68,8 @@ async fn main() -> anyhow::Result<()> {
     // Build the resolver.
     let resolver = Arc::new(SessionResolver::new(cache, client, symbols));
 
-    // Build the sink (log sink for now — ClickHouse etc. behind the trait).
+    // Build the sink (LogSink for the default binary — external users
+    // write their own main() with a custom SessionSink).
     let sink = Arc::new(LogSink);
 
     // Build and start the gRPC server.

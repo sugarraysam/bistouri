@@ -1,9 +1,14 @@
-//! Session sink trait — the extensible connector layer.
+//! Session sink trait — the extensible storage layer.
 //!
 //! The sink receives fully-resolved sessions and stores/exports them
-//! to the downstream system. Implementations are swappable at runtime.
+//! to a downstream system. Implementations are swappable via the
+//! generic `S: SessionSink` on `SymbolizerService`.
+//!
+//! To build a custom sink, implement `SessionSink` and wire it into
+//! your own `main()` using the symbolizer library crate. No code
+//! modification required.
 
-pub(crate) mod log;
+pub mod log;
 
 use async_trait::async_trait;
 
@@ -11,8 +16,7 @@ use crate::model::ResolvedSession;
 
 /// Errors from sink implementations.
 #[derive(thiserror::Error, Debug)]
-pub(crate) enum SinkError {
-    #[allow(dead_code)]
+pub enum SinkError {
     #[error("sink write failed: {0}")]
     Write(String),
 }
@@ -22,8 +26,11 @@ pub(crate) enum SinkError {
 /// Implementations:
 /// - `LogSink`: logs resolved sessions (dev/debug, always available)
 /// - Future: ClickHouse TSDB, pprof export, etc.
+///
+/// External users implement this trait and plug it into
+/// `SymbolizerService<C, S>` — no symbolizer code changes needed.
 #[async_trait]
-pub(crate) trait SessionSink: Send + Sync {
+pub trait SessionSink: Send + Sync {
     /// Stores a fully-resolved session.
     ///
     /// Implementations should be idempotent — the symbolizer may retry

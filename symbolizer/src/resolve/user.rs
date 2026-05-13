@@ -104,8 +104,26 @@ pub(crate) fn resolve_frame(
 fn resolve_from_object(obj: &CachedObject, file_offset: u64, build_id_hex: &str) -> ResolvedFrame {
     // file_offset → vaddr via PT_LOAD segment matching.
     let vaddr = match translate_file_offset(&obj.segments, file_offset, build_id_hex) {
-        Ok(v) => v,
-        Err(_) => return ResolvedFrame::Symbolized(SymbolInfo::unknown()),
+        Ok(v) => {
+            debug!(
+                build_id = build_id_hex,
+                file_offset = file_offset,
+                vaddr = format!("0x{v:x}"),
+                segments = obj.segments.len(),
+                "file_offset → vaddr translation succeeded"
+            );
+            v
+        }
+        Err(e) => {
+            debug!(
+                build_id = build_id_hex,
+                file_offset = file_offset,
+                segments = obj.segments.len(),
+                error = %e,
+                "file_offset → vaddr translation failed"
+            );
+            return ResolvedFrame::Symbolized(SymbolInfo::unknown());
+        }
     };
 
     obj.symbolize_vaddr(vaddr)

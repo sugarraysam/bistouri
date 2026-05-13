@@ -176,7 +176,7 @@ unsafe impl Send for CacheEntry {}
 /// Wraps `LruCache` in a `Mutex` for concurrent access from multiple
 /// `spawn_blocking` tasks. The cache is append-only (modulo LRU eviction)
 /// since build IDs are content-addressed.
-pub(crate) struct ObjectCache {
+pub struct ObjectCache {
     objects: Mutex<LruCache<BuildId, CacheEntry>>,
     /// Negative cache: build IDs where debuginfod returned HTTP 404.
     /// Only not-found results live here — parse failures are stored
@@ -191,7 +191,7 @@ impl ObjectCache {
     ///
     /// `capacity`: maximum number of parsed ELF objects to keep.
     /// `negative_capacity`: maximum number of negative (404) entries.
-    pub(crate) fn new(capacity: usize, negative_capacity: usize) -> Self {
+    pub fn new(capacity: usize, negative_capacity: usize) -> Self {
         use std::num::NonZeroUsize;
         Self {
             objects: Mutex::new(LruCache::new(
@@ -277,13 +277,13 @@ pub(crate) type SymbolKey = (BuildId, u64);
 /// Sits in front of the DWARF walk — if a `(build_id, offset)` pair has
 /// been resolved before, we return the cached `ResolvedFrame` without
 /// touching addr2line.
-pub(crate) struct SymbolCache {
+pub struct SymbolCache {
     entries: Mutex<LruCache<SymbolKey, ResolvedFrame>>,
 }
 
 impl SymbolCache {
     /// Creates a new symbol cache with the given capacity.
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         use std::num::NonZeroUsize;
         Self {
             entries: Mutex::new(LruCache::new(
@@ -307,6 +307,7 @@ impl SymbolCache {
 mod tests {
     use super::*;
     use crate::resolve::build_id::BUILD_ID_SIZE;
+    use rstest::rstest;
 
     fn dummy_build_id(byte: u8) -> BuildId {
         [byte; BUILD_ID_SIZE]
@@ -343,8 +344,6 @@ mod tests {
         assert!(cache.with_object(&bid, |_| ()).is_none());
     }
 
-    use rstest::rstest;
-
     /// Symbol cache behavior across capacity and access patterns.
     ///
     /// Each case inserts `keys_to_insert` into a cache of `capacity`,
@@ -371,5 +370,46 @@ mod tests {
 
         let key = (dummy_build_id(lookup_key.0), lookup_key.1);
         assert_eq!(cache.get(&key).is_some(), expect_hit, "{description}");
+    }
+
+    #[test]
+    fn fixture_hello_resolves_target_function() {
+        let fixture_path = format!(
+            "{}/tests/e2e/fixtures/bin/hello",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let elf_bytes = std::fs::read(&fixture_path)
+            .unwrap_or_else(|_| panic!("missing fixture: {fixture_path}"));
+
+        let obj = CachedObject::from_elf_bytes(&elf_bytes, "test", None)
+            .expect("failed to parse fixture ELF");
+
+        assert!(!obj.segments.is_empty(), "expected PT_LOAD segments");
+
+        // file_offset 6213 (0x1845) = target_function from manifest.json
+        let vaddr = crate::resolve::elf::translate_file_offset(&obj.segments, 6213, "test")
+            .expect("segment translation failed for offset 6213");
+
+        eprintln!("vaddr: 0x{vaddr:x}");
+
+        let frame = obj.symbolize_vaddr(vaddr);
+        eprintln!("frame: {:?}", frame);
+
+        match &frame {
+            crate::model::ResolvedFrame::Symbolized(info) => {
+                assert_eq!(
+                    info.function, "target_function",
+                    "expected 'target_function' got '{}'",
+                    info.function
+                );
+            }
+            crate::model::ResolvedFrame::Inlined(frames) => {
+                let names: Vec<&str> = frames.iter().map(|f| f.function.as_str()).collect();
+                assert!(
+                    names.contains(&"target_function"),
+                    "expected 'target_function' in {names:?}"
+                );
+            }
+        }
     }
 }

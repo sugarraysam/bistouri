@@ -40,8 +40,15 @@ pub(crate) struct LoadSegment {
 
 impl LoadSegment {
     /// Returns `true` if `file_offset` falls within this segment's file range.
+    /// Used for user-space frames (BPF gives file offsets).
     pub(crate) fn contains(&self, file_offset: u64) -> bool {
         file_offset >= self.p_offset && file_offset < self.p_offset + self.p_filesz
+    }
+
+    /// Returns `true` if `vaddr` falls within this segment's virtual address range.
+    /// Used for kernel frames (KASLR-corrected IPs are virtual addresses).
+    pub(crate) fn contains_vaddr(&self, vaddr: u64) -> bool {
+        vaddr >= self.p_vaddr && vaddr < self.p_vaddr + self.p_filesz
     }
 
     /// Translates a file offset to a virtual address within this segment.
@@ -55,18 +62,19 @@ impl LoadSegment {
     }
 }
 
-/// Extracts all `PT_LOAD` segments from a parsed ELF object.
+/// Extracts all loadable segments from a parsed ELF object.
+///
+/// The `object` crate's `ObjectSegment` trait documents itself as
+/// "A loadable segment in an Object" — so `segments()` already
+/// filters to PT_LOAD entries. We additionally skip segments with
+/// `p_filesz == 0` (BSS-only) since they have no file data to match.
 pub(crate) fn extract_load_segments<'data>(object: &object::read::File<'data>) -> Vec<LoadSegment> {
     use object::ObjectSegment;
+    use tracing::debug;
 
-    object
+    let segments: Vec<LoadSegment> = object
         .segments()
         .filter_map(|seg| {
-            // object crate doesn't expose segment type directly on all
-            // backends — but elf::FileHeader segments are always typed.
-            // For ELF files, all segments returned by .segments() are
-            // PT_LOAD (object filters them). We still check p_filesz > 0
-            // to skip BSS-only segments.
             let (p_offset, p_filesz) = seg.file_range();
             if p_filesz == 0 {
                 return None;
@@ -77,7 +85,20 @@ pub(crate) fn extract_load_segments<'data>(object: &object::read::File<'data>) -
                 p_filesz,
             })
         })
-        .collect()
+        .collect();
+
+    debug!(count = segments.len(), "extracted load segments");
+    for (i, s) in segments.iter().enumerate() {
+        debug!(
+            idx = i,
+            p_offset = format!("0x{:x}", s.p_offset),
+            p_vaddr = format!("0x{:x}", s.p_vaddr),
+            p_filesz = format!("0x{:x}", s.p_filesz),
+            "  segment"
+        );
+    }
+
+    segments
 }
 
 /// Finds the `PT_LOAD` segment containing `file_offset` and translates

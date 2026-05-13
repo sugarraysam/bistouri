@@ -1,12 +1,12 @@
 /// Resolved symbol information for a single stack frame.
 #[derive(Debug, Clone)]
-pub(crate) struct SymbolInfo {
+pub struct SymbolInfo {
     /// Demangled function name, or a placeholder like `[unknown]`.
-    pub(crate) function: String,
+    pub function: String,
     /// Source file path (if DWARF info available).
-    pub(crate) file: Option<String>,
+    pub file: Option<String>,
     /// Source line number (if DWARF info available).
-    pub(crate) line: Option<u32>,
+    pub line: Option<u32>,
 }
 
 impl SymbolInfo {
@@ -37,7 +37,7 @@ impl SymbolInfo {
 
 /// A fully resolved stack frame.
 #[derive(Debug, Clone)]
-pub(crate) enum ResolvedFrame {
+pub enum ResolvedFrame {
     Symbolized(SymbolInfo),
     /// Inlined frames expanded from a single address.
     Inlined(Vec<SymbolInfo>),
@@ -45,20 +45,20 @@ pub(crate) enum ResolvedFrame {
 
 /// A fully resolved stack trace (kernel + user frames symbolized).
 #[derive(Debug)]
-pub(crate) struct ResolvedTrace {
-    pub(crate) kernel_frames: Vec<ResolvedFrame>,
-    pub(crate) user_frames: Vec<ResolvedFrame>,
-    pub(crate) on_cpu_count: u64,
-    pub(crate) off_cpu_count: u64,
+pub struct ResolvedTrace {
+    pub kernel_frames: Vec<ResolvedFrame>,
+    pub user_frames: Vec<ResolvedFrame>,
+    pub on_cpu_count: u64,
+    pub off_cpu_count: u64,
 }
 
 /// A fully resolved session, ready for downstream storage.
 #[derive(Debug)]
-pub(crate) struct ResolvedSession {
-    pub(crate) session_id: String,
-    pub(crate) pid: u32,
-    pub(crate) comm: String,
-    pub(crate) kernel_release: String,
-    pub(crate) traces: Vec<ResolvedTrace>,
-    pub(crate) total_samples: u64,
+pub struct ResolvedSession {
+    pub session_id: String,
+    pub pid: u32,
+    pub comm: String,
+    pub kernel_release: String,
+    pub traces: Vec<ResolvedTrace>,
+    pub total_samples: u64,
 }

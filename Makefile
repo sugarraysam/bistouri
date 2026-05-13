@@ -24,7 +24,7 @@ build:
 	cargo +nightly build --workspace --all-targets --all-features
 
 test:
-	cargo +nightly test --workspace --all-targets --all-features -- --skip bistouri_e2e
+	cargo +nightly test --workspace --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 docs-check:
 	python3 scripts/check_docs.py

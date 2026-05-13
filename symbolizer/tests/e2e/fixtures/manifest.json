@@ -1,0 +1,42 @@
+{
+  "hello": {
+    "build_id_hex": "e5bbaef2f434873fa879b2f1f12ff1b7d2b70f26",
+    "symbols": {
+      "target_function": {
+        "file_offset": 6213,
+        "file": "hello.c",
+        "line": 12
+      },
+      "outer_call": {
+        "file_offset": 6234,
+        "file": "hello.c",
+        "line": 17
+      },
+      "main": {
+        "file_offset": 6250,
+        "file": "hello.c",
+        "line": 21
+      }
+    }
+  },
+  "multi_dso": {
+    "build_id_hex": "f8ba4f9f28c7376ce0a1f8d123bd279144a12b8d",
+    "symbols": {
+      "compute_checksum": {
+        "file_offset": 6213,
+        "file": "multi_dso.c",
+        "line": 10
+      },
+      "process_packet": {
+        "file_offset": 6279,
+        "file": "multi_dso.c",
+        "line": 18
+      },
+      "main": {
+        "file_offset": 6295,
+        "file": "multi_dso.c",
+        "line": 22
+      }
+    }
+  }
+}

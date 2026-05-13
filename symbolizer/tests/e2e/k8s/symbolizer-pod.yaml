@@ -1,0 +1,60 @@
+# Bistouri Symbolizer pod for E2E integration tests.
+#
+# Two containers:
+#   1. symbolizer — gRPC server (LogSink), assertions via kubectl logs
+#   2. debuginfod — indexes fixture ELFs + host kernel debuginfo locally,
+#      federates upstream for distro packages
+#
+# hostNetwork: true so the test harness on the host can reach the
+# symbolizer's gRPC port directly on localhost.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bistouri-symbolizer
+  labels:
+    app: bistouri-symbolizer
+spec:
+  hostNetwork: true
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+  - name: symbolizer
+    image: bistouri-symbolizer:local
+    imagePullPolicy: Never
+    args:
+    - "--listen-addr=0.0.0.0:50051"
+    - "--debuginfod-url=http://localhost:8002"
+    - "--cache-size=64"
+    - "--negative-cache-size=128"
+    ports:
+    - containerPort: 50051
+      hostPort: 50051
+      name: grpc
+      protocol: TCP
+    env:
+    - name: RUST_LOG
+      value: "bistouri_symbolizer=debug"
+  - name: debuginfod
+    image: debuginfod-fixtures:local
+    imagePullPolicy: Never
+    # Override entrypoint to scan both baked-in fixtures AND host
+    # kernel debug symbols mounted from the host's /usr/lib/debug/boot/.
+    command: ["debuginfod", "-F", "-t", "0", "-vvv", "/fixtures", "/host-debug"]
+    ports:
+    - containerPort: 8002
+      name: debuginfod
+      protocol: TCP
+    volumeMounts:
+    - name: debuginfod-cache
+      mountPath: /root/.debuginfod_client
+    - name: host-debug
+      mountPath: /host-debug
+      readOnly: true
+  volumes:
+  - name: debuginfod-cache
+    emptyDir: {}
+  - name: host-debug
+    hostPath:
+      path: /usr/lib/debug/boot
+      type: DirectoryOrCreate

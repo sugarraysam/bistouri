@@ -1,0 +1,31 @@
+# vim: ft=dockerfile
+# Debuginfod sidecar for symbolizer E2E tests.
+#
+# Serves fixture ELF binaries locally via -F and federates to
+# debuginfod.elfutils.org for vmlinux / distro debuginfo.
+#
+# The fixture ELFs are baked into the image at build time.
+# Federation handles kernel debuginfo on demand.
+#
+# Uses Debian because Alpine's elfutils package does NOT include
+# the debuginfod server binary.
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    debuginfod \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-compiled fixture ELF binaries into the index directory.
+COPY fixtures/bin/ /fixtures/
+
+EXPOSE 8002
+
+# -F: index /fixtures for ELF files by build_id (local fixtures)
+# -t 0: single scan — no periodic rescan needed for static fixtures
+# -v: verbose logging for debugging indexing issues
+# DEBUGINFOD_URLS: federate upstream for vmlinux and distro packages
+ENV DEBUGINFOD_URLS="https://debuginfod.ubuntu.com/ https://debuginfod.elfutils.org/"
+
+ENTRYPOINT ["debuginfod", "-F", "-t", "0", "-v", "/fixtures"]

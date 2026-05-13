@@ -16,13 +16,13 @@ use bistouri_api::v1::capture_service_server::CaptureService;
 ///
 /// Generic over both the debuginfod client and the sink to enable
 /// static dispatch throughout the pipeline — no vtable overhead.
-pub(crate) struct SymbolizerService<C: DebuginfodClient, S: SessionSink> {
+pub struct SymbolizerService<C: DebuginfodClient, S: SessionSink> {
     resolver: Arc<SessionResolver<C>>,
     sink: Arc<S>,
 }
 
 impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> SymbolizerService<C, S> {
-    pub(crate) fn new(resolver: Arc<SessionResolver<C>>, sink: Arc<S>) -> Self {
+    pub fn new(resolver: Arc<SessionResolver<C>>, sink: Arc<S>) -> Self {
         Self { resolver, sink }
     }
 }
