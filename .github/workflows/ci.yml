@@ -38,7 +38,10 @@ jobs:
       run: cargo +nightly build --workspace --verbose --all-targets --all-features
 
     - name: Run tests
-      run: cargo +nightly test --workspace --verbose --all-targets --all-features -- --skip bistouri_e2e
+      run: |
+        cargo +nightly test --workspace --verbose --all-targets --all-features -- \
+          --skip bistouri_e2e \
+          --skip symbolizer_e2e
 
   e2e_tests:
     name: Agent E2E Integration Tests

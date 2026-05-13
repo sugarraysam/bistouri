@@ -33,8 +33,9 @@ spec:
     - "bistouri_symbolizer=debug"
     - "--listen-addr=0.0.0.0:50051"
     - "--debuginfod-url=http://localhost:8002"
-    - "--cache-size=64"
-    - "--negative-cache-size=128"
+    - "--user-object-budget-bytes=67108864"
+    - "--kernel-object-budget-bytes=134217728"
+    - "--negative-cache-entries=128"
     ports:
     - containerPort: 50051
       hostPort: 50051

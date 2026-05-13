@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::build_id;
-use super::cache::{CacheEntry, CachedObject, ObjectCache};
+use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache};
 use crate::debuginfod::{ArtifactKind, DebuginfodClient};
 use crate::model::{ResolvedFrame, SymbolInfo};
 
@@ -26,22 +26,22 @@ pub(crate) const DEFAULT_STATIC_TEXT_ADDR: u64 = 0xffff_ffff_8100_0000;
 
 /// Long-lived kernel frame resolver.
 ///
-/// Owns shared references to the object cache and debuginfod client,
-/// avoiding repeated parameter passing on the hot path. Generic over
-/// the client type to eliminate vtable dispatch on cache-miss fetches.
+/// Owns cloned cache handles (moka caches are internally `Arc`-wrapped,
+/// so cloning is a pointer bump). Generic over the client type to
+/// eliminate vtable dispatch on cache-miss fetches.
 pub(crate) struct KernelResolver<C> {
-    cache: Arc<ObjectCache>,
+    cache: ObjectCache,
+    negative: NegativeCache,
     client: Arc<C>,
 }
 
 impl<C: DebuginfodClient> KernelResolver<C> {
-    pub(crate) fn new(cache: Arc<ObjectCache>, client: Arc<C>) -> Self {
-        Self { cache, client }
-    }
-
-    /// Returns a clone of the cache Arc for use in `spawn_blocking` closures.
-    pub(crate) fn cache_ref(&self) -> Arc<ObjectCache> {
-        self.cache.clone()
+    pub(crate) fn new(cache: ObjectCache, negative: NegativeCache, client: Arc<C>) -> Self {
+        Self {
+            cache,
+            negative,
+            client,
+        }
     }
 
     /// Ensures the vmlinux debuginfo is cached for the given kernel build ID.
@@ -63,7 +63,7 @@ impl<C: DebuginfodClient> KernelResolver<C> {
             return true;
         }
 
-        if self.cache.is_negative(bid) {
+        if self.negative.is_negative(bid) {
             return false;
         }
 
@@ -75,7 +75,7 @@ impl<C: DebuginfodClient> KernelResolver<C> {
             Ok(None) => {
                 // Definitive 404 — negative cache.
                 debug!(build_id = %hex, "vmlinux not found in debuginfod, negative caching");
-                self.cache.insert_negative(*bid);
+                self.negative.insert(*bid);
                 return false;
             }
             Err(e) => {
@@ -90,7 +90,8 @@ impl<C: DebuginfodClient> KernelResolver<C> {
 
         match CachedObject::from_elf_bytes(&bytes, &hex, static_text_addr) {
             Ok(parsed) => {
-                self.cache.insert(*bid, CacheEntry::Parsed(parsed));
+                self.cache
+                    .insert(*bid, CacheEntry::Parsed(Arc::new(parsed)));
                 true
             }
             Err(e) => {

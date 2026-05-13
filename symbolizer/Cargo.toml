@@ -21,7 +21,7 @@ addr2line = { version = "0.26", default-features = false, features = ["std", "cp
 object = { version = "0.39", default-features = false, features = ["read", "elf", "std"] }
 gimli = "0.33"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-lru = "0.18"
+moka = { version = "0.12", features = ["sync"] }
 async-trait = "0.1"
 faster-hex = "0.10"
 

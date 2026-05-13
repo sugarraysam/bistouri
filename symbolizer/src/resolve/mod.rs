@@ -16,9 +16,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use self::build_id::{BuildId, BUILD_ID_SIZE};
-use self::cache::{ObjectCache, SymbolCache};
+use self::cache::{NegativeCache, ObjectCache, SymbolCache};
 use self::kernel::KernelResolver;
-use self::user::UserResolver;
 use crate::debuginfod::DebuginfodClient;
 use crate::model::{ResolvedFrame, ResolvedSession, ResolvedTrace, SymbolInfo};
 use bistouri_api::v1 as proto;
@@ -32,22 +31,37 @@ const MAX_CONCURRENT_FETCHES: usize = 16;
 ///
 /// Generic over the debuginfod client type to enable static dispatch
 /// (monomorphized at compile time, no vtable overhead).
+///
+/// Caches are split into kernel and user-space pools so vmlinux objects
+/// (200+ MB) are never evicted by user-space churn.
 pub struct SessionResolver<C: DebuginfodClient> {
-    cache: Arc<ObjectCache>,
+    user_objects: ObjectCache,
+    kernel_objects: ObjectCache,
+    user_symbols: SymbolCache,
+    kernel_symbols: SymbolCache,
+    negative: NegativeCache,
+    client: Arc<C>,
     kernel: KernelResolver<C>,
-    user: UserResolver<C>,
-    symbols: Arc<SymbolCache>,
 }
 
 impl<C: DebuginfodClient + 'static> SessionResolver<C> {
-    pub fn new(cache: Arc<ObjectCache>, client: Arc<C>, symbols: Arc<SymbolCache>) -> Self {
-        let kernel = KernelResolver::new(cache.clone(), client.clone());
-        let user = UserResolver::new(cache.clone(), client);
+    pub fn new(
+        user_objects: ObjectCache,
+        kernel_objects: ObjectCache,
+        user_symbols: SymbolCache,
+        kernel_symbols: SymbolCache,
+        negative: NegativeCache,
+        client: Arc<C>,
+    ) -> Self {
+        let kernel = KernelResolver::new(kernel_objects.clone(), negative.clone(), client.clone());
         Self {
-            cache,
+            user_objects,
+            kernel_objects,
+            user_symbols,
+            kernel_symbols,
+            negative,
+            client,
             kernel,
-            user,
-            symbols,
         }
     }
 
@@ -74,27 +88,47 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
             user_prefetch.await;
         }
 
+        // Pre-extract metadata before moving the payload into spawn_blocking.
+        let session_id = payload.session_id.clone();
+        let pid = payload.metadata.as_ref().map(|m| m.pid).unwrap_or(0);
+        let total_samples = payload.total_samples;
+        let comm = payload
+            .metadata
+            .as_ref()
+            .map(|m| m.comm.clone())
+            .unwrap_or_else(|| "<unknown>".into());
+
         // Phase 2: Symbolize in blocking context. Payload is moved, not cloned.
-        let cache = self.cache.clone();
-        let kernel_cache = self.kernel.cache_ref();
-        let symbols = self.symbols.clone();
+        // moka caches are Clone (internally Arc-wrapped) — cheap to move.
+        let user_objects = self.user_objects.clone();
+        let kernel_objects = self.kernel_objects.clone();
+        let user_symbols = self.user_symbols.clone();
+        let kernel_symbols = self.kernel_symbols.clone();
         match tokio::task::spawn_blocking(move || {
-            resolve_session_blocking(payload, &cache, &kernel_cache, &symbols)
+            resolve_session_blocking(
+                payload,
+                &user_objects,
+                &kernel_objects,
+                &user_symbols,
+                &kernel_symbols,
+            )
         })
         .await
         {
             Ok(resolved) => resolved,
             Err(e) => {
-                // Task panicked or was cancelled. Use static placeholders
-                // instead of pre-cloning metadata on the happy path.
-                error!(error = %e, "resolve task panicked or was cancelled");
+                error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "resolve task panicked or was cancelled"
+                );
                 ResolvedSession {
-                    session_id: String::new(),
-                    pid: 0,
-                    comm: "<panic>".into(),
+                    session_id,
+                    pid,
+                    comm,
                     kernel_release: String::new(),
                     traces: Vec::new(),
-                    total_samples: 0,
+                    total_samples,
                 }
             }
         }
@@ -118,11 +152,11 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
         for chunk in unique_ids.chunks(MAX_CONCURRENT_FETCHES) {
             let mut set = tokio::task::JoinSet::new();
             for &bid in chunk {
-                let user = self.user.cache_ref();
-                let client = Arc::clone(&self.user.client_ref());
-                let user_resolver = UserResolver::new(user, client);
+                let cache = self.user_objects.clone();
+                let negative = self.negative.clone();
+                let client = self.client.clone();
                 set.spawn(async move {
-                    user_resolver.ensure_cached(&bid).await;
+                    user::ensure_cached(&bid, &cache, &negative, client.as_ref()).await;
                 });
             }
             // Await all in this batch before starting the next.
@@ -143,9 +177,10 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
 /// fields are moved (not cloned) into the `ResolvedSession`.
 fn resolve_session_blocking(
     payload: proto::SessionPayload,
-    cache: &ObjectCache,
-    kernel_cache: &ObjectCache,
-    symbols: &SymbolCache,
+    user_objects: &ObjectCache,
+    kernel_objects: &ObjectCache,
+    user_symbols: &SymbolCache,
+    kernel_symbols: &SymbolCache,
 ) -> ResolvedSession {
     // Pre-extract kernel metadata once, not per-frame.
     let metadata = payload.metadata.as_ref();
@@ -168,8 +203,8 @@ fn resolve_session_blocking(
                                 raw_ip,
                                 runtime_text_addr,
                                 kernel_bid,
-                                kernel_cache,
-                                symbols,
+                                kernel_objects,
+                                kernel_symbols,
                             )
                         })
                         .collect()
@@ -180,7 +215,9 @@ fn resolve_session_blocking(
                 .map(|t| {
                     t.user_frames
                         .iter()
-                        .map(|uf| resolve_user_frame(uf, &payload.mappings, cache, symbols))
+                        .map(|uf| {
+                            resolve_user_frame(uf, &payload.mappings, user_objects, user_symbols)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -222,8 +259,9 @@ fn resolve_session_blocking(
 
 /// Kernel frame resolution on the blocking path.
 ///
-/// Uses the pre-extracted build ID reference and cached `static_text_addr` —
-/// no per-frame slice conversion or vmlinux re-parsing.
+/// Metadata (static_text_addr) is read lock-free from `Arc<CachedObject>`.
+/// L2 symbol cache is checked before any per-object lock. Only the DWARF
+/// walk (`symbolize_vaddr`) acquires the per-object context Mutex.
 fn resolve_kernel_frame_blocking(
     raw_ip: u64,
     runtime_text_addr: u64,
@@ -235,26 +273,28 @@ fn resolve_kernel_frame_blocking(
         return ResolvedFrame::Symbolized(SymbolInfo::unknown());
     };
 
-    cache
-        .with_object(bid, |obj| {
-            let static_text = obj
-                .static_text_addr
-                .unwrap_or(kernel::DEFAULT_STATIC_TEXT_ADDR);
-            let vmlinux_vaddr = raw_ip
-                .wrapping_sub(runtime_text_addr)
-                .wrapping_add(static_text);
+    let Some(obj) = cache.get_object(bid) else {
+        return ResolvedFrame::Symbolized(SymbolInfo::unknown());
+    };
 
-            // L2 symbol cache check for kernel frames.
-            let key = (*bid, vmlinux_vaddr);
-            if let Some(cached) = symbols.get(&key) {
-                return ResolvedFrame::clone(&cached);
-            }
+    // Lock-free metadata access — segments and static_text_addr are Sync.
+    let static_text = obj
+        .static_text_addr
+        .unwrap_or(kernel::DEFAULT_STATIC_TEXT_ADDR);
+    let vmlinux_vaddr = raw_ip
+        .wrapping_sub(runtime_text_addr)
+        .wrapping_add(static_text);
 
-            let frame = kernel::resolve_kernel_addr(obj, vmlinux_vaddr);
-            symbols.insert(key, frame.clone());
-            frame
-        })
-        .unwrap_or(ResolvedFrame::Symbolized(SymbolInfo::unknown()))
+    // L2 symbol cache check — entirely lock-free.
+    let key = (*bid, vmlinux_vaddr);
+    if let Some(cached) = symbols.get(&key) {
+        return (*cached).clone();
+    }
+
+    // Only the DWARF walk acquires the per-object context Mutex.
+    let frame = kernel::resolve_kernel_addr(&obj, vmlinux_vaddr);
+    symbols.insert(key, Arc::new(frame.clone()));
+    frame
 }
 
 /// Resolves a single user-space frame from its proto representation.

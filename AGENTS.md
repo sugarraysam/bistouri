@@ -69,6 +69,11 @@ symbolizer service for cross-host symbol resolution.
   value must be moved into a consuming call, read any fields needed for
   logging/error context from the result of that call rather than cloning
   them beforehand.
+- Units in Names: Variables, struct fields, CLI flags, and environment
+  variables that carry dimensional values must include the unit as a
+  suffix (e.g. `timeout_secs`, `budget_bytes`, `capacity_entries`,
+  `interval_ms`). This makes the expected unit self-documenting and
+  prevents callers from passing the wrong magnitude.
 
 ### 2. eBPF Specific Guidelines (agent/ crate only)
 

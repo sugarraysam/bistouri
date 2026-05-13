@@ -4,7 +4,9 @@
 //! - `GET /buildid/<hex_build_id>/executable` → stripped ELF
 //! - `GET /buildid/<hex_build_id>/debuginfo`  → DWARF debuginfo
 
+pub mod filesystem;
 pub mod http;
+pub mod tiered;
 
 /// Artifact type to request from debuginfod.
 #[derive(Debug, Clone, Copy)]

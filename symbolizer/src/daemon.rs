@@ -13,24 +13,16 @@ use tonic::transport::Server;
 use tracing::info;
 
 use crate::debuginfod::DebuginfodClient;
-use crate::resolve::cache::{ObjectCache, SymbolCache};
+use crate::resolve::cache::{NegativeCache, ObjectCache, SymbolCache};
 use crate::resolve::SessionResolver;
 use crate::server::SymbolizerService;
 use crate::sink::SessionSink;
 
 /// Configuration for the symbolizer daemon.
-///
-/// Validated on construction — all capacities must be > 0.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     /// gRPC listen address.
     pub listen_addr: SocketAddr,
-    /// Maximum number of parsed ELF objects to cache (L1).
-    pub cache_size: usize,
-    /// Maximum number of negative cache entries (404'd build IDs).
-    pub negative_cache_size: usize,
-    /// Maximum number of resolved symbols to cache (L2).
-    pub symbol_cache_size: usize,
 }
 
 /// Top-level lifecycle manager for the symbolizer service.
@@ -47,10 +39,16 @@ impl SymbolizerDaemon {
     ///
     /// Returns immediately with a running daemon. Call `shutdown()` to
     /// stop the server gracefully.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start<C, S>(
         config: DaemonConfig,
         client: Arc<C>,
         sink: Arc<S>,
+        user_objects: ObjectCache,
+        kernel_objects: ObjectCache,
+        user_symbols: SymbolCache,
+        kernel_symbols: SymbolCache,
+        negative: NegativeCache,
     ) -> anyhow::Result<Self>
     where
         C: DebuginfodClient + 'static,
@@ -58,17 +56,15 @@ impl SymbolizerDaemon {
     {
         let cancel = CancellationToken::new();
 
-        // Build the object cache (L1: parsed ELF objects).
-        let cache = Arc::new(ObjectCache::new(
-            config.cache_size,
-            config.negative_cache_size,
-        ));
-
-        // Build the symbol cache (L2: resolved frames).
-        let symbols = Arc::new(SymbolCache::new(config.symbol_cache_size));
-
         // Build the resolver.
-        let resolver = Arc::new(SessionResolver::new(cache, client, symbols));
+        let resolver = Arc::new(SessionResolver::new(
+            user_objects,
+            kernel_objects,
+            user_symbols,
+            kernel_symbols,
+            negative,
+            client,
+        ));
 
         // Build the gRPC service.
         let service = SymbolizerService::new(resolver, sink);
