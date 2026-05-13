@@ -83,11 +83,11 @@ jobs:
     - name: Run TSAN tests
       run: make test-tsan
 
-  e2e_tests:
+  agent_e2e_tests:
     name: Agent E2E Integration Tests
     runs-on: ubuntu-latest
     needs: build_and_test
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@v6
 
@@ -109,6 +109,30 @@ jobs:
 
     - name: Agent E2E tests
       run: make -C agent e2e
+
+  symbolizer_e2e_tests:
+    name: Symbolizer E2E Integration Tests
+    runs-on: ubuntu-latest
+    needs: build_and_test
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy, rustfmt
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install build dependencies
+      run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev protobuf-compiler
+
+    - name: Install k3s (skip systemd)
+      run: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_ENABLE=true sh -
+        k3s --version
 
     - name: Symbolizer E2E tests
       run: make -C symbolizer e2e
