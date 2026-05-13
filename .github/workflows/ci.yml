@@ -43,6 +43,46 @@ jobs:
           --skip bistouri_e2e \
           --skip symbolizer_e2e
 
+  test_asan:
+    name: Test (ASAN)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rust-src
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev protobuf-compiler
+
+    - name: Run ASAN tests
+      run: make test-asan
+
+  test_tsan:
+    name: Test (TSAN)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rust-src
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev protobuf-compiler
+
+    - name: Run TSAN tests
+      run: make test-tsan
+
   e2e_tests:
     name: Agent E2E Integration Tests
     runs-on: ubuntu-latest

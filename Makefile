@@ -1,4 +1,4 @@
-.PHONY: all help fmt clippy build test docs-check ci validate-deployment generate-crd clean
+.PHONY: all help fmt clippy build test test-asan test-tsan docs-check ci validate-deployment generate-crd clean
 
 all: ci
 
@@ -9,6 +9,8 @@ help:
 	@echo "  clippy              Lint all crates"
 	@echo "  build               Build all crates"
 	@echo "  test                Run unit tests for all crates"
+	@echo "  test-asan           Run unit tests with AddressSanitizer (requires nightly and rust-src)"
+	@echo "  test-tsan           Run unit tests with ThreadSanitizer (requires nightly and rust-src)"
 	@echo "  docs-check          Verify _quarto.yml chapters exist on disk"
 	@echo "  validate-deployment Dry-run kubectl apply on deployment/ manifests"
 	@echo "  generate-crd        Regenerate deployment/crd/bistouriconfig.yaml from Rust types"
@@ -25,6 +27,12 @@ build:
 
 test:
 	cargo +nightly test --workspace --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
+
+test-asan:
+	RUSTFLAGS="-Zsanitizer=address" cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
+
+test-tsan:
+	RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 docs-check:
 	python3 scripts/check_docs.py
