@@ -155,6 +155,25 @@ pub(crate) struct CachedObject {
 }
 
 impl CachedObject {
+    /// Defines the strict set of DWARF sections required for address-to-line
+    /// symbolization. Any section not in this list is dropped to save memory.
+    const REQUIRED_DWARF_SECTIONS: &'static [&'static str] = &[
+        ".debug_abbrev",
+        ".debug_addr",        // DWARF 5
+        ".debug_aranges",     // Fast address lookup
+        ".debug_info",        // Core DIEs (subprograms, inlines)
+        ".debug_line",        // Line number programs
+        ".debug_line_str",    // DWARF 5 line strings
+        ".debug_ranges",      // DWARF 4 address ranges
+        ".debug_rnglists",    // DWARF 5 address ranges
+        ".debug_str",         // Strings (function names)
+        ".debug_str_offsets", // DWARF 5 string offsets
+    ];
+
+    fn is_essential_section(name: &str) -> bool {
+        Self::REQUIRED_DWARF_SECTIONS.contains(&name)
+    }
+
     /// Parses raw ELF bytes into a `CachedObject`.
     ///
     /// Creates a shared `Arc<gimli::Dwarf>` and seeds the context pool
@@ -182,10 +201,17 @@ impl CachedObject {
         // Each section is loaded into an Arc<[u8]> so the Context owns
         // its data, is Send, and can outlive the raw ELF bytes.
         let dwarf = gimli::Dwarf::load(|section_id| -> std::result::Result<_, gimli::Error> {
-            let data = object
-                .section_by_name(section_id.name())
-                .and_then(|s| s.uncompressed_data().ok())
-                .unwrap_or(std::borrow::Cow::Borrowed(&[]));
+            let section_name = section_id.name();
+
+            let data = if Self::is_essential_section(section_name) {
+                object
+                    .section_by_name(section_name)
+                    .and_then(|s| s.uncompressed_data().ok())
+                    .unwrap_or(std::borrow::Cow::Borrowed(&[]))
+            } else {
+                std::borrow::Cow::Borrowed(&[] as &[u8])
+            };
+
             dwarf_bytes += data.len();
             Ok(gimli::EndianArcSlice::new(
                 Arc::from(&*data),
