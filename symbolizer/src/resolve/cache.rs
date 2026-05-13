@@ -419,6 +419,7 @@ mod tests {
     use super::*;
     use crate::resolve::build_id::BUILD_ID_SIZE;
     use rstest::rstest;
+    use std::sync::{Arc, Barrier};
 
     fn dummy_build_id(byte: u8) -> BuildId {
         [byte; BUILD_ID_SIZE]
@@ -541,11 +542,17 @@ mod tests {
         let vaddr = crate::resolve::elf::translate_file_offset(&obj.segments, 6213, "test")
             .expect("segment translation failed for offset 6213");
 
-        // Spawn 8 threads all resolving the same vaddr concurrently.
+        // Spawn 8 threads all resolving the same vaddr concurrently. Use barrier
+        // to ensure concurrency.
+        let barrier = Arc::new(Barrier::new(8));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let obj = obj.clone();
-                std::thread::spawn(move || obj.symbolize_vaddr(vaddr))
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    obj.symbolize_vaddr(vaddr)
+                })
             })
             .collect();
 

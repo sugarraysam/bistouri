@@ -32,7 +32,7 @@ test-asan:
 	RUSTFLAGS="-Zsanitizer=address" cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 test-tsan:
-	RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
+	TSAN_OPTIONS="suppressions=$(CURDIR)/tsan_suppressions.txt" RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 docs-check:
 	python3 scripts/check_docs.py

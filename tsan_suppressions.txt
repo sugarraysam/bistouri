@@ -1,0 +1,4 @@
+# Syntax docs: https://github.com/google/sanitizers/wiki/threadsanitizersuppressions
+
+# Moka uses deferred reclamation through crossbeam_epoch which yields false positives.
+race:crossbeam_epoch
