@@ -61,7 +61,7 @@ EOF
 # ── k3s ──────────────────────────────────────────────────────────────
 
 ensure_kernel_dbgsym
-start_fre sh_k3s
+start_fresh_k3s
 register_cleanup_trap
 setup_kubeconfig
 
