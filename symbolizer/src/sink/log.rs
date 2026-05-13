@@ -11,6 +11,7 @@ use super::{SessionSink, SinkError};
 use crate::model::{ResolvedFrame, ResolvedSession, SymbolInfo};
 
 /// Sink that logs resolved sessions to the tracing subscriber.
+#[derive(Debug)]
 pub struct LogSink;
 
 #[async_trait]

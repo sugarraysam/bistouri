@@ -7,8 +7,9 @@
 //! # Example: custom sink
 //!
 //! ```ignore
+//! use std::sync::Arc;
+//! use bistouri_symbolizer::daemon::{DaemonConfig, SymbolizerDaemon};
 //! use bistouri_symbolizer::sink::SessionSink;
-//! use bistouri_symbolizer::server::SymbolizerService;
 //!
 //! struct ClickHouseSink { /* ... */ }
 //!
@@ -19,10 +20,13 @@
 //!     }
 //! }
 //!
-//! // Wire it in — the symbolizer code is unchanged:
-//! let service = SymbolizerService::new(resolver, Arc::new(ClickHouseSink { /* ... */ }));
+//! // Wire it in — the symbolizer library handles everything:
+//! let daemon = SymbolizerDaemon::start(config, client, Arc::new(ClickHouseSink { })).await?;
+//! tokio::signal::ctrl_c().await?;
+//! daemon.shutdown().await;
 //! ```
 
+pub mod daemon;
 pub mod debuginfod;
 pub mod model;
 pub mod resolve;

@@ -3,10 +3,8 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::info;
 
+use bistouri_symbolizer::daemon::{DaemonConfig, SymbolizerDaemon};
 use bistouri_symbolizer::debuginfod::http::HttpDebuginfodClient;
-use bistouri_symbolizer::resolve::cache::{ObjectCache, SymbolCache};
-use bistouri_symbolizer::resolve::SessionResolver;
-use bistouri_symbolizer::server::SymbolizerService;
 use bistouri_symbolizer::sink::log::LogSink;
 
 /// Bistouri symbolizer service — resolves raw stack traces from agents
@@ -33,18 +31,29 @@ struct Args {
     /// Maximum number of resolved symbols to cache (L2 symbol cache).
     #[arg(long, default_value_t = 100_000, env = "SYMBOLIZER_SYMBOL_CACHE_SIZE")]
     symbol_cache_size: usize,
+
+    /// Log level filter (e.g. "info", "bistouri_symbolizer=debug").
+    /// Falls back to RUST_LOG env var, then "info".
+    #[arg(long, env = "RUST_LOG")]
+    log_level: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
+
+    // Log level resolution: --log-level flag > RUST_LOG env > "info"
+    // Clap's `env` attribute handles flag > env precedence, so
+    // args.log_level is Some if either was set.
+    let filter = args
+        .log_level
+        .as_deref()
+        .unwrap_or("info")
+        .to_string();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
+        .init();
 
     info!(
         listen_addr = %args.listen_addr,
@@ -53,35 +62,27 @@ async fn main() -> anyhow::Result<()> {
         "starting bistouri-symbolizer"
     );
 
-    // Build the debuginfod client.
     let client = Arc::new(
         HttpDebuginfodClient::new(args.debuginfod_url)
             .map_err(|e| anyhow::anyhow!("failed to create debuginfod client: {e:#}"))?,
     );
 
-    // Build the object cache (L1: parsed ELF objects).
-    let cache = Arc::new(ObjectCache::new(args.cache_size, args.negative_cache_size));
-
-    // Build the symbol cache (L2: resolved frames).
-    let symbols = Arc::new(SymbolCache::new(args.symbol_cache_size));
-
-    // Build the resolver.
-    let resolver = Arc::new(SessionResolver::new(cache, client, symbols));
-
-    // Build the sink (LogSink for the default binary — external users
-    // write their own main() with a custom SessionSink).
     let sink = Arc::new(LogSink);
 
-    // Build and start the gRPC server.
-    let service = SymbolizerService::new(resolver, sink);
+    let config = DaemonConfig {
+        listen_addr: args.listen_addr.parse()?,
+        cache_size: args.cache_size,
+        negative_cache_size: args.negative_cache_size,
+        symbol_cache_size: args.symbol_cache_size,
+    };
 
-    let addr = args.listen_addr.parse()?;
-    info!(addr = %addr, "gRPC server listening");
+    let daemon = SymbolizerDaemon::start(config, client, sink).await?;
 
-    tonic::transport::Server::builder()
-        .add_service(bistouri_api::v1::capture_service_server::CaptureServiceServer::new(service))
-        .serve(addr)
-        .await?;
+    tokio::signal::ctrl_c().await?;
+    info!("received Ctrl-C, shutting down");
+
+    daemon.shutdown().await;
+    info!("shutdown complete");
 
     Ok(())
 }

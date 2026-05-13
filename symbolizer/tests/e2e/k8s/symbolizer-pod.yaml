@@ -7,6 +7,12 @@
 #
 # hostNetwork: true so the test harness on the host can reach the
 # symbolizer's gRPC port directly on localhost.
+#
+# NOTE: /host-debug is mounted read-only from the host's full
+# /usr/lib/debug directory. The debuginfod command targets only
+# the boot/ subdirectory. Multiple vmlinux files (~450 MB each)
+# live there; scanning is unavoidably slow but completes within
+# ~120 seconds.
 
 apiVersion: v1
 kind: Pod
@@ -23,6 +29,8 @@ spec:
     image: bistouri-symbolizer:local
     imagePullPolicy: Never
     args:
+    - "--log-level"
+    - "bistouri_symbolizer=debug"
     - "--listen-addr=0.0.0.0:50051"
     - "--debuginfod-url=http://localhost:8002"
     - "--cache-size=64"
@@ -32,14 +40,11 @@ spec:
       hostPort: 50051
       name: grpc
       protocol: TCP
-    env:
-    - name: RUST_LOG
-      value: "bistouri_symbolizer=debug"
   - name: debuginfod
     image: debuginfod-fixtures:local
     imagePullPolicy: Never
-    # Override entrypoint to scan both baked-in fixtures AND host
-    # kernel debug symbols mounted from the host's /usr/lib/debug/boot/.
+    # Scan baked-in fixtures AND the host kernel's debug symbols.
+    # -F: recursive file scan.  -t 0: foreground scan, no rescans.
     command: ["debuginfod", "-F", "-t", "0", "-vvv", "/fixtures", "/host-debug"]
     ports:
     - containerPort: 8002

@@ -5,13 +5,7 @@ use std::path::Path;
 use thiserror::Error;
 
 /// Size of a GNU build ID in bytes (SHA-1 hash).
-const BUILD_ID_SIZE: usize = 20;
-
-/// ELF note type for GNU build ID (`NT_GNU_BUILD_ID`).
-const NT_GNU_BUILD_ID: u32 = 3;
-
-/// ELF note owner name for GNU notes.
-const GNU_NOTE_NAME: &[u8] = b"GNU\0";
+const BUILD_ID_SIZE: usize = bistouri_sys::kernel::BUILD_ID_SIZE;
 
 #[derive(Error, Debug)]
 pub(crate) enum KernelMetaError {
@@ -27,12 +21,6 @@ pub(crate) enum KernelMetaError {
          kernel may not have been built with CONFIG_BUILD_ID"
     )]
     BuildIdNotFound,
-
-    #[error(
-        "kernel build ID is {actual} bytes, expected {BUILD_ID_SIZE} — \
-         unsupported hash algorithm"
-    )]
-    BuildIdWrongSize { actual: usize },
 
     #[error(
         "_text symbol not found in {path} — cannot determine KASLR base. \
@@ -122,55 +110,8 @@ impl KernelMeta {
                 source: e,
             })?;
 
-        Self::parse_build_id_from_notes(&data)
-    }
-
-    /// Parses a GNU build ID from raw ELF note data.
-    /// Extracted for testability — the public API reads from sysfs.
-    fn parse_build_id_from_notes(data: &[u8]) -> Result<[u8; BUILD_ID_SIZE], KernelMetaError> {
-        let mut offset = 0;
-
-        while offset + 12 <= data.len() {
-            let n_namesz = u32::from_ne_bytes(
-                data[offset..offset + 4]
-                    .try_into()
-                    .map_err(|_| KernelMetaError::BuildIdNotFound)?,
-            ) as usize;
-            let n_descsz = u32::from_ne_bytes(
-                data[offset + 4..offset + 8]
-                    .try_into()
-                    .map_err(|_| KernelMetaError::BuildIdNotFound)?,
-            ) as usize;
-            let n_type = u32::from_ne_bytes(
-                data[offset + 8..offset + 12]
-                    .try_into()
-                    .map_err(|_| KernelMetaError::BuildIdNotFound)?,
-            );
-
-            let name_start = offset + 12;
-            let name_padded = align4(n_namesz);
-            let desc_start = name_start + name_padded;
-            let desc_padded = align4(n_descsz);
-
-            if desc_start + n_descsz > data.len() {
-                break;
-            }
-
-            let name = &data[name_start..name_start + n_namesz];
-
-            if n_type == NT_GNU_BUILD_ID && name == GNU_NOTE_NAME {
-                if n_descsz != BUILD_ID_SIZE {
-                    return Err(KernelMetaError::BuildIdWrongSize { actual: n_descsz });
-                }
-                let mut build_id = [0u8; BUILD_ID_SIZE];
-                build_id.copy_from_slice(&data[desc_start..desc_start + BUILD_ID_SIZE]);
-                return Ok(build_id);
-            }
-
-            offset = desc_start + desc_padded;
-        }
-
-        Err(KernelMetaError::BuildIdNotFound)
+        bistouri_sys::kernel::parse_build_id_from_notes(&data)
+            .ok_or(KernelMetaError::BuildIdNotFound)
     }
 
     /// Reads the runtime `_text` address from `/proc/kallsyms`.
@@ -187,26 +128,19 @@ impl KernelMeta {
     /// Parses the `_text` address from kallsyms content.
     /// Extracted for testability.
     fn parse_kaslr_from_kallsyms(contents: &str, path: &Path) -> Result<u64, KernelMetaError> {
+        // parse_text_addr returns None for both "not found" and "zero address"
+        // (kptr_restrict). Distinguish by checking for the symbol presence.
+        if let Some(addr) = bistouri_sys::kernel::parse_text_addr(contents) {
+            return Ok(addr);
+        }
+
+        // Determine whether _text is absent or has a zero address.
         for line in contents.lines() {
-            // Format: "ffffffff81000000 T _text" or "ffffffff81000000 t _text"
             let mut parts = line.split_whitespace();
-            let addr_hex = parts.next();
+            let _addr_hex = parts.next();
             let _sym_type = parts.next();
-            let sym_name = parts.next();
-
-            if sym_name == Some("_text") {
-                let addr_hex = addr_hex.unwrap(); // safe: sym_name matched
-                let addr = u64::from_str_radix(addr_hex, 16).map_err(|_| {
-                    KernelMetaError::KallsymsTextNotFound {
-                        path: path.display().to_string(),
-                    }
-                })?;
-
-                if addr == 0 {
-                    return Err(KernelMetaError::KptrRestricted);
-                }
-
-                return Ok(addr);
+            if parts.next() == Some("_text") {
+                return Err(KernelMetaError::KptrRestricted);
             }
         }
 
@@ -227,15 +161,13 @@ impl KernelMeta {
     }
 }
 
-/// Rounds up to the nearest 4-byte boundary (ELF note alignment).
-fn align4(n: usize) -> usize {
-    (n + 3) & !3
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    const NT_GNU_BUILD_ID: u32 = 3;
+    const GNU_NOTE_NAME: &[u8] = b"GNU\0";
 
     /// Builds a synthetic ELF note in native byte order.
     fn make_note(name: &[u8], desc: &[u8], n_type: u32) -> Vec<u8> {
@@ -245,18 +177,18 @@ mod tests {
         buf.extend_from_slice(&n_type.to_ne_bytes());
 
         buf.extend_from_slice(name);
-        let name_pad = align4(name.len()) - name.len();
+        let name_pad = bistouri_sys::kernel::align4(name.len()) - name.len();
         buf.extend(std::iter::repeat_n(0u8, name_pad));
 
         buf.extend_from_slice(desc);
-        let desc_pad = align4(desc.len()) - desc.len();
+        let desc_pad = bistouri_sys::kernel::align4(desc.len()) - desc.len();
         buf.extend(std::iter::repeat_n(0u8, desc_pad));
 
         buf
     }
 
     // -------------------------------------------------------------------
-    // ELF note parsing — success cases
+    // ELF note parsing — success cases (delegates to bistouri_sys)
     // -------------------------------------------------------------------
 
     #[rstest]
@@ -279,7 +211,7 @@ mod tests {
         #[case] expected: [u8; BUILD_ID_SIZE],
         #[case] description: &str,
     ) {
-        let result = KernelMeta::parse_build_id_from_notes(&data).unwrap();
+        let result = bistouri_sys::kernel::parse_build_id_from_notes(&data).unwrap();
         assert_eq!(result, expected, "{description}");
     }
 
@@ -288,31 +220,19 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[rstest]
-    #[case::empty_input(
-        vec![],
-        "BuildIdNotFound",
-        "empty data yields not-found"
-    )]
+    #[case::empty_input(vec![], "empty data yields not-found")]
     #[case::wrong_note_type(
         make_note(GNU_NOTE_NAME, &[0u8; BUILD_ID_SIZE], 99),
-        "BuildIdNotFound",
         "GNU name but wrong n_type"
     )]
     #[case::wrong_desc_size(
         make_note(GNU_NOTE_NAME, &[0u8; 16], NT_GNU_BUILD_ID),
-        "BuildIdWrongSize",
         "correct type but 16-byte desc instead of 20"
     )]
-    fn build_id_failure(
-        #[case] data: Vec<u8>,
-        #[case] expected_variant: &str,
-        #[case] description: &str,
-    ) {
-        let err = KernelMeta::parse_build_id_from_notes(&data).unwrap_err();
-        let variant_name = format!("{err:?}");
+    fn build_id_failure(#[case] data: Vec<u8>, #[case] description: &str) {
         assert!(
-            variant_name.starts_with(expected_variant),
-            "{description}: expected {expected_variant}, got {variant_name}",
+            bistouri_sys::kernel::parse_build_id_from_notes(&data).is_none(),
+            "{description}"
         );
     }
 
@@ -366,7 +286,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // align4
+    // align4 (delegated to bistouri_sys)
     // -------------------------------------------------------------------
 
     #[rstest]
@@ -377,6 +297,6 @@ mod tests {
     #[case::five(5, 8)]
     #[case::eight(8, 8)]
     fn align4_cases(#[case] input: usize, #[case] expected: usize) {
-        assert_eq!(align4(input), expected);
+        assert_eq!(bistouri_sys::kernel::align4(input), expected);
     }
 }

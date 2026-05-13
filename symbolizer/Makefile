@@ -2,10 +2,10 @@
 
 help:
 	@echo "Symbolizer targets:"
-	@echo "  docker-build           Build the symbolizer Docker image"
-	@echo "  docker-build-debuginfod Build the debuginfod sidecar Docker image"
-	@echo "  fixtures               Rebuild fixture binaries + manifest.json"
-	@echo "  e2e                    Run symbolizer E2E tests (requires k3s + Docker)"
+	@echo "  docker-build             Build the symbolizer Docker image"
+	@echo "  docker-build-debuginfod  Build the debuginfod sidecar Docker image"
+	@echo "  fixtures                 Rebuild fixture binaries + manifest.json"
+	@echo "  e2e                      Run symbolizer E2E tests (requires k3s + Docker)"
 
 # Build the symbolizer Docker image.
 docker-build:

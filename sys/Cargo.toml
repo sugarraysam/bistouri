@@ -1,0 +1,12 @@
+[package]
+name = "bistouri-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Zero runtime dependencies — pure parsing functions only.
+# Consumers bring their own I/O and error handling.
+[dependencies]
+
+[dev-dependencies]
+rstest = "0.26"

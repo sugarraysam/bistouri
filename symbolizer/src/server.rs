@@ -38,14 +38,14 @@ impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> CaptureService
         let payload = request.into_inner();
 
         // Extract lightweight metadata for logging before moving the payload.
-        let session_id = payload.session_id.clone();
+        // Only pid and trace/mapping counts are read — no String clones.
         let pid = payload.metadata.as_ref().map(|m| m.pid).unwrap_or(0);
         let total_samples = payload.total_samples;
         let trace_count = payload.traces.len();
         let mapping_count = payload.mappings.len();
 
         debug!(
-            session_id = %session_id,
+            session_id = %payload.session_id,
             pid = pid,
             total_samples = total_samples,
             traces = trace_count,
@@ -56,6 +56,11 @@ impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> CaptureService
         // Phase 1+2: resolve (async prefetch + blocking symbolization).
         // Payload is moved into the resolver — no expensive clone.
         let resolved = self.resolver.resolve(payload).await;
+
+        // Read session_id from the resolved result (not the raw payload — avoids
+        // the original pre-clone). This is a cheap ref-to-clone just before the
+        // sink consumes the resolved session.
+        let session_id = resolved.session_id.clone();
 
         // Phase 3: store via the configured sink.
         if let Err(e) = self.sink.store(resolved).await {

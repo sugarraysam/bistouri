@@ -23,7 +23,7 @@
 //! `ResolvedFrame` to skip DWARF walks on repeated lookups.
 
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use lru::LruCache;
@@ -277,8 +277,11 @@ pub(crate) type SymbolKey = (BuildId, u64);
 /// Sits in front of the DWARF walk — if a `(build_id, offset)` pair has
 /// been resolved before, we return the cached `ResolvedFrame` without
 /// touching addr2line.
+///
+/// Stores `Arc<ResolvedFrame>` internally so cache hits are atomic
+/// refcount bumps instead of deep-cloning every `String` field.
 pub struct SymbolCache {
-    entries: Mutex<LruCache<SymbolKey, ResolvedFrame>>,
+    entries: Mutex<LruCache<SymbolKey, Arc<ResolvedFrame>>>,
 }
 
 impl SymbolCache {
@@ -292,14 +295,17 @@ impl SymbolCache {
         }
     }
 
-    /// Returns a cached frame if present, cloned out through the mutex.
-    pub(crate) fn get(&self, key: &SymbolKey) -> Option<ResolvedFrame> {
+    /// Returns a cached frame if present.
+    ///
+    /// Returns `Arc<ResolvedFrame>` — an atomic refcount bump with
+    /// zero heap allocation. Callers dereference to use the frame.
+    pub(crate) fn get(&self, key: &SymbolKey) -> Option<Arc<ResolvedFrame>> {
         self.entries.lock().unwrap().get(key).cloned()
     }
 
     /// Inserts a resolved frame into the cache.
     pub(crate) fn insert(&self, key: SymbolKey, frame: ResolvedFrame) {
-        self.entries.lock().unwrap().put(key, frame);
+        self.entries.lock().unwrap().put(key, Arc::new(frame));
     }
 }
 

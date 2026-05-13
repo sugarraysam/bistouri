@@ -1,6 +1,6 @@
 {
   "hello": {
-    "build_id_hex": "e5bbaef2f434873fa879b2f1f12ff1b7d2b70f26",
+    "build_id_hex": "06d2d035e4957a85bb2f78d1809ab617fadf4631",
     "symbols": {
       "target_function": {
         "file_offset": 6213,
@@ -20,7 +20,7 @@
     }
   },
   "multi_dso": {
-    "build_id_hex": "f8ba4f9f28c7376ce0a1f8d123bd279144a12b8d",
+    "build_id_hex": "b3413f111cf634aee9902dd60907fffcf14ba413",
     "symbols": {
       "compute_checksum": {
         "file_offset": 6213,

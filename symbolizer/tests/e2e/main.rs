@@ -37,7 +37,10 @@ const LOG_FLUSH_DELAY: Duration = Duration::from_secs(5);
 const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for debuginfod to finish indexing fixture ELFs.
-const DEBUGINFOD_INDEX_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// Generous to account for scanning large vmlinux files (~450 MB each)
+/// in `/usr/lib/debug/boot/` on a cold k3s start.
+const DEBUGINFOD_INDEX_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// K8s manifests directory (relative to CARGO_MANIFEST_DIR).
 fn k8s_dir() -> String {

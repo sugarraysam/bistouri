@@ -40,8 +40,8 @@ jobs:
     - name: Run tests
       run: cargo +nightly test --workspace --verbose --all-targets --all-features -- --skip bistouri_e2e
 
-  integration_tests:
-    name: E2E Integration Tests
+  e2e_tests:
+    name: Agent E2E Integration Tests
     runs-on: ubuntu-latest
     needs: build_and_test
     timeout-minutes: 10
@@ -64,5 +64,8 @@ jobs:
         curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_ENABLE=true sh -
         k3s --version
 
-    - name: Run E2E tests
-      run: make -C agent integration-tests
+    - name: Agent E2E tests
+      run: make -C agent e2e
+
+    - name: Symbolizer E2E tests
+      run: make -C symbolizer e2e

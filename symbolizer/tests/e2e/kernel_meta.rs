@@ -54,36 +54,11 @@ impl HostKernelMeta {
         let data = std::fs::read("/sys/kernel/notes")
             .map_err(|e| E2eError::KernelMeta(format!("reading /sys/kernel/notes: {e}")))?;
 
-        // Walk ELF notes: each is { u32 namesz, u32 descsz, u32 type, name[], desc[] }
-        let mut offset = 0;
-        while offset + 12 <= data.len() {
-            let namesz = u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            let descsz =
-                u32::from_ne_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
-            let ntype = u32::from_ne_bytes(data[offset + 8..offset + 12].try_into().unwrap());
-
-            let name_start = offset + 12;
-            let name_padded = (namesz + 3) & !3;
-            let desc_start = name_start + name_padded;
-            let desc_padded = (descsz + 3) & !3;
-
-            if desc_start + descsz > data.len() {
-                break;
-            }
-
-            let name = &data[name_start..name_start + namesz];
-
-            // NT_GNU_BUILD_ID = 3, name = "GNU\0"
-            if ntype == 3 && name == b"GNU\0" {
-                return Ok(data[desc_start..desc_start + descsz].to_vec());
-            }
-
-            offset = desc_start + desc_padded;
-        }
-
-        Err(E2eError::KernelMeta(
-            "GNU build ID not found in /sys/kernel/notes".into(),
-        ))
+        bistouri_sys::kernel::parse_build_id_from_notes(&data)
+            .map(|bid| bid.to_vec())
+            .ok_or_else(|| {
+                E2eError::KernelMeta("GNU build ID not found in /sys/kernel/notes".into())
+            })
     }
 
     /// Read _text address and known function addresses from /proc/kallsyms.
@@ -91,45 +66,23 @@ impl HostKernelMeta {
         let contents = std::fs::read_to_string("/proc/kallsyms")
             .map_err(|e| E2eError::KernelMeta(format!("reading /proc/kallsyms: {e}")))?;
 
-        let mut text_addr: Option<u64> = None;
-        let mut symbols = Vec::new();
-
-        for line in contents.lines() {
-            let mut parts = line.split_whitespace();
-            let addr_hex = match parts.next() {
-                Some(a) => a,
-                None => continue,
-            };
-            let _sym_type = parts.next();
-            let sym_name = match parts.next() {
-                Some(n) => n,
-                None => continue,
-            };
-
-            let addr = u64::from_str_radix(addr_hex, 16).unwrap_or(0);
-
-            if sym_name == "_text" {
-                if addr == 0 {
-                    return Err(E2eError::KernelMeta(
-                        "_text address is 0 — kptr_restrict is active. \
-                         Run with sudo or set kernel.kptr_restrict=0"
-                            .into(),
-                    ));
-                }
-                text_addr = Some(addr);
-            }
-
-            if TARGET_SYMBOLS.contains(&sym_name) && addr != 0 {
-                symbols.push(KernelSymbol {
-                    name: sym_name.to_string(),
-                    addr,
-                });
-            }
-        }
-
-        let text_addr = text_addr.ok_or_else(|| {
-            E2eError::KernelMeta("_text symbol not found in /proc/kallsyms".into())
+        let text_addr = bistouri_sys::kernel::parse_text_addr(&contents).ok_or_else(|| {
+            E2eError::KernelMeta(
+                "_text address is 0 or not found — kptr_restrict is active. \
+                 Run with sudo or set kernel.kptr_restrict=0"
+                    .into(),
+            )
         })?;
+
+        let symbols: Vec<KernelSymbol> = TARGET_SYMBOLS
+            .iter()
+            .filter_map(|name| {
+                bistouri_sys::kernel::parse_symbol_addr(&contents, name).map(|addr| KernelSymbol {
+                    name: (*name).to_string(),
+                    addr,
+                })
+            })
+            .collect();
 
         Ok((text_addr, symbols))
     }

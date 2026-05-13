@@ -13,6 +13,7 @@ const FETCH_TIMEOUT_SECS: u64 = 30;
 ///
 /// Expects a debuginfod-compatible server (e.g. `elfutils-debuginfod` sidecar)
 /// at the configured base URL.
+#[derive(Debug)]
 pub struct HttpDebuginfodClient {
     client: Client,
     base_url: String,

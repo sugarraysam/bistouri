@@ -18,6 +18,7 @@ use tracing::{debug, error, info};
 use self::build_id::{BuildId, BUILD_ID_SIZE};
 use self::cache::{ObjectCache, SymbolCache};
 use self::kernel::KernelResolver;
+use self::user::UserResolver;
 use crate::debuginfod::DebuginfodClient;
 use crate::model::{ResolvedFrame, ResolvedSession, ResolvedTrace, SymbolInfo};
 use bistouri_api::v1 as proto;
@@ -33,18 +34,19 @@ const MAX_CONCURRENT_FETCHES: usize = 16;
 /// (monomorphized at compile time, no vtable overhead).
 pub struct SessionResolver<C: DebuginfodClient> {
     cache: Arc<ObjectCache>,
-    client: Arc<C>,
     kernel: KernelResolver<C>,
+    user: UserResolver<C>,
     symbols: Arc<SymbolCache>,
 }
 
 impl<C: DebuginfodClient + 'static> SessionResolver<C> {
     pub fn new(cache: Arc<ObjectCache>, client: Arc<C>, symbols: Arc<SymbolCache>) -> Self {
         let kernel = KernelResolver::new(cache.clone(), client.clone());
+        let user = UserResolver::new(cache.clone(), client);
         Self {
             cache,
-            client,
             kernel,
+            user,
             symbols,
         }
     }
@@ -72,16 +74,6 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
             user_prefetch.await;
         }
 
-        // Pre-extract metadata before moving the payload into spawn_blocking.
-        let session_id = payload.session_id.clone();
-        let pid = payload.metadata.as_ref().map(|m| m.pid).unwrap_or(0);
-        let total_samples = payload.total_samples;
-        let comm = payload
-            .metadata
-            .as_ref()
-            .map(|m| m.comm.clone())
-            .unwrap_or_else(|| "<unknown>".into());
-
         // Phase 2: Symbolize in blocking context. Payload is moved, not cloned.
         let cache = self.cache.clone();
         let kernel_cache = self.kernel.cache_ref();
@@ -93,18 +85,16 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
         {
             Ok(resolved) => resolved,
             Err(e) => {
-                error!(
-                    session_id = %session_id,
-                    error = %e,
-                    "resolve task panicked or was cancelled"
-                );
+                // Task panicked or was cancelled. Use static placeholders
+                // instead of pre-cloning metadata on the happy path.
+                error!(error = %e, "resolve task panicked or was cancelled");
                 ResolvedSession {
-                    session_id,
-                    pid,
-                    comm,
+                    session_id: String::new(),
+                    pid: 0,
+                    comm: "<panic>".into(),
                     kernel_release: String::new(),
                     traces: Vec::new(),
-                    total_samples,
+                    total_samples: 0,
                 }
             }
         }
@@ -128,10 +118,11 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
         for chunk in unique_ids.chunks(MAX_CONCURRENT_FETCHES) {
             let mut set = tokio::task::JoinSet::new();
             for &bid in chunk {
-                let cache = self.cache.clone();
-                let client = self.client.clone();
+                let user = self.user.cache_ref();
+                let client = Arc::clone(&self.user.client_ref());
+                let user_resolver = UserResolver::new(user, client);
                 set.spawn(async move {
-                    user::ensure_cached(&bid, &cache, client.as_ref()).await;
+                    user_resolver.ensure_cached(&bid).await;
                 });
             }
             // Await all in this batch before starting the next.
@@ -256,7 +247,7 @@ fn resolve_kernel_frame_blocking(
             // L2 symbol cache check for kernel frames.
             let key = (*bid, vmlinux_vaddr);
             if let Some(cached) = symbols.get(&key) {
-                return cached;
+                return ResolvedFrame::clone(&cached);
             }
 
             let frame = kernel::resolve_kernel_addr(obj, vmlinux_vaddr);

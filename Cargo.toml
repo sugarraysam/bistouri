@@ -3,5 +3,6 @@ members = [
     "agent",
     "api",
     "symbolizer",
+    "sys",
 ]
 resolver = "2"
