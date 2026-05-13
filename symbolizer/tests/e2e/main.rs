@@ -233,6 +233,15 @@ async fn symbolizer_e2e() {
             if kernel.known_symbols.is_empty() {
                 warn!("⚠️  Phase 2 skipped: no known kernel symbols in /proc/kallsyms");
             } else {
+                let build_id_hex: String = kernel
+                    .build_id
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+
+                info!(build_id = %build_id_hex, "waiting for debuginfod to index host kernel");
+                wait_debuginfod_indexed(&build_id_hex).await;
+
                 let payload = fixture::build_kernel_payload(&kernel);
                 info!(session_id = %payload.session_id, "sending kernel-frame payload");
                 client
