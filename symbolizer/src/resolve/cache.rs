@@ -90,6 +90,26 @@ impl CacheEntry {
     }
 }
 
+/// Expected number of concurrent threads borrowing from the context pool.
+const EXPECTED_CONTEXT_POOL_SIZE: usize = 4;
+
+/// The estimated fraction of the raw DWARF size that a single `addr2line::Context`
+/// will allocate on the heap for parsed ASTs and interval trees (1/20 = 5%).
+const CONTEXT_HEAP_FRACTION_DIVISOR: usize = 20;
+
+/// Estimates the total memory footprint of the `addr2line::Context` pool.
+///
+/// This accounts for both the base struct size of the contexts and the lazy
+/// heap allocations (e.g., parsed compilation units) across an expected
+/// number of concurrent threads.
+#[inline]
+fn estimate_context_pool_bytes(dwarf_bytes: usize) -> usize {
+    let context_stack_bytes = std::mem::size_of::<addr2line::Context<ArcReader>>();
+    let context_heap_bytes = dwarf_bytes / CONTEXT_HEAP_FRACTION_DIVISOR;
+
+    (context_stack_bytes + context_heap_bytes) * EXPECTED_CONTEXT_POOL_SIZE
+}
+
 /// A parsed and cached ELF object, ready for symbolization.
 ///
 /// Metadata (segments, static_text_addr) is `Sync`-safe and freely
@@ -189,7 +209,7 @@ impl CachedObject {
         })?;
 
         let seg_bytes = segments.len() * std::mem::size_of::<LoadSegment>();
-        let estimated_bytes = dwarf_bytes + seg_bytes;
+        let estimated_bytes = dwarf_bytes + seg_bytes + estimate_context_pool_bytes(dwarf_bytes);
 
         Ok(Self {
             dwarf,
