@@ -35,7 +35,6 @@ ensure_kernel_dbgsym() {
 		cat <<EOF | sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null
 deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
 deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse
-deb http://ddebs.ubuntu.com $(lsb_release -cs)-security main restricted universe multiverse
 EOF
 
 		sudo apt-get update -qq
