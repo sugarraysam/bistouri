@@ -30,12 +30,18 @@ ensure_kernel_dbgsym() {
 	if ! grep -q ddebs /etc/apt/sources.list.d/*.list 2>/dev/null; then
 		e2e_warn "Adding Ubuntu ddebs repository..."
 		sudo apt-get install -y ubuntu-dbgsym-keyring 2>/dev/null || true
-		echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse" |
-			sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null
+
+		# ADD -updates AND -security REPOS HERE
+		cat <<EOF | sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null
+deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
+deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse
+deb http://ddebs.ubuntu.com $(lsb_release -cs)-security main restricted universe multiverse
+EOF
+
 		sudo apt-get update -qq
 	fi
 
-	if sudo apt-get install -y --no-install-recommends "$pkg" 2>/dev/null; then
+	if sudo apt-get install -y --no-install-recommends "$pkg"; then
 		e2e_info "Installed $pkg"
 	else
 		e2e_warn "Could not install $pkg — Phase 2 (kernel resolution) will be skipped"
