@@ -52,7 +52,7 @@ jobs:
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@nightly
       with:
-        components: rust-src
+        components: rust-src, clippy, rustfmt
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
@@ -72,7 +72,7 @@ jobs:
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@nightly
       with:
-        components: rust-src
+        components: rust-src, clippy, rustfmt
 
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
