@@ -26,6 +26,6 @@ EXPOSE 8002
 # -t 0: single scan — no periodic rescan needed for static fixtures
 # -v: verbose logging for debugging indexing issues
 # DEBUGINFOD_URLS: federate upstream for vmlinux and distro packages
-ENV DEBUGINFOD_URLS="https://debuginfod.ubuntu.com/ https://debuginfod.elfutils.org/"
+ENV DEBUGINFOD_URLS="https://debuginfod.ubuntu.com/"
 
 ENTRYPOINT ["debuginfod", "-F", "-t", "0", "-v", "/fixtures"]

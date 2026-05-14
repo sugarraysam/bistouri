@@ -15,9 +15,16 @@ source "${REPO_ROOT}/scripts/k3s-helpers.sh"
 
 # ── Kernel debug symbols ─────────────────────────────────────────────
 
-VMLINUX_DBG="/usr/lib/debug/boot/vmlinux-$(uname -r)"
+VMLINUX_DBG=""
+HOST_DEBUG_STAGING="/tmp/bistouri-host-debug"
+
+find_vmlinux_dbg() {
+	ls /usr/lib/debug/boot/vmlinux-$(uname -r)* 2>/dev/null | head -n 1
+}
 
 ensure_kernel_dbgsym() {
+	VMLINUX_DBG=$(find_vmlinux_dbg)
+
 	if [ -f "$VMLINUX_DBG" ]; then
 		e2e_info "Kernel debug symbols found: $VMLINUX_DBG"
 		return
@@ -53,14 +60,32 @@ EOF
 	e2e_info "Found matching debug package: $pkg"
 	if sudo apt-get install -y --no-install-recommends "$pkg"; then
 		e2e_info "Installed $pkg"
+		VMLINUX_DBG=$(find_vmlinux_dbg)
 	else
 		e2e_warn "Could not install $pkg — Phase 2 (kernel resolution) skipped."
+	fi
+}
+
+stage_kernel_dbgsym() {
+	e2e_info "Staging targeted kernel debug symbols into $HOST_DEBUG_STAGING..."
+
+	# Clean up previous runs to ensure no stale files from older kernels exist
+	sudo rm -rf "$HOST_DEBUG_STAGING"
+	mkdir -p "$HOST_DEBUG_STAGING"
+
+	if [ -n "$VMLINUX_DBG" ] && [ -f "$VMLINUX_DBG" ]; then
+		# Copy the file so it resolves correctly inside the container mount
+		cp "$VMLINUX_DBG" "$HOST_DEBUG_STAGING/"
+		e2e_info "Successfully copied $VMLINUX_DBG to staging directory."
+	else
+		e2e_warn "No kernel debug symbols found to stage."
 	fi
 }
 
 # ── k3s ──────────────────────────────────────────────────────────────
 
 ensure_kernel_dbgsym
+stage_kernel_dbgsym
 start_fresh_k3s
 register_cleanup_trap
 setup_kubeconfig

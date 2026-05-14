@@ -66,6 +66,7 @@ spec:
   - name: debuginfod-cache
     emptyDir: {}
   - name: host-debug
+    # Custom path for faster indexing, only copying current kernel dbgsym
     hostPath:
-      path: /usr/lib/debug/boot
+      path: /tmp/bistouri-host-debug
       type: DirectoryOrCreate
