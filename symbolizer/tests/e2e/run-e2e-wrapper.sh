@@ -19,7 +19,7 @@ VMLINUX_DBG=""
 HOST_DEBUG_STAGING="/tmp/bistouri-host-debug"
 
 find_vmlinux_dbg() {
-	ls /usr/lib/debug/boot/vmlinux-$(uname -r)* 2>/dev/null | head -n 1
+	find /usr/lib/debug/boot -maxdepth 1 -name "vmlinux-$(uname -r)*" 2>/dev/null | head -n 1 || true
 }
 
 ensure_kernel_dbgsym() {
