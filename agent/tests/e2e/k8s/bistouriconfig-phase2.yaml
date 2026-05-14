@@ -18,6 +18,7 @@ spec:
     - rule:
         type: Exact
         comm: "cpu-burner"
+      service_id: "cpu_burner"
       resources:
         - resource: memory
           threshold: 5.0
@@ -28,6 +29,7 @@ spec:
     - rule:
         type: Exact
         comm: "io-burner"
+      service_id: "io_burner"
       resources:
         - resource: cpu
           threshold: 5.0
@@ -38,6 +40,7 @@ spec:
     - rule:
         type: Exact
         comm: "mem-burner"
+      service_id: "mem_burner"
       resources:
         - resource: cpu
           threshold: 5.0

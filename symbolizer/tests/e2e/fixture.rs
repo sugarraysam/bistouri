@@ -128,12 +128,14 @@ pub(crate) fn build_user_payload(
         }),
         metadata: Some(proto::Metadata {
             pid: 12345,
-            comm: format!("e2e-{fixture_name}"),
             kernel_meta: Some(proto::KernelMeta {
                 release: "e2e-test".into(),
                 build_id: vec![0; 20],
                 text_addr: 0,
             }),
+            labels: [("comm".to_string(), format!("e2e-{fixture_name}"))]
+                .into_iter()
+                .collect(),
         }),
         traces,
         total_samples,
@@ -143,6 +145,12 @@ pub(crate) fn build_user_payload(
         }),
         sample_period_nanos: 1_000_000_000 / 19,
         mappings,
+        tenant_id: "e2e-test-tenant".into(),
+        service_id: format!("e2e-{fixture_name}"),
+        capture_start_time: Some(prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        }),
     }
 }
 
@@ -172,12 +180,14 @@ pub(crate) fn build_kernel_payload(kernel: &HostKernelMeta) -> proto::SessionPay
         }),
         metadata: Some(proto::Metadata {
             pid: 0,
-            comm: "kernel".into(),
             kernel_meta: Some(proto::KernelMeta {
                 release: kernel.release.clone(),
                 build_id: kernel.build_id.clone(),
                 text_addr: kernel.text_addr,
             }),
+            labels: [("comm".to_string(), "kernel".to_string())]
+                .into_iter()
+                .collect(),
         }),
         traces,
         total_samples: 1,
@@ -187,5 +197,11 @@ pub(crate) fn build_kernel_payload(kernel: &HostKernelMeta) -> proto::SessionPay
         }),
         sample_period_nanos: 1_000_000_000 / 19,
         mappings: vec![],
+        tenant_id: "e2e-test-tenant".into(),
+        service_id: "e2e-kernel".into(),
+        capture_start_time: Some(prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        }),
     }
 }

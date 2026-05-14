@@ -19,20 +19,24 @@ use crate::sink::SessionSink;
 use bistouri_api::v1 as proto;
 use bistouri_api::v1::capture_service_server::CaptureService;
 
-/// gRPC handler — resolves `SessionPayload`s and stores via the sink.
-pub struct SymbolizerService<C: DebuginfodClient, S: SessionSink> {
+/// gRPC handler that receives `SessionPayload`s from agents,
+/// resolves their frames, and stores the results via the sink.
+///
+/// Generic over both the debuginfod client and the sink to enable
+/// static dispatch throughout the pipeline — no vtable overhead.
+pub struct SymbolizerService<C: DebuginfodClient, S: SessionSink + ?Sized> {
     resolver: Arc<SessionResolver<C>>,
     sink: Arc<S>,
 }
 
-impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> SymbolizerService<C, S> {
+impl<C: DebuginfodClient + 'static, S: SessionSink + 'static + ?Sized> SymbolizerService<C, S> {
     pub fn new(resolver: Arc<SessionResolver<C>>, sink: Arc<S>) -> Self {
         Self { resolver, sink }
     }
 }
 
 #[tonic::async_trait]
-impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> CaptureService
+impl<C: DebuginfodClient + 'static, S: SessionSink + 'static + ?Sized> CaptureService
     for SymbolizerService<C, S>
 {
     async fn report_session(

@@ -304,12 +304,14 @@ async fn symbolizer_e2e() {
         }),
         metadata: Some(bistouri_api::v1::Metadata {
             pid: 99999,
-            comm: "e2e-unknown".into(),
             kernel_meta: Some(bistouri_api::v1::KernelMeta {
                 release: "e2e-test".into(),
                 build_id: vec![0; 20],
                 text_addr: 0,
             }),
+            labels: [("comm".to_string(), "e2e-unknown".to_string())]
+                .into_iter()
+                .collect(),
         }),
         traces: vec![bistouri_api::v1::CountedTrace {
             trace: Some(bistouri_api::v1::StackTrace {
@@ -338,6 +340,12 @@ async fn symbolizer_e2e() {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ],
         }],
+        tenant_id: "e2e-test-tenant".into(),
+        service_id: "e2e-test-service".into(),
+        capture_start_time: Some(prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        }),
     };
 
     info!("sending payload with unknown build_id");

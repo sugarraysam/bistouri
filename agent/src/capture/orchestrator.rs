@@ -146,6 +146,9 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             self.config.kernel_meta.clone(),
             self.config.sample_period_nanos,
             self.config.trace_capacity,
+            request.tenant_id,
+            request.service_id,
+            request.labels,
         );
         let session_id = session.id();
 
@@ -232,7 +235,8 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             .payload
             .metadata
             .as_ref()
-            .map(|m| m.comm.as_str())
+            .and_then(|m| m.labels.get("comm"))
+            .map(|s| s.as_str())
             .unwrap_or("<unknown>");
         let resource_label = source_label(&finalized.source);
 
@@ -372,6 +376,9 @@ mod tests {
             pid,
             comm: format!("test-{}", pid),
             source: CaptureSource::Psi(resource),
+            tenant_id: "test-tenant".into(),
+            service_id: "test-service".into(),
+            labels: HashMap::new(),
         }
     }
 
@@ -416,9 +423,13 @@ mod tests {
         (orch, req_tx, stack_tx, session_rx)
     }
 
-    /// Helper: extract comm from a SessionPayload's metadata.
+    /// Helper: extract comm from a SessionPayload's metadata labels.
     fn payload_comm(p: &proto::SessionPayload) -> &str {
-        p.metadata.as_ref().map(|m| m.comm.as_str()).unwrap_or("")
+        p.metadata
+            .as_ref()
+            .and_then(|m| m.labels.get("comm"))
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
     #[tokio::test(start_paused = true)]

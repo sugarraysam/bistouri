@@ -3,6 +3,7 @@ package bistouri.v1;
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 // Downstream consumer contract.
 //
@@ -39,14 +40,31 @@ message SessionPayload {
   // Deduplicated DSO/binary mapping table. ResolvedFrame.mapping_index
   // references entries in this table, avoiding per-frame build_id repetition.
   repeated Mapping mappings = 8;
+
+  // Multi-tenancy: organizational unit. Set by the agent at startup.
+  string tenant_id = 9;
+
+  // Logical service being profiled. Set per-target from TriggerConfig.
+  string service_id = 10;
+
+  // Wall-clock time when the capture started.
+  // Set by the agent — most accurate source of truth for ClickHouse queries.
+  google.protobuf.Timestamp capture_start_time = 11;
 }
 
 // ── Metadata ─────────────────────────────────────────────────────────
 
 message Metadata {
   uint32 pid = 1;
-  string comm = 2;
+  // Field 2 reserved — comm moved to labels["comm"].
+  reserved 2;
+  reserved "comm";
   KernelMeta kernel_meta = 3;
+
+  // Flexible key-value labels (Prometheus-style).
+  // Carries pass-through metadata: comm, hostname, pod, etc.
+  // Agents populate these from their environment/config.
+  map<string, string> labels = 4;
 }
 
 message KernelMeta {

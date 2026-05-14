@@ -55,8 +55,16 @@ impl BistouriDaemon {
         let vdso_cache = Arc::new(Mutex::new(VdsoCache::new()));
 
         let watcher = trigger::watcher::build_watcher(&args).await;
-        let prepared =
-            PreparedTriggerAgent::prepare(watcher, args.proc_path, args.cgroup_path).await?;
+        let agent_labels: std::collections::HashMap<String, String> =
+            args.label.iter().cloned().collect();
+        let prepared = PreparedTriggerAgent::prepare(
+            watcher,
+            args.proc_path,
+            args.cgroup_path,
+            args.tenant_id.clone(),
+            agent_labels,
+        )
+        .await?;
 
         let agent_builder = ProfilerAgentBuilder::new()
             .with_freq(args.freq)

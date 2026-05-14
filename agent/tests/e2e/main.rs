@@ -81,7 +81,12 @@ async fn bistouri_e2e() {
     for comm in EXPECTED_COMMS {
         let session = sessions
             .iter()
-            .find(|s| s.metadata.as_ref().is_some_and(|m| m.comm == *comm))
+            .find(|s| {
+                s.metadata
+                    .as_ref()
+                    .and_then(|m| m.labels.get("comm"))
+                    .is_some_and(|c| c == comm)
+            })
             .unwrap_or_else(|| panic!("no session received for workload {comm}"));
 
         assert!(

@@ -31,6 +31,8 @@
 //! `comm` carries `maxLength: 15` (kernel `TASK_COMM_LEN - 1`) in the hand-written
 //! schema, bounding string-comparison cost in CEL rules.
 
+use std::collections::HashMap;
+
 use crate::config::{MatchRule, ResourceConfig, TargetConfig};
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -82,17 +84,24 @@ pub struct TargetConfigSchema {
     /// Process matching rule.
     #[schemars(schema_with = "match_rule_schema")]
     pub rule: MatchRule,
+    /// Logical service identity. Required for multi-tenant routing.
+    pub service_id: String,
     /// PSI resources to watch for this target. At most 3 (Memory, Cpu, Io).
     #[schemars(length(max = 3))]
     pub resources: Vec<ResourceConfig>,
+    /// Per-target labels (optional). Merged with agent-level labels.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 impl From<TargetConfigSchema> for TargetConfig {
     fn from(t: TargetConfigSchema) -> Self {
         TargetConfig {
             rule: t.rule,
+            service_id: t.service_id,
             resources: t.resources,
             rule_id: 0, // assigned later by TriggerConfig::assign_rule_ids
+            labels: t.labels,
         }
     }
 }
@@ -142,6 +151,10 @@ impl From<TargetConfigSchema> for TargetConfig {
         "  )",
         ")"
     )).message("duplicate resource type within a single target — each PSI resource may appear at most once per target"),
+    // Rule 5: each target must declare a service_id.
+    validation = Rule::new(
+        "self.spec.targets.all(t, size(t.service_id) > 0)"
+    ).message("each target must declare a service_id"),
 )]
 pub struct BistouriConfigSpec {
     /// Process targets to watch. At least one required.

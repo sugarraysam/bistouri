@@ -16,6 +16,8 @@
 //! The `schemars` feature gate adds `JsonSchema` derives required by `crd-gen`
 //! without bloating the agent's dependency tree.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "schemars")]
@@ -93,6 +95,9 @@ impl MatchRule {
 pub struct TargetConfig {
     /// Process matching rule.
     pub rule: MatchRule,
+    /// Logical service identity. Required for multi-tenant routing.
+    /// Identifies the service being profiled within a tenant.
+    pub service_id: String,
     /// One or more PSI resources to watch for this target.
     pub resources: Vec<ResourceConfig>,
     /// Unique rule identifier assigned by the agent after deserialization.
@@ -100,4 +105,8 @@ pub struct TargetConfig {
     #[serde(skip, default)]
     #[cfg_attr(feature = "schemars", schemars(skip))]
     pub rule_id: u32,
+    /// Per-target labels merged with agent-level labels (target wins on conflict).
+    /// Optional — used for injecting team, version, or environment metadata.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }

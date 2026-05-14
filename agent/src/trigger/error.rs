@@ -29,6 +29,15 @@ pub(crate) enum TriggerError {
     #[error("Threshold {threshold} for comm '{comm}' must be in the range (0, 100) exclusive")]
     InvalidThreshold { threshold: f64, comm: String },
 
+    #[error("Invalid service_id '{service_id}': {reason}")]
+    InvalidServiceId {
+        service_id: String,
+        reason: &'static str,
+    },
+
+    #[error("Duplicate service_id '{service_id}' across targets")]
+    DuplicateServiceId { service_id: String },
+
     #[error("Failed to parse config: {0}")]
     ConfigParse(#[source] serde_yml::Error),
 

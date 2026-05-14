@@ -14,6 +14,11 @@ use bistouri_symbolizer::sink::log::LogSink;
 
 /// Bistouri symbolizer service — resolves raw stack traces from agents
 /// into human-readable function names, source files, and line numbers.
+///
+/// This is the open-source reference binary using `LogSink`.
+/// For production storage backends (ClickHouse, etc.), build a custom
+/// binary that imports `bistouri-symbolizer` as a library and implements
+/// `SessionSink`. See the crate-level docs for an example.
 #[derive(Parser, Debug)]
 #[command(name = "bistouri-symbolizer", version)]
 struct Args {
@@ -136,6 +141,8 @@ async fn main() -> anyhow::Result<()> {
         listen_addr: args.listen_addr.parse()?,
     };
 
+    // Log-only sink — for production storage, build a custom binary
+    // with your own SessionSink implementation.
     let sink = Arc::new(LogSink);
 
     // Build the debuginfod client.

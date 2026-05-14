@@ -7,6 +7,42 @@ use tracing::warn;
 // Re-export here so the rest of the agent continues to import from this module.
 pub(crate) use bistouri_api::config::{MatchRule, PsiResource, ResourceConfig, TargetConfig};
 
+/// Maximum length for `service_id` — aligns with K8s/DNS naming conventions.
+const SERVICE_ID_MAX_LEN: usize = 32;
+
+/// Validates that `service_id` matches `^[a-z][a-z0-9_]*$` and is 1–32 chars.
+fn validate_service_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(TriggerError::InvalidServiceId {
+            service_id: id.into(),
+            reason: "must not be empty",
+        });
+    }
+    if id.len() > SERVICE_ID_MAX_LEN {
+        return Err(TriggerError::InvalidServiceId {
+            service_id: id.into(),
+            reason: "must be at most 32 characters",
+        });
+    }
+    let mut chars = id.chars();
+    let first = chars.next().unwrap(); // safe: checked non-empty above
+    if !first.is_ascii_lowercase() {
+        return Err(TriggerError::InvalidServiceId {
+            service_id: id.into(),
+            reason: "must start with a lowercase letter [a-z]",
+        });
+    }
+    for ch in chars {
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_') {
+            return Err(TriggerError::InvalidServiceId {
+                service_id: id.into(),
+                reason: "must contain only lowercase letters, digits, and underscores [a-z0-9_]",
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct TriggerConfig {
     pub(crate) targets: Vec<TargetConfig>,
@@ -40,6 +76,7 @@ impl TriggerConfig {
             rule: MatchRule::Exact {
                 comm: "bistouri-agent".to_string(),
             },
+            service_id: "bistouri_agent".to_string(),
             resources: vec![
                 ResourceConfig {
                     resource: PsiResource::Memory,
@@ -51,6 +88,7 @@ impl TriggerConfig {
                 },
             ],
             rule_id: 0,
+            labels: Default::default(),
         }])
         // Safe: we control these inputs and they are known-valid.
         .expect("default config must be valid")
@@ -72,12 +110,21 @@ impl TriggerConfig {
         // all targets. Duplicate pairs would produce conflicting PSI watchers
         // for the same cgroup — the second would be silently dropped.
         let mut seen_pairs: HashSet<(&str, PsiResource)> = HashSet::new();
+        let mut seen_service_ids: HashSet<&str> = HashSet::new();
 
         for target in &self.targets {
             let comm = target.rule.comm();
 
             if comm.len() > 15 {
                 return Err(TriggerError::CommTooLong { comm: comm.into() });
+            }
+
+            // service_id validation: ^[a-z][a-z0-9_]*$, 1–63 chars, unique.
+            validate_service_id(&target.service_id)?;
+            if !seen_service_ids.insert(&target.service_id) {
+                return Err(TriggerError::DuplicateServiceId {
+                    service_id: target.service_id.clone(),
+                });
             }
 
             if target.resources.is_empty() {
@@ -165,8 +212,10 @@ mod tests {
             rule: MatchRule::Exact {
                 comm: comm.to_string(),
             },
+            service_id: comm.to_string(),
             resources,
             rule_id: 0,
+            labels: Default::default(),
         }
     }
 
@@ -175,8 +224,10 @@ mod tests {
             rule: MatchRule::Prefix {
                 comm: comm.to_string(),
             },
+            service_id: format!("{}_svc", comm.replace('-', "_").trim_end_matches('_')),
             resources,
             rule_id: 0,
+            labels: Default::default(),
         }
     }
 
@@ -198,12 +249,14 @@ targets:
   - rule:
       type: Exact
       comm: node
+    service_id: node
     resources:
       - resource: memory
         threshold: 10
   - rule:
       type: Prefix
       comm: "worker-"
+    service_id: worker
     resources:
       - resource: cpu
         threshold: 50
@@ -223,6 +276,7 @@ targets:
   - rule:
       type: Exact
       comm: bistouri
+    service_id: bistouri
     resources:
       - resource: memory
         threshold: 10
@@ -280,10 +334,17 @@ targets:
     #[case::short("node", false)]
     #[case::empty("", false)] // empty comm is valid syntactically
     fn comm_length_validation(#[case] comm: &str, #[case] should_fail: bool) {
-        let result = TriggerConfig::try_new(vec![exact_target(
-            comm,
-            vec![res(PsiResource::Memory, 10.0)],
-        )]);
+        let target = TargetConfig {
+            rule: MatchRule::Exact {
+                comm: comm.to_string(),
+            },
+            // Use a fixed valid service_id so we test comm length, not service_id syntax.
+            service_id: "test_svc".to_string(),
+            resources: vec![res(PsiResource::Memory, 10.0)],
+            rule_id: 0,
+            labels: Default::default(),
+        };
+        let result = TriggerConfig::try_new(vec![target]);
         assert_eq!(result.is_err(), should_fail);
         if should_fail {
             assert!(matches!(
@@ -291,6 +352,78 @@ targets:
                 TriggerError::CommTooLong { .. }
             ));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // service_id validation — rstest table
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::simple("api", false)]
+    #[case::with_digits("api2", false)]
+    #[case::with_underscores("api_gateway", false)]
+    #[case::single_char("a", false)]
+    #[case::leading_digit("1service", true)]
+    #[case::uppercase("API", true)]
+    #[case::mixed_case("apiGateway", true)]
+    #[case::hyphen("api-gateway", true)]
+    #[case::empty("", true)]
+    #[case::dot("api.gateway", true)]
+    #[case::space("api gateway", true)]
+    #[case::max_length(&"a".repeat(32), false)]
+    #[case::over_max_length(&"a".repeat(33), true)]
+    fn service_id_validation(#[case] service_id: &str, #[case] should_fail: bool) {
+        let target = TargetConfig {
+            rule: MatchRule::Exact {
+                comm: "node".to_string(),
+            },
+            service_id: service_id.to_string(),
+            resources: vec![res(PsiResource::Memory, 10.0)],
+            rule_id: 0,
+            labels: Default::default(),
+        };
+        let result = TriggerConfig::try_new(vec![target]);
+        assert_eq!(
+            result.is_err(),
+            should_fail,
+            "service_id='{service_id}', expected fail={should_fail}, got {:?}",
+            result,
+        );
+        if should_fail {
+            assert!(matches!(
+                result.unwrap_err(),
+                TriggerError::InvalidServiceId { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_service_ids_fails() {
+        let targets = vec![
+            TargetConfig {
+                rule: MatchRule::Exact {
+                    comm: "node".into(),
+                },
+                service_id: "myapp".into(),
+                resources: vec![res(PsiResource::Memory, 10.0)],
+                rule_id: 0,
+                labels: Default::default(),
+            },
+            TargetConfig {
+                rule: MatchRule::Exact {
+                    comm: "python".into(),
+                },
+                service_id: "myapp".into(), // duplicate!
+                resources: vec![res(PsiResource::Cpu, 10.0)],
+                rule_id: 0,
+                labels: Default::default(),
+            },
+        ];
+        let result = TriggerConfig::try_new(targets);
+        assert!(matches!(
+            result.unwrap_err(),
+            TriggerError::DuplicateServiceId { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -325,8 +458,20 @@ targets:
     )]
     #[case::cross_target_dup_resource(
         vec![
-            exact_target("node", vec![res(PsiResource::Cpu, 10.0)]),
-            exact_target("node", vec![res(PsiResource::Cpu, 20.0)]),
+            TargetConfig {
+                rule: MatchRule::Exact { comm: "node".into() },
+                service_id: "node_alpha".into(),
+                resources: vec![res(PsiResource::Cpu, 10.0)],
+                rule_id: 0,
+                labels: Default::default(),
+            },
+            TargetConfig {
+                rule: MatchRule::Exact { comm: "node".into() },
+                service_id: "node_beta".into(),
+                resources: vec![res(PsiResource::Cpu, 20.0)],
+                rule_id: 0,
+                labels: Default::default(),
+            },
         ],
         true,
         "same (comm, resource) across two separate targets"
@@ -399,6 +544,7 @@ targets:
   - rule:
       type: Exact
       comm: node
+    service_id: node
     resources:
       - resource: disk
         threshold: 10
@@ -411,6 +557,7 @@ targets:
   - rule:
       type: Exact
       comm: node
+    service_id: node
     resources:
       - resource: memory
 "#,

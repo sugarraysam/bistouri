@@ -1,7 +1,8 @@
 //! Centralized metric definitions for the Bistouri symbolizer.
 //!
 //! All Prometheus metric names, descriptions, and the `describe_all()` entry
-//! point live here.
+//! point live here. ClickHouse-specific metrics are in the private
+//! `bistouri-storage` crate.
 
 /// Cache hits for objects and symbols.
 /// Labels: `kind` = "object" | "symbol", `space` = "user" | "kernel".

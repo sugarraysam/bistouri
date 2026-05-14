@@ -72,11 +72,13 @@ mod tests {
             rule: MatchRule::Exact {
                 comm: comm.to_string(),
             },
+            service_id: comm.to_string(),
             resources: vec![ResourceConfig {
                 resource: PsiResource::Memory,
                 threshold: 10.0,
             }],
             rule_id: 0,
+            labels: Default::default(),
         }
     }
 
@@ -85,11 +87,13 @@ mod tests {
             rule: MatchRule::Prefix {
                 comm: comm.to_string(),
             },
+            service_id: format!("{}_svc", comm.replace('-', "_").trim_end_matches('_')),
             resources: vec![ResourceConfig {
                 resource: PsiResource::Cpu,
                 threshold: 10.0,
             }],
             rule_id: 0,
+            labels: Default::default(),
         }
     }
 
@@ -162,21 +166,25 @@ mod tests {
                 rule: MatchRule::Exact {
                     comm: "bistouri".to_string(),
                 },
+                service_id: "bistouri_mem".to_string(),
                 resources: vec![ResourceConfig {
                     resource: PsiResource::Memory,
                     threshold: 10.0,
                 }],
                 rule_id: 0,
+                labels: Default::default(),
             },
             TargetConfig {
                 rule: MatchRule::Exact {
                     comm: "bistouri".to_string(),
                 },
+                service_id: "bistouri_cpu".to_string(),
                 resources: vec![ResourceConfig {
                     resource: PsiResource::Cpu,
                     threshold: 10.0,
                 }],
                 rule_id: 0,
+                labels: Default::default(),
             },
         ]);
         let matcher = CommMatcher::new(&config);

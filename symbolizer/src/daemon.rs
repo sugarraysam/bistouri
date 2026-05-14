@@ -45,7 +45,7 @@ impl SymbolizerDaemon {
     ) -> anyhow::Result<Self>
     where
         C: DebuginfodClient + 'static,
-        S: SessionSink + 'static,
+        S: SessionSink + 'static + ?Sized,
     {
         let cancel = CancellationToken::new();
 

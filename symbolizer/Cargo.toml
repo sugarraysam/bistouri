@@ -26,11 +26,11 @@ async-trait = "0.1"
 faster-hex = "0.10"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
+prost-types = "0.14"
 
 [dev-dependencies]
 bistouri-sys = { path = "../sys" }
 rstest = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-prost-types = "0.14"
 prometheus-parse = "0.2"

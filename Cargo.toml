@@ -5,4 +5,8 @@ members = [
     "symbolizer",
     "sys",
 ]
+# Private crate — not committed to the public repo (.gitignore'd).
+# Excluded from the workspace so `cargo build --workspace` succeeds
+# on fresh clones even without this directory present.
+exclude = ["bistouri-storage"]
 resolver = "2"

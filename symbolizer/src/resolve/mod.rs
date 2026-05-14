@@ -24,7 +24,10 @@ use self::build_id::{BuildId, BUILD_ID_SIZE};
 use self::cache::{CachePool, ObjectCache, SymbolCache};
 use self::kernel::KernelResolver;
 use crate::debuginfod::DebuginfodClient;
-use crate::model::{ResolvedFrame, ResolvedSession, ResolvedTrace, SymbolInfo};
+use crate::model::{
+    CaptureSourceInfo, ResolvedFrame, ResolvedSession, ResolvedTrace, SymbolInfo, RESOURCE_CPU,
+    RESOURCE_IO, RESOURCE_MEMORY, RESOURCE_UNKNOWN,
+};
 use bistouri_api::v1 as proto;
 
 /// Maximum number of concurrent debuginfod fetches during prefetch.
@@ -80,12 +83,12 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
 
         // Pre-extract metadata before moving the payload into spawn_blocking.
         let session_id = payload.session_id.clone();
-        let pid = payload.metadata.as_ref().map(|m| m.pid).unwrap_or(0);
         let total_samples = payload.total_samples;
-        let comm = payload
+        let _comm = payload
             .metadata
             .as_ref()
-            .map(|m| m.comm.clone())
+            .and_then(|m| m.labels.get("comm"))
+            .cloned()
             .unwrap_or_else(|| "<unknown>".into());
 
         // Phase 2: Symbolize in blocking context. Payload is moved, not cloned.
@@ -101,12 +104,19 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
                     "resolve task panicked or was cancelled"
                 );
                 ResolvedSession {
+                    tenant_id: String::new(),
+                    service_id: String::new(),
                     session_id,
-                    pid,
-                    comm,
+                    capture_source: CaptureSourceInfo::Psi {
+                        resource: RESOURCE_UNKNOWN,
+                    },
+                    labels: Default::default(),
+                    capture_start_time: std::time::SystemTime::UNIX_EPOCH,
+                    capture_duration: std::time::Duration::ZERO,
                     kernel_release: String::new(),
                     traces: Vec::new(),
                     total_samples,
+                    sample_period_nanos: 0,
                 }
             }
         }
@@ -208,28 +218,80 @@ fn resolve_session_blocking(payload: proto::SessionPayload, caches: &CachePool) 
         .collect();
 
     // Move metadata out of the payload — no cloning.
-    let pid = metadata.map(|m| m.pid).unwrap_or(0);
-    let comm = metadata.map(|m| m.comm.as_str()).unwrap_or("<unknown>");
+    let metadata = payload.metadata.as_ref();
+    let comm = metadata
+        .and_then(|m| m.labels.get("comm"))
+        .map(|s| s.as_str())
+        .unwrap_or("<unknown>");
     let kernel_release = kernel_meta
         .map(|km| km.release.as_str())
         .unwrap_or_default();
 
+    // Extract capture source from proto.
+    let capture_source = payload
+        .source
+        .as_ref()
+        .and_then(|s| s.source.as_ref())
+        .map(|src| match src {
+            proto::capture_source::Source::Psi(psi) => {
+                let resource = proto::PsiResourceType::try_from(psi.resource)
+                    .map(|r| match r {
+                        proto::PsiResourceType::Memory => RESOURCE_MEMORY,
+                        proto::PsiResourceType::Cpu => RESOURCE_CPU,
+                        proto::PsiResourceType::Io => RESOURCE_IO,
+                        _ => RESOURCE_UNKNOWN,
+                    })
+                    .unwrap_or(RESOURCE_UNKNOWN);
+                CaptureSourceInfo::Psi { resource }
+            }
+        })
+        .unwrap_or(CaptureSourceInfo::Psi {
+            resource: RESOURCE_UNKNOWN,
+        });
+
+    // Convert proto Timestamp → Rust SystemTime.
+    // The value was set by the agent at capture start — this is format
+    // conversion, not recomputation.
+    let capture_start_time = payload
+        .capture_start_time
+        .as_ref()
+        .map(|ts| {
+            std::time::UNIX_EPOCH + std::time::Duration::new(ts.seconds as u64, ts.nanos as u32)
+        })
+        .unwrap_or(std::time::UNIX_EPOCH);
+
+    // Extract capture_duration from proto Duration.
+    let capture_duration = payload
+        .capture_duration
+        .as_ref()
+        .map(|d| std::time::Duration::new(d.seconds as u64, d.nanos as u32))
+        .unwrap_or(std::time::Duration::ZERO);
+
+    // Extract labels from metadata.
+    let labels = metadata.map(|m| m.labels.clone()).unwrap_or_default();
+
     info!(
         session_id = %payload.session_id,
-        pid = pid,
         comm = %comm,
+        tenant_id = %payload.tenant_id,
+        service_id = %payload.service_id,
         traces = traces.len(),
         total_samples = payload.total_samples,
         "session resolved"
     );
 
     ResolvedSession {
+        tenant_id: payload.tenant_id,
+        service_id: payload.service_id,
         session_id: payload.session_id,
-        pid,
-        comm: comm.into(),
+        capture_source,
+        labels,
+        capture_start_time,
+        capture_duration,
         kernel_release: kernel_release.into(),
         traces,
         total_samples: payload.total_samples,
+        sample_period_nanos: payload.sample_period_nanos,
     }
 }
 

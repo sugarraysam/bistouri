@@ -160,6 +160,31 @@ pub(crate) struct Args {
     /// points at the in-process `SessionSink`.
     #[arg(long, env = "BISTOURI_SYMBOLIZER_ENDPOINT")]
     pub symbolizer_endpoint: Option<String>,
+
+    /// Tenant identity for multi-tenant routing. Required.
+    ///
+    /// Identifies the billing/organizational unit. Every SessionPayload
+    /// from this agent carries this value.
+    #[arg(long, env = "BISTOURI_TENANT_ID")]
+    pub tenant_id: String,
+
+    /// Additional key=value labels attached to every session.
+    ///
+    /// Can be specified multiple times: --label hostname=node-1 --label env=prod
+    /// Or via env: BISTOURI_LABELS="hostname=node-1,env=prod"
+    /// Target-level labels from TriggerConfig take precedence on conflict.
+    #[arg(long, value_parser = parse_label, env = "BISTOURI_LABELS", value_delimiter = ',')]
+    pub label: Vec<(String, String)>,
+}
+
+fn parse_label(s: &str) -> std::result::Result<(String, String), String> {
+    let (key, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid label '{s}': expected key=value"))?;
+    if key.is_empty() {
+        return Err(format!("invalid label '{s}': key must not be empty"));
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 fn clap_styles() -> Styles {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use uuid::Uuid;
 
@@ -39,6 +39,10 @@ pub(crate) struct CaptureRequest {
     pub pid: u32,
     pub comm: String,
     pub source: CaptureSource,
+    pub tenant_id: String,
+    pub service_id: String,
+    /// Merged labels: agent-level + target-level (target wins on conflict).
+    pub labels: HashMap<String, String>,
 }
 
 /// Converts a `CaptureSource` into the proto `capture_source::Source`.
@@ -118,6 +122,7 @@ pub(crate) struct CaptureSession {
 }
 
 impl CaptureSession {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pid: u32,
         comm: String,
@@ -125,15 +130,37 @@ impl CaptureSession {
         kernel_meta: Arc<KernelMeta>,
         sample_period_nanos: u64,
         trace_capacity: usize,
+        tenant_id: String,
+        service_id: String,
+        labels: HashMap<String, String>,
     ) -> Self {
+        // Build labels map: start with caller-provided labels,
+        // always inject comm and pid.
+        let mut final_labels = labels;
+        final_labels
+            .entry("comm".into())
+            .or_insert_with(|| comm.clone());
+        final_labels
+            .entry("pid".into())
+            .or_insert_with(|| pid.to_string());
+
         let metadata = proto::Metadata {
             pid,
-            comm,
             kernel_meta: Some(proto::KernelMeta {
                 release: kernel_meta.release.clone(),
                 build_id: kernel_meta.build_id.to_vec(),
                 text_addr: kernel_meta.text_addr,
             }),
+            labels: final_labels,
+        };
+
+        let now = SystemTime::now();
+        let since_epoch = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let capture_start_time = prost_types::Timestamp {
+            seconds: since_epoch.as_secs() as i64,
+            nanos: since_epoch.subsec_nanos() as i32,
         };
 
         let id = SessionId::new();
@@ -151,6 +178,9 @@ impl CaptureSession {
             capture_duration: None,
             sample_period_nanos,
             mappings: Vec::with_capacity(INITIAL_MAPPING_CAPACITY),
+            tenant_id,
+            service_id,
+            capture_start_time: Some(capture_start_time),
         };
 
         Self {
@@ -176,12 +206,13 @@ impl CaptureSession {
         &self.source
     }
 
-    /// Returns the process comm from the proto metadata.
+    /// Returns the process comm from the labels map.
     pub(crate) fn comm(&self) -> &str {
         self.payload
             .metadata
             .as_ref()
-            .map(|m| m.comm.as_str())
+            .and_then(|m| m.labels.get("comm"))
+            .map(|s| s.as_str())
             .unwrap_or("<unknown>")
     }
 
@@ -286,6 +317,9 @@ mod tests {
             mock_kernel_meta(),
             TEST_SAMPLE_PERIOD_NANOS,
             16, // matches compute_trace_capacity(19, 3)
+            "test-tenant".into(),
+            "test-service".into(),
+            HashMap::new(),
         )
     }
 
@@ -519,6 +553,9 @@ mod tests {
             mock_kernel_meta(),
             TEST_SAMPLE_PERIOD_NANOS,
             16,
+            "my-tenant".into(),
+            "my-service".into(),
+            HashMap::new(),
         );
 
         let finalized = session.finalize();
@@ -526,10 +563,13 @@ mod tests {
 
         assert_eq!(payload.sample_period_nanos, TEST_SAMPLE_PERIOD_NANOS);
         assert!(payload.capture_duration.is_some());
+        assert_eq!(payload.tenant_id, "my-tenant");
+        assert_eq!(payload.service_id, "my-service");
+        assert!(payload.capture_start_time.is_some());
 
         let meta = payload.metadata.as_ref().unwrap();
         assert_eq!(meta.pid, 99);
-        assert_eq!(meta.comm, "meta-test");
+        assert_eq!(meta.labels.get("comm").unwrap(), "meta-test");
 
         let kernel = meta.kernel_meta.as_ref().unwrap();
         assert_eq!(kernel.release, "6.8.0-test");

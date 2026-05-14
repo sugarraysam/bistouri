@@ -29,7 +29,7 @@ impl SessionExporter for NullExporter {
         info!(
             session_id = %payload.session_id,
             pid = meta.map(|m| m.pid).unwrap_or(0),
-            comm = %meta.map(|m| m.comm.as_str()).unwrap_or("<unknown>"),
+            comm = %meta.and_then(|m| m.labels.get("comm")).map(|s| s.as_str()).unwrap_or("<unknown>"),
             total_samples = payload.total_samples,
             unique_traces = payload.traces.len(),
             "completed session ready for symbolization (no endpoint configured)",
@@ -78,7 +78,8 @@ impl SessionExporter for GrpcExporter {
         let comm = payload
             .metadata
             .as_ref()
-            .map(|m| m.comm.clone())
+            .and_then(|m| m.labels.get("comm"))
+            .cloned()
             .unwrap_or_default();
 
         // CaptureServiceClient<Channel> is cheap to clone (inner Arc).

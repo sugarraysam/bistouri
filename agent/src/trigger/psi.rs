@@ -43,6 +43,7 @@ impl PsiRegistry {
     }
 
     /// Attempts to register a PSI watcher for the given (cgroup, resource) pair.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register(
         &mut self,
         cgroup_id: u64,
@@ -51,6 +52,9 @@ impl PsiRegistry {
         threshold: f64,
         pid: u32,
         comm: String,
+        tenant_id: String,
+        service_id: String,
+        labels: HashMap<String, String>,
     ) -> PsiRegisterResult {
         let registry_key = (cgroup_id, resource);
 
@@ -71,6 +75,9 @@ impl PsiRegistry {
             cgroup_path.to_path_buf(),
             self.capture_tx.clone(),
             self.request_cooldown,
+            tenant_id,
+            service_id,
+            labels,
         );
         self.watchers.insert(registry_key, watcher);
         metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(self.watchers.len() as f64);
@@ -115,6 +122,7 @@ impl PsiRegistry {
         Ok(async_fd)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_watcher(
         async_fd: AsyncFd<presutaoru::PsiFd>,
         pid: u32,
@@ -123,6 +131,9 @@ impl PsiRegistry {
         cgroup_path: PathBuf,
         capture_tx: mpsc::Sender<CaptureRequest>,
         request_cooldown: Duration,
+        tenant_id: String,
+        service_id: String,
+        labels: HashMap<String, String>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut last_sent: Option<std::time::Instant> = None;
@@ -140,6 +151,9 @@ impl PsiRegistry {
                     pid,
                     comm: comm.clone(),
                     source: CaptureSource::Psi(resource),
+                    tenant_id: tenant_id.clone(),
+                    service_id: service_id.clone(),
+                    labels: labels.clone(),
                 };
                 if capture_tx.try_send(req).is_err() {
                     error!("capture request channel full, PSI event dropped");

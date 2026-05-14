@@ -6,6 +6,8 @@ mod psi;
 mod trie;
 pub(crate) mod watcher;
 
+use std::collections::HashMap;
+
 use crate::capture::session::CaptureRequest;
 use crate::capture::vdso::VdsoCache;
 use crate::sys::cgroup::{cgroup_path_to_id, find_cgroup2_mount, resolve_cgroup_path};
@@ -61,6 +63,9 @@ pub(crate) struct PreparedTriggerAgent {
     watcher: Box<dyn ConfigWatcher>,
     event_rx: Option<mpsc::Receiver<ProcessMatchEvent>>,
     walk_ctx: ProcWalkContext,
+    tenant_id: String,
+    /// Agent-level labels (merged with per-target labels at capture time).
+    agent_labels: HashMap<String, String>,
 }
 
 impl PreparedTriggerAgent {
@@ -69,6 +74,8 @@ impl PreparedTriggerAgent {
         mut watcher: Box<dyn ConfigWatcher>,
         proc_path: PathBuf,
         cgroup_path: Option<PathBuf>,
+        tenant_id: String,
+        agent_labels: HashMap<String, String>,
     ) -> Result<Self> {
         let config = watcher.load_initial().await;
         let (event_tx, event_rx) = mpsc::channel::<ProcessMatchEvent>(TRIGGER_CHANNEL_SIZE);
@@ -97,6 +104,8 @@ impl PreparedTriggerAgent {
                 event_tx,
                 vdso_cache: Arc::new(Mutex::new(VdsoCache::new())),
             },
+            tenant_id,
+            agent_labels,
         })
     }
 
@@ -149,6 +158,8 @@ impl PreparedTriggerAgent {
             walk_ctx: self.walk_ctx,
             event_rx,
             control_rx,
+            tenant_id: self.tenant_id,
+            agent_labels: self.agent_labels,
         };
 
         let task_handle = tokio::spawn(async move {
@@ -171,6 +182,8 @@ struct TriggerAgent {
     walk_ctx: ProcWalkContext,
     event_rx: mpsc::Receiver<ProcessMatchEvent>,
     control_rx: mpsc::Receiver<TriggerControl>,
+    tenant_id: String,
+    agent_labels: HashMap<String, String>,
 }
 
 impl TriggerAgent {
@@ -225,6 +238,13 @@ impl TriggerAgent {
         let target = self.config.target_for_rule(event.rule_id);
         let cgroup_id = cgroup_path_to_id(&cgroup_path);
 
+        // Merge agent-level labels with target-level labels.
+        // Target labels win on conflict.
+        let mut merged_labels = self.agent_labels.clone();
+        for (k, v) in &target.labels {
+            merged_labels.insert(k.clone(), v.clone());
+        }
+
         for res_cfg in &target.resources {
             match self.psi_registry.register(
                 cgroup_id,
@@ -233,6 +253,9 @@ impl TriggerAgent {
                 res_cfg.threshold,
                 event.pid,
                 event.comm.clone(),
+                self.tenant_id.clone(),
+                target.service_id.clone(),
+                merged_labels.clone(),
             ) {
                 PsiRegisterResult::Registered => {
                     info!(

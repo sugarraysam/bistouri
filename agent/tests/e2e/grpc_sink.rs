@@ -39,7 +39,8 @@ impl CaptureService for SinkService {
         let comm = payload
             .metadata
             .as_ref()
-            .map(|m| m.comm.as_str())
+            .and_then(|m| m.labels.get("comm"))
+            .map(|s| s.as_str())
             .unwrap_or("<unknown>");
 
         tracing::debug!(
@@ -131,7 +132,12 @@ impl SessionSink {
                     let guard = self.sessions.lock().expect("sessions mutex poisoned");
                     let seen: HashSet<&str> = guard
                         .iter()
-                        .filter_map(|s| s.metadata.as_ref().map(|m| m.comm.as_str()))
+                        .filter_map(|s| {
+                            s.metadata
+                                .as_ref()
+                                .and_then(|m| m.labels.get("comm"))
+                                .map(|s| s.as_str())
+                        })
                         .collect();
                     if expected.is_subset(&seen) {
                         return guard.clone();

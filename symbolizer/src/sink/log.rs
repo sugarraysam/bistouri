@@ -19,8 +19,8 @@ impl SessionSink for LogSink {
     async fn store(&self, session: ResolvedSession) -> std::result::Result<(), SinkError> {
         info!(
             session_id = %session.session_id,
-            pid = session.pid,
-            comm = %session.comm,
+            tenant_id = %session.tenant_id,
+            service_id = %session.service_id,
             kernel_release = %session.kernel_release,
             total_samples = session.total_samples,
             unique_traces = session.traces.len(),
