@@ -46,7 +46,8 @@ EOF
 		sudo apt-get update -qq
 	fi
 
-	local version="$(uname -r)"
+	local version
+	version="$(uname -r)"
 
 	local exact_version
 	exact_version=$(dpkg-query -W -f='${Version}' "linux-image-${version}" 2>/dev/null)
@@ -59,6 +60,10 @@ EOF
 	# STRICT search: Enforce end-of-string bounds to prevent -fde leakage
 	# This ensures we match linux-image-6.17.0-1010-azure-dbgsym and NOT -azure-fde-dbgsym
 	local pkg
+
+	# DEBUG
+	apt-cache search "^linux-image-${version}*"
+
 	pkg=$(apt-cache search "^linux-image-${version}-dbgsym$" | awk '{print $1}' | head -n 1)
 
 	# Some cloud images use an unsigned dbgsym variant. Fallback if the strict match fails.
