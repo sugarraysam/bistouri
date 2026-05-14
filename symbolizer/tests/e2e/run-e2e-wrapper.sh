@@ -77,6 +77,12 @@ stage_kernel_dbgsym() {
 		# Copy the file so it resolves correctly inside the container mount
 		cp "$VMLINUX_DBG" "$HOST_DEBUG_STAGING/"
 		e2e_info "Successfully copied $VMLINUX_DBG to staging directory."
+
+		local staged_file=$(ls "$HOST_DEBUG_STAGING/"vmlinux* | head -n 1)
+		if command -v readelf >/dev/null 2>&1; then
+			local actual_build_id=$(readelf -n "$staged_file" 2>/dev/null | grep "Build ID" || echo "UNKNOWN")
+			e2e_info "Staged vmlinux Build ID: $actual_build_id"
+		fi
 	else
 		e2e_warn "No kernel debug symbols found to stage."
 	fi
