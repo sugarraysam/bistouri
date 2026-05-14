@@ -47,22 +47,39 @@ EOF
 	fi
 
 	local version="$(uname -r)"
-	local pkg
 
-	pkg=$(apt-cache search "linux-image.*${version}.*dbgsym" | awk '{print $1}' | head -n 1)
+	local exact_version
+	exact_version=$(dpkg-query -W -f='${Version}' "linux-image-${version}" 2>/dev/null)
+
+	if [ -z "$exact_version" ]; then
+		e2e_warn "Could not determine exact Debian version of the running kernel."
+		return
+	fi
+
+	# STRICT search: Enforce end-of-string bounds to prevent -fde leakage
+	# This ensures we match linux-image-6.17.0-1010-azure-dbgsym and NOT -azure-fde-dbgsym
+	local pkg
+	pkg=$(apt-cache search "^linux-image-${version}-dbgsym$" | awk '{print $1}' | head -n 1)
+
+	# Some cloud images use an unsigned dbgsym variant. Fallback if the strict match fails.
+	if [ -z "$pkg" ]; then
+		pkg=$(apt-cache search "^linux-image-unsigned-${version}-dbgsym$" | awk '{print $1}' | head -n 1)
+	fi
 
 	if [ -z "$pkg" ]; then
-		e2e_warn "Could not find any dbgsym packages for $version."
-		e2e_warn "Could not install debug symbols — Phase 2 skipped."
+		e2e_warn "Could not find any exact dbgsym packages for $version."
 		return
 	fi
 
 	e2e_info "Found matching debug package: $pkg"
-	if sudo apt-get install -y --no-install-recommends "$pkg"; then
-		e2e_info "Installed $pkg"
+	e2e_info "Enforcing exact version match: ${exact_version}"
+
+	# 3. Install the specific version mapped to the running kernel
+	if sudo apt-get install -y --allow-downgrades --no-install-recommends "${pkg}=${exact_version}"; then
+		e2e_info "Installed ${pkg}=${exact_version}"
 		VMLINUX_DBG=$(find_vmlinux_dbg)
 	else
-		e2e_warn "Could not install $pkg — Phase 2 (kernel resolution) skipped."
+		e2e_warn "Could not install exact version ${exact_version} of $pkg."
 	fi
 }
 
