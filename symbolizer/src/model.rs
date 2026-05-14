@@ -46,8 +46,8 @@ pub enum ResolvedFrame {
 /// A fully resolved stack trace (kernel + user frames symbolized).
 #[derive(Debug)]
 pub struct ResolvedTrace {
-    pub kernel_frames: Vec<ResolvedFrame>,
-    pub user_frames: Vec<ResolvedFrame>,
+    pub kernel_frames: Vec<std::sync::Arc<ResolvedFrame>>,
+    pub user_frames: Vec<std::sync::Arc<ResolvedFrame>>,
     pub on_cpu_count: u64,
     pub off_cpu_count: u64,
 }

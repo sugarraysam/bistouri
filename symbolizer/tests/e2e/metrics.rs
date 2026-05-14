@@ -81,38 +81,4 @@ impl MetricsClient {
             .map_err(|e| E2eError::MetricsParse(e.to_string()))?;
         Ok(MetricsSnapshot { scrape })
     }
-
-    /// Poll until a counter exceeds `threshold`, or time out.
-    ///
-    /// Kept for Phase 2 (hot-reload) where we must wait for an event
-    /// that hasn't happened yet. All Phase 1 assertions use `scrape()`
-    /// instead — the gRPC sink guarantees the pipeline has already run.
-    #[allow(dead_code)]
-    pub(crate) async fn wait_for_counter_gt(
-        &self,
-        name: &str,
-        label: Option<(&str, &str)>,
-        threshold: f64,
-        timeout: Duration,
-    ) -> Result<f64, E2eError> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                let val = self
-                    .scrape()
-                    .await
-                    .map(|s| s.counter(name, label))
-                    .unwrap_or(0.0);
-                if val > threshold {
-                    return val;
-                }
-                debug!(metric = name, val, threshold, "polling");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        })
-        .await
-        .map_err(|_| E2eError::Timeout {
-            what: format!("{name} > {threshold}"),
-            timeout,
-        })
-    }
 }

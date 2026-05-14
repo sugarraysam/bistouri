@@ -1,6 +1,5 @@
 //! Top-level daemon lifecycle for the symbolizer service.
 //!
-//! Mirrors the `BistouriDaemon` pattern from the agent crate:
 //! `SymbolizerDaemon::start()` boots all subsystems, `shutdown()`
 //! tears them down. `main()` is a thin CLI shim that calls both.
 
@@ -13,7 +12,7 @@ use tonic::transport::Server;
 use tracing::info;
 
 use crate::debuginfod::DebuginfodClient;
-use crate::resolve::cache::{NegativeCache, ObjectCache, SymbolCache};
+use crate::resolve::cache::CachePool;
 use crate::resolve::SessionResolver;
 use crate::server::SymbolizerService;
 use crate::sink::SessionSink;
@@ -27,7 +26,6 @@ pub struct DaemonConfig {
 
 /// Top-level lifecycle manager for the symbolizer service.
 ///
-/// Generic over `C` (debuginfod client) and `S` (sink) — all static dispatch.
 /// Owns a `CancellationToken` for coordinated shutdown.
 pub struct SymbolizerDaemon {
     cancel: CancellationToken,
@@ -39,16 +37,11 @@ impl SymbolizerDaemon {
     ///
     /// Returns immediately with a running daemon. Call `shutdown()` to
     /// stop the server gracefully.
-    #[allow(clippy::too_many_arguments)]
     pub async fn start<C, S>(
         config: DaemonConfig,
         client: Arc<C>,
         sink: Arc<S>,
-        user_objects: ObjectCache,
-        kernel_objects: ObjectCache,
-        user_symbols: SymbolCache,
-        kernel_symbols: SymbolCache,
-        negative: NegativeCache,
+        caches: CachePool,
     ) -> anyhow::Result<Self>
     where
         C: DebuginfodClient + 'static,
@@ -56,17 +49,8 @@ impl SymbolizerDaemon {
     {
         let cancel = CancellationToken::new();
 
-        // Build the resolver.
-        let resolver = Arc::new(SessionResolver::new(
-            user_objects,
-            kernel_objects,
-            user_symbols,
-            kernel_symbols,
-            negative,
-            client,
-        ));
+        let resolver = Arc::new(SessionResolver::new(caches, client));
 
-        // Build the gRPC service.
         let service = SymbolizerService::new(resolver, sink);
 
         let addr = config.listen_addr;

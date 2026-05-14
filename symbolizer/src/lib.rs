@@ -9,7 +9,8 @@
 //! ```ignore
 //! use std::sync::Arc;
 //! use bistouri_symbolizer::daemon::{DaemonConfig, SymbolizerDaemon};
-//! use bistouri_symbolizer::sink::SessionSink;
+//! use bistouri_symbolizer::sink::{SessionSink, SinkError};
+//! use bistouri_symbolizer::model::ResolvedSession;
 //!
 //! struct ClickHouseSink { /* ... */ }
 //!
@@ -17,11 +18,12 @@
 //! impl SessionSink for ClickHouseSink {
 //!     async fn store(&self, session: ResolvedSession) -> Result<(), SinkError> {
 //!         // write to ClickHouse
+//!         todo!()
 //!     }
 //! }
 //!
 //! // Wire it in — the symbolizer library handles everything:
-//! let daemon = SymbolizerDaemon::start(config, client, Arc::new(ClickHouseSink { })).await?;
+//! let daemon = SymbolizerDaemon::start(config, client, Arc::new(ClickHouseSink { }), caches).await?;
 //! tokio::signal::ctrl_c().await?;
 //! daemon.shutdown().await;
 //! ```

@@ -1,10 +1,10 @@
 //! Log-based sink for development and debugging.
 //!
 //! Logs each resolved session's traces at INFO level with function names,
-//! sample counts, and source locations. Useful for verifying the
-//! symbolization pipeline without a downstream database.
+//! sample counts, and source locations.
 
-use async_trait::async_trait;
+use std::sync::Arc;
+
 use tracing::info;
 
 use super::{SessionSink, SinkError};
@@ -14,7 +14,7 @@ use crate::model::{ResolvedFrame, ResolvedSession, SymbolInfo};
 #[derive(Debug)]
 pub struct LogSink;
 
-#[async_trait]
+#[async_trait::async_trait]
 impl SessionSink for LogSink {
     async fn store(&self, session: ResolvedSession) -> std::result::Result<(), SinkError> {
         info!(
@@ -56,8 +56,8 @@ impl SessionSink for LogSink {
     }
 }
 
-fn log_frame(frame: &ResolvedFrame, indent: &str) {
-    match frame {
+fn log_frame(frame: &Arc<ResolvedFrame>, indent: &str) {
+    match frame.as_ref() {
         ResolvedFrame::Symbolized(sym) => log_symbol(sym, indent),
         ResolvedFrame::Inlined(syms) => {
             for (i, sym) in syms.iter().enumerate() {

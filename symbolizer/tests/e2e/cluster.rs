@@ -43,12 +43,6 @@ impl E2eCluster {
     pub(crate) fn symbolizer_logs(&self) -> Result<String, E2eError> {
         kubectl(&["logs", "bistouri-symbolizer", "-c", "symbolizer"])
     }
-
-    /// Fetch debuginfod sidecar logs for debugging.
-    #[allow(dead_code)]
-    pub(crate) fn debuginfod_logs(&self) -> Result<String, E2eError> {
-        kubectl(&["logs", "bistouri-symbolizer", "-c", "debuginfod"])
-    }
 }
 
 impl Drop for E2eCluster {

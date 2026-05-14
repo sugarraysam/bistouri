@@ -10,9 +10,6 @@ use crate::error::{Result, SymbolizerError};
 const FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// Debuginfod client that fetches artifacts over HTTP.
-///
-/// Expects a debuginfod-compatible server (e.g. `elfutils-debuginfod` sidecar)
-/// at the configured base URL.
 #[derive(Debug)]
 pub struct HttpDebuginfodClient {
     client: Client,
@@ -21,9 +18,6 @@ pub struct HttpDebuginfodClient {
 
 impl HttpDebuginfodClient {
     /// Creates a new client pointing at the given debuginfod server.
-    ///
-    /// `base_url` should be the root URL without trailing slash,
-    /// e.g. `http://localhost:8002`.
     pub fn new(base_url: String) -> Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))

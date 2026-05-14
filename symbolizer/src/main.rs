@@ -9,7 +9,7 @@ use bistouri_symbolizer::daemon::{DaemonConfig, SymbolizerDaemon};
 use bistouri_symbolizer::debuginfod::filesystem::FilesystemDebuginfodClient;
 use bistouri_symbolizer::debuginfod::http::HttpDebuginfodClient;
 use bistouri_symbolizer::debuginfod::tiered::TieredDebuginfodClient;
-use bistouri_symbolizer::resolve::cache::{NegativeCache, ObjectCache, SymbolCache};
+use bistouri_symbolizer::resolve::cache::{CachePool, NegativeCache, ObjectCache, SymbolCache};
 use bistouri_symbolizer::sink::log::LogSink;
 
 /// Bistouri symbolizer service — resolves raw stack traces from agents
@@ -121,15 +121,16 @@ async fn main() -> anyhow::Result<()> {
         "starting bistouri-symbolizer"
     );
 
-    // Build split caches (kernel vs user-space).
-    let user_objects = ObjectCache::new(args.user_object_budget_bytes);
-    let kernel_objects = ObjectCache::new(args.kernel_object_budget_bytes);
-    let user_symbols = SymbolCache::new(args.user_symbol_capacity_entries);
-    let kernel_symbols = SymbolCache::new(args.kernel_symbol_capacity_entries);
-    let negative = NegativeCache::new(
-        args.negative_cache_entries,
-        Duration::from_secs(args.negative_ttl_secs),
-    );
+    let caches = CachePool {
+        user_objects: ObjectCache::new(args.user_object_budget_bytes),
+        kernel_objects: ObjectCache::new(args.kernel_object_budget_bytes),
+        user_symbols: SymbolCache::new(args.user_symbol_capacity_entries),
+        kernel_symbols: SymbolCache::new(args.kernel_symbol_capacity_entries),
+        negative: NegativeCache::new(
+            args.negative_cache_entries,
+            Duration::from_secs(args.negative_ttl_secs),
+        ),
+    };
 
     let config = DaemonConfig {
         listen_addr: args.listen_addr.parse()?,
@@ -147,30 +148,10 @@ async fn main() -> anyhow::Result<()> {
         info!(path = %cache_path.display(), "enabling filesystem-backed debuginfod (tiered)");
         let fs_client = FilesystemDebuginfodClient::new(cache_path);
         let client = Arc::new(TieredDebuginfodClient::new(fs_client, http_client));
-        SymbolizerDaemon::start(
-            config,
-            client,
-            sink,
-            user_objects,
-            kernel_objects,
-            user_symbols,
-            kernel_symbols,
-            negative,
-        )
-        .await?
+        SymbolizerDaemon::start(config, client, sink, caches).await?
     } else {
         let client = Arc::new(http_client);
-        SymbolizerDaemon::start(
-            config,
-            client,
-            sink,
-            user_objects,
-            kernel_objects,
-            user_symbols,
-            kernel_symbols,
-            negative,
-        )
-        .await?
+        SymbolizerDaemon::start(config, client, sink, caches).await?
     };
 
     tokio::signal::ctrl_c().await?;

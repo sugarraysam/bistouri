@@ -42,9 +42,27 @@ ensure_kernel_dbgsym() {
 	fi
 }
 
+# ── Stage kernel debug symbols for the k3s hostPath volume ───────────
+# The pod manifest mounts /tmp/bistouri-host-debug → /host-debug.
+# Copy only the current kernel's vmlinux to keep debuginfod indexing fast.
+
+HOST_DEBUG_STAGING="/tmp/bistouri-host-debug"
+
+stage_kernel_dbgsym() {
+	sudo rm -rf "${HOST_DEBUG_STAGING}"
+	sudo mkdir -p "${HOST_DEBUG_STAGING}/boot"
+	if [ -f "$VMLINUX_DBG" ]; then
+		e2e_info "Staging kernel vmlinux → ${HOST_DEBUG_STAGING}/boot/"
+		sudo cp "$VMLINUX_DBG" "${HOST_DEBUG_STAGING}/boot/"
+	else
+		e2e_warn "No kernel debug symbols to stage — Phase 2 may fail"
+	fi
+}
+
 # ── k3s ──────────────────────────────────────────────────────────────
 
 ensure_kernel_dbgsym
+stage_kernel_dbgsym
 start_fresh_k3s
 register_cleanup_trap
 setup_kubeconfig

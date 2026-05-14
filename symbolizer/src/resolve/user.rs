@@ -77,7 +77,6 @@ pub(crate) async fn ensure_cached(
     }
 }
 
-/// Fetches ELF bytes from debuginfod. Tries debuginfo first, then executable.
 async fn fetch_elf(client: &dyn DebuginfodClient, build_id_hex: &str) -> Result<Option<Vec<u8>>> {
     // Prefer debuginfo (has DWARF for file+line resolution).
     if let Some(bytes) = client.fetch(build_id_hex, ArtifactKind::Debuginfo).await? {
@@ -90,24 +89,21 @@ async fn fetch_elf(client: &dyn DebuginfodClient, build_id_hex: &str) -> Result<
 /// Resolves a single user-space frame (build_id + file_offset) to symbols.
 ///
 /// Must be called from a `spawn_blocking` context (addr2line is CPU-bound).
-/// Metadata (segments) is accessed lock-free from `Arc<CachedObject>`.
-/// L2 symbol cache is checked before any lock. Only the DWARF walk
-/// (`symbolize_vaddr`) acquires the per-object context Mutex.
 pub(crate) fn resolve_frame(
     build_id: &[u8; BUILD_ID_SIZE],
     file_offset: u64,
     cache: &ObjectCache,
     symbols: &SymbolCache,
-) -> ResolvedFrame {
+) -> Arc<ResolvedFrame> {
     let start_time = Instant::now();
     let key = (*build_id, file_offset);
 
-    // L2 symbol cache hit — entirely lock-free.
+    // L2 symbol cache hit — zero-copy Arc return.
     if let Some(cached) = symbols.get(&key) {
         counter!(METRIC_CACHE_HITS, "kind" => "symbol", "space" => "user").increment(1);
         histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
             .record(start_time.elapsed().as_secs_f64());
-        return (*cached).clone();
+        return cached;
     }
     counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "user").increment(1);
 
@@ -117,16 +113,14 @@ pub(crate) fn resolve_frame(
         counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "user").increment(1);
         histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
             .record(start_time.elapsed().as_secs_f64());
-        return ResolvedFrame::Symbolized(SymbolInfo::unknown());
+        return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
     };
     counter!(METRIC_CACHE_HITS, "kind" => "object", "space" => "user").increment(1);
 
-    // Segment translation is lock-free — segments are Sync.
-    // Only symbolize_vaddr acquires the per-object context Mutex.
-    let frame = resolve_from_object(&obj, file_offset, &hex);
+    let frame = Arc::new(resolve_from_object(&obj, file_offset, &hex));
 
     // Populate L2 for future lookups.
-    symbols.insert(key, Arc::new(frame.clone()));
+    symbols.insert(key, frame.clone());
     histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
         .record(start_time.elapsed().as_secs_f64());
     frame

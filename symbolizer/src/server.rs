@@ -19,11 +19,7 @@ use crate::sink::SessionSink;
 use bistouri_api::v1 as proto;
 use bistouri_api::v1::capture_service_server::CaptureService;
 
-/// gRPC handler that receives `SessionPayload`s from agents,
-/// resolves their frames, and stores the results via the sink.
-///
-/// Generic over both the debuginfod client and the sink to enable
-/// static dispatch throughout the pipeline — no vtable overhead.
+/// gRPC handler — resolves `SessionPayload`s and stores via the sink.
 pub struct SymbolizerService<C: DebuginfodClient, S: SessionSink> {
     resolver: Arc<SessionResolver<C>>,
     sink: Arc<S>,
@@ -48,8 +44,6 @@ impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> CaptureService
 
         let payload = request.into_inner();
 
-        // Extract lightweight metadata for logging before moving the payload.
-        // Only pid and trace/mapping counts are read — no String clones.
         let pid = payload.metadata.as_ref().map(|m| m.pid).unwrap_or(0);
         let total_samples = payload.total_samples;
         let trace_count = payload.traces.len();
@@ -64,16 +58,11 @@ impl<C: DebuginfodClient + 'static, S: SessionSink + 'static> CaptureService
             "received session payload"
         );
 
-        // Phase 1+2: resolve (async prefetch + blocking symbolization).
-        // Payload is moved into the resolver — no expensive clone.
+        // Payload is moved into the resolver — no clone.
         let resolved = self.resolver.resolve(payload).await;
 
-        // Read session_id from the resolved result (not the raw payload — avoids
-        // the original pre-clone). This is a cheap ref-to-clone just before the
-        // sink consumes the resolved session.
         let session_id = resolved.session_id.clone();
 
-        // Phase 3: store via the configured sink.
         if let Err(e) = self.sink.store(resolved).await {
             error!(
                 session_id = %session_id,

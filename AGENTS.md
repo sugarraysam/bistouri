@@ -54,6 +54,10 @@ symbolizer service for cross-host symbol resolution.
   errors using ? when appropriate.
 - Async: Use tokio for any I/O bound operations. Avoid blocking the
   async runtime.
+- Async Traits: Always use the `async-trait` crate
+  (`#[async_trait::async_trait]`) for async trait definitions. Do not
+  use RPITIT (`impl Future<Output = ...> + Send`) or bare
+  `std::future::Future` return types in traits.
 - Safety: Minimize the use of unsafe. When unsafe is strictly required
   (often the case when dealing with raw pointers from libbpf-rs or
   libc), strictly document the safety invariants being upheld.

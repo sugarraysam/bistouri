@@ -22,15 +22,8 @@ pub enum SymbolizerError {
     #[error("no PT_LOAD segment contains file_offset {file_offset:#x} in build_id {build_id}")]
     SegmentNotFound { build_id: String, file_offset: u64 },
 
-    #[allow(dead_code)]
-    #[error("DWARF symbolization failed: {0}")]
-    Dwarf(String),
-
     #[error("debuginfod returned HTTP {status} for build_id {build_id}")]
     DebuginfodNotFound { build_id: String, status: u16 },
-
-    #[error("gRPC transport error: {0}")]
-    Transport(#[from] tonic::transport::Error),
 }
 
 /// Result alias for the symbolizer crate.

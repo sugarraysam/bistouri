@@ -4,13 +4,6 @@
 //! (typically a shared volume mounted from the debuginfod sidecar).
 //!
 //! Layout: `<cache_path>/<hex_build_id>/debuginfo|executable`
-//!
-//! ## Race condition safety
-//!
-//! This client is read-only. The debuginfod server (RW process) uses
-//! atomic writes (`write` to temp → `rename(2)`), so we never see
-//! partially written files. If a file is deleted while we hold an open
-//! fd, the inode stays alive until we close it (POSIX guarantee).
 
 use std::path::PathBuf;
 
@@ -28,10 +21,6 @@ pub struct FilesystemDebuginfodClient {
 }
 
 impl FilesystemDebuginfodClient {
-    /// Creates a new filesystem client reading from the given cache directory.
-    ///
-    /// `cache_path` should be the root of the debuginfod cache,
-    /// e.g. `/var/cache/debuginfod_client` or a shared volume mount.
     pub fn new(cache_path: PathBuf) -> Self {
         Self { cache_path }
     }
@@ -66,9 +55,7 @@ impl DebuginfodClient for FilesystemDebuginfodClient {
                 Ok(None)
             }
             Err(e) => {
-                // Genuine I/O error (permissions, disk failure, etc.)
-                // Log and return None to allow HTTP fallback rather than
-                // failing the entire request.
+                // Genuine I/O error — log and return None for HTTP fallback.
                 tracing::warn!(
                     build_id = build_id_hex,
                     path = %path.display(),
