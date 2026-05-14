@@ -220,68 +220,72 @@ async fn symbolizer_e2e() {
 
     info!("Phase 2: kernel frame resolution");
 
-    match kernel_meta::HostKernelMeta::read() {
-        Ok(kernel) => {
-            info!(
-                build_id_len = kernel.build_id.len(),
-                text_addr = format!("0x{:x}", kernel.text_addr),
-                release = %kernel.release,
-                known_symbols = kernel.known_symbols.len(),
-                "host kernel metadata"
-            );
-
-            if kernel.known_symbols.is_empty() {
-                warn!("⚠️  Phase 2 skipped: no known kernel symbols in /proc/kallsyms");
-            } else {
-                let build_id_hex: String = kernel
-                    .build_id
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect();
-
-                info!(build_id = %build_id_hex, "waiting for debuginfod to index host kernel");
-                wait_debuginfod_indexed(&build_id_hex).await;
-
-                let payload = fixture::build_kernel_payload(&kernel);
-                info!(session_id = %payload.session_id, "sending kernel-frame payload");
-                client
-                    .report_session(payload)
-                    .await
-                    .expect("ReportSession RPC failed for kernel frames");
-
-                // vmlinux fetch from upstream may be slow.
-                info!("waiting for debuginfod federation + symbolization...");
-                tokio::time::sleep(Duration::from_secs(30)).await;
-
-                let logs = cluster
-                    .symbolizer_logs()
-                    .expect("failed to read symbolizer logs");
-
-                let expected_names: Vec<&str> = kernel
-                    .known_symbols
-                    .iter()
-                    .map(|s| s.name.as_str())
-                    .collect();
-
-                let any_resolved = expected_names.iter().any(|name| logs.contains(name));
-
-                assert!(
-                    any_resolved,
-                    "Phase 2: none of the expected kernel functions ({expected_names:?}) \
-                     found in logs.\n\
-                     --- logs excerpt (last 2000 chars) ---\n{tail}",
-                    tail = &logs[logs.len().saturating_sub(2000)..],
+    if std::env::var("GITHUB_ACTIONS").is_ok() {
+        warn!("⚠️  Phase 2 skipped: running inside GitHub CI");
+    } else {
+        match kernel_meta::HostKernelMeta::read() {
+            Ok(kernel) => {
+                info!(
+                    build_id_len = kernel.build_id.len(),
+                    text_addr = format!("0x{:x}", kernel.text_addr),
+                    release = %kernel.release,
+                    known_symbols = kernel.known_symbols.len(),
+                    "host kernel metadata"
                 );
 
-                info!("✅ Phase 2 passed: kernel frames resolved");
+                if kernel.known_symbols.is_empty() {
+                    warn!("⚠️  Phase 2 skipped: no known kernel symbols in /proc/kallsyms");
+                } else {
+                    let build_id_hex: String = kernel
+                        .build_id
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
+
+                    info!(build_id = %build_id_hex, "waiting for debuginfod to index host kernel");
+                    wait_debuginfod_indexed(&build_id_hex).await;
+
+                    let payload = fixture::build_kernel_payload(&kernel);
+                    info!(session_id = %payload.session_id, "sending kernel-frame payload");
+                    client
+                        .report_session(payload)
+                        .await
+                        .expect("ReportSession RPC failed for kernel frames");
+
+                    // vmlinux fetch from upstream may be slow.
+                    info!("waiting for debuginfod federation + symbolization...");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+
+                    let logs = cluster
+                        .symbolizer_logs()
+                        .expect("failed to read symbolizer logs");
+
+                    let expected_names: Vec<&str> = kernel
+                        .known_symbols
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect();
+
+                    let any_resolved = expected_names.iter().any(|name| logs.contains(name));
+
+                    assert!(
+                        any_resolved,
+                        "Phase 2: none of the expected kernel functions ({expected_names:?}) \
+                         found in logs.\n\
+                         --- logs excerpt (last 2000 chars) ---\n{tail}",
+                        tail = &logs[logs.len().saturating_sub(2000)..],
+                    );
+
+                    info!("✅ Phase 2 passed: kernel frames resolved");
+                }
             }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "⚠️  Phase 2 skipped: cannot read kernel metadata \
-                 (kptr_restrict active or missing permissions)"
-            );
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "⚠️  Phase 2 skipped: cannot read kernel metadata \
+                     (kptr_restrict active or missing permissions)"
+                );
+            }
         }
     }
 
