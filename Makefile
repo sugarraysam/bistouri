@@ -17,22 +17,22 @@ help:
 	@echo "  clean               Clean workspace build artifacts"
 
 fmt:
-	cargo +nightly fmt --all
+	cargo fmt --all
 
 clippy:
-	cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 build:
-	cargo +nightly build --workspace --all-targets --all-features
+	cargo build --workspace --all-targets --all-features
 
 test:
-	cargo +nightly test --workspace --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
+	cargo test --workspace --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 test-asan:
-	RUSTFLAGS="-Zsanitizer=address" cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
+	RUSTFLAGS="-Zsanitizer=address" cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 test-tsan:
-	TSAN_OPTIONS="suppressions=$(CURDIR)/tsan_suppressions.txt" RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
+	TSAN_OPTIONS="suppressions=$(CURDIR)/tsan_suppressions.txt" RUSTFLAGS="-Zsanitizer=thread" cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 docs-check:
 	python3 scripts/check_docs.py

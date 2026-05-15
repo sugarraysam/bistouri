@@ -27,14 +27,14 @@ make -C "$REPO_ROOT" validate-deployment
 # ── Build + load images ──────────────────────────────────────────────
 
 if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
-	e2e_info "Building agent Docker image..."
-	DOCKER_BUILDKIT=1 docker build -t bistouri-agent:local \
-		-f "${REPO_ROOT}/agent/Dockerfile" "$REPO_ROOT"
-	e2e_info "Building stress workload Docker image..."
-	docker build -t bistouri-stress:local \
-		-f "${SCRIPT_DIR}/images/Dockerfile.stress" "${SCRIPT_DIR}/images/"
+    e2e_info "Building agent Docker image..."
+    DOCKER_BUILDKIT=1 docker build -t bistouri-agent:local \
+        -f "${REPO_ROOT}/agent/Dockerfile" "$REPO_ROOT"
+    e2e_info "Building stress workload Docker image..."
+    docker build -t bistouri-stress:local \
+        -f "${SCRIPT_DIR}/images/Dockerfile.stress" "${SCRIPT_DIR}/images/"
 else
-	e2e_info "Skipping Docker builds (SKIP_BUILD=true)"
+    e2e_info "Skipping Docker builds (SKIP_BUILD=true)"
 fi
 
 import_k3s_images bistouri-agent:local bistouri-stress:local
@@ -42,6 +42,6 @@ import_k3s_images bistouri-agent:local bistouri-stress:local
 # ── Run tests ────────────────────────────────────────────────────────
 
 e2e_info "Running agent E2E tests..."
-cargo +nightly test --test e2e -- --nocapture "$@"
+cargo test --test e2e -- --nocapture "$@"
 
 e2e_info "All agent E2E tests passed!"

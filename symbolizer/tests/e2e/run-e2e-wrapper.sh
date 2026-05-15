@@ -18,28 +18,28 @@ source "${REPO_ROOT}/scripts/k3s-helpers.sh"
 VMLINUX_DBG="/usr/lib/debug/boot/vmlinux-$(uname -r)"
 
 ensure_kernel_dbgsym() {
-	if [ -f "$VMLINUX_DBG" ]; then
-		e2e_info "Kernel debug symbols found: $VMLINUX_DBG"
-		return
-	fi
+    if [ -f "$VMLINUX_DBG" ]; then
+        e2e_info "Kernel debug symbols found: $VMLINUX_DBG"
+        return
+    fi
 
-	local pkg="linux-image-$(uname -r)-dbgsym"
-	e2e_info "Kernel debug symbols not found — installing $pkg..."
+    local pkg="linux-image-$(uname -r)-dbgsym"
+    e2e_info "Kernel debug symbols not found — installing $pkg..."
 
-	# Ubuntu dbgsym packages live in a dedicated repo.
-	if ! grep -q ddebs /etc/apt/sources.list.d/*.list 2>/dev/null; then
-		e2e_warn "Adding Ubuntu ddebs repository..."
-		sudo apt-get install -y ubuntu-dbgsym-keyring 2>/dev/null || true
-		echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse" |
-			sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null
-		sudo apt-get update -qq
-	fi
+    # Ubuntu dbgsym packages live in a dedicated repo.
+    if ! grep -q ddebs /etc/apt/sources.list.d/*.list 2>/dev/null; then
+        e2e_warn "Adding Ubuntu ddebs repository..."
+        sudo apt-get install -y ubuntu-dbgsym-keyring 2>/dev/null || true
+        echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse" |
+            sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null
+        sudo apt-get update -qq
+    fi
 
-	if sudo apt-get install -y --no-install-recommends "$pkg" 2>/dev/null; then
-		e2e_info "Installed $pkg"
-	else
-		e2e_warn "Could not install $pkg — Phase 2 (kernel resolution) will be skipped"
-	fi
+    if sudo apt-get install -y --no-install-recommends "$pkg" 2>/dev/null; then
+        e2e_info "Installed $pkg"
+    else
+        e2e_warn "Could not install $pkg — Phase 2 (kernel resolution) will be skipped"
+    fi
 }
 
 # ── Stage kernel debug symbols for the k3s hostPath volume ───────────
@@ -49,14 +49,14 @@ ensure_kernel_dbgsym() {
 HOST_DEBUG_STAGING="/tmp/bistouri-host-debug"
 
 stage_kernel_dbgsym() {
-	sudo rm -rf "${HOST_DEBUG_STAGING}"
-	sudo mkdir -p "${HOST_DEBUG_STAGING}/boot"
-	if [ -f "$VMLINUX_DBG" ]; then
-		e2e_info "Staging kernel vmlinux → ${HOST_DEBUG_STAGING}/boot/"
-		sudo cp "$VMLINUX_DBG" "${HOST_DEBUG_STAGING}/boot/"
-	else
-		e2e_warn "No kernel debug symbols to stage — Phase 2 may fail"
-	fi
+    sudo rm -rf "${HOST_DEBUG_STAGING}"
+    sudo mkdir -p "${HOST_DEBUG_STAGING}/boot"
+    if [ -f "$VMLINUX_DBG" ]; then
+        e2e_info "Staging kernel vmlinux → ${HOST_DEBUG_STAGING}/boot/"
+        sudo cp "$VMLINUX_DBG" "${HOST_DEBUG_STAGING}/boot/"
+    else
+        e2e_warn "No kernel debug symbols to stage — Phase 2 may fail"
+    fi
 }
 
 # ── k3s ──────────────────────────────────────────────────────────────
@@ -70,13 +70,13 @@ setup_kubeconfig
 # ── Build + load images ──────────────────────────────────────────────
 
 if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
-	e2e_info "Building symbolizer Docker image..."
-	make -C "$SYMBOLIZER_DIR" docker-build
+    e2e_info "Building symbolizer Docker image..."
+    make -C "$SYMBOLIZER_DIR" docker-build
 
-	e2e_info "Building debuginfod-fixtures Docker image..."
-	make -C "$SYMBOLIZER_DIR" docker-build-debuginfod
+    e2e_info "Building debuginfod-fixtures Docker image..."
+    make -C "$SYMBOLIZER_DIR" docker-build-debuginfod
 else
-	e2e_info "Skipping Docker builds (SKIP_BUILD=true)"
+    e2e_info "Skipping Docker builds (SKIP_BUILD=true)"
 fi
 import_k3s_images bistouri-symbolizer:local debuginfod-fixtures:local
 
@@ -86,6 +86,6 @@ e2e_info "Running symbolizer E2E tests..."
 
 # sudo is required so /proc/kallsyms exposes real addresses (kptr_restrict).
 sudo --preserve-env=KUBECONFIG,RUST_LOG,HOME,GITHUB_ACTIONS \
-	$(which cargo) +nightly test -p bistouri-symbolizer --test e2e -- --nocapture
+    $(which cargo) test -p bistouri-symbolizer --test e2e -- --nocapture
 
 e2e_info "All symbolizer E2E tests passed!"
