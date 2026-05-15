@@ -32,6 +32,3 @@ TODO.md
 docs/_book/
 docs/.quarto/
 __pycache__
-
-# embedded monorepo
-moon.yml

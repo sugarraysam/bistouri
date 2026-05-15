@@ -1,0 +1,90 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'rust'
+stack: 'systems'
+layer: 'library'
+
+project:
+  title: 'Bistouri'
+  description: 'Open-source eBPF profiling agent and symbolizer library'
+
+# Override inherited file groups to cover the multi-crate workspace.
+fileGroups:
+  sources:
+    - 'agent/src/**/*'
+    - 'api/src/**/*'
+    - 'symbolizer/src/**/*'
+    - 'sys/src/**/*'
+    - '*/Cargo.toml'
+    - 'Cargo.toml'
+  tests:
+    - '*/tests/**/*'
+    - '*/benches/**/*'
+
+tasks:
+  # ── Override inherited tasks with workspace-wide cargo commands ────
+  # Bistouri is a multi-crate workspace. The inherited single-crate
+  # cargo commands won't cover all sub-crates, so we replace them with
+  # --workspace variants. No +nightly needed — the default toolchain
+  # is nightly (pinned in .prototools).
+
+  fmt:
+    command: 'cargo fmt --all --check'
+    options:
+      merge: 'replace'
+
+  clippy:
+    command: 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
+    deps:
+      - '~:fmt'
+    options:
+      merge: 'replace'
+
+  test:
+    command: 'cargo test --workspace --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e'
+    deps:
+      - '~:clippy'
+    options:
+      merge: 'replace'
+
+  build:
+    command: 'cargo build --workspace --all-targets --all-features'
+    deps:
+      - '~:clippy'
+    options:
+      merge: 'replace'
+
+  # ── Bistouri-specific tasks (not inherited) ───────────────────────
+  docs-check:
+    description: 'Verify _quarto.yml chapters exist on disk'
+    command: 'python3 scripts/check_docs.py'
+    inputs:
+      - 'docs/**/*'
+      - 'scripts/check_docs.py'
+
+  test-asan:
+    description: 'Run tests with AddressSanitizer'
+    script: 'RUSTFLAGS="-Zsanitizer=address" cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e'
+    preset: 'utility'
+
+  test-tsan:
+    description: 'Run tests with ThreadSanitizer'
+    script: 'TSAN_OPTIONS="suppressions=$(pwd)/tsan_suppressions.txt" RUSTFLAGS="-Zsanitizer=thread" cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e'
+    preset: 'utility'
+
+  validate-deployment:
+    description: 'Dry-run kubectl apply on deployment manifests'
+    command: 'make validate-deployment'
+    preset: 'utility'
+    inputs:
+      - 'deployment/**/*.yaml'
+
+  generate-crd:
+    description: 'Regenerate CRD YAML from Rust types'
+    command: 'cargo run -q -p bistouri-api --bin crd-gen --features kube'
+    preset: 'utility'
+
+  clean:
+    description: 'Clean workspace build artifacts'
+    command: 'cargo clean'
+    preset: 'utility'
