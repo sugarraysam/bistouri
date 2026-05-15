@@ -21,7 +21,6 @@ mod metrics;
 use std::time::Duration;
 
 use bistouri_api::v1::capture_service_client::CaptureServiceClient;
-use reqwest::StatusCode;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
@@ -29,19 +28,13 @@ use crate::cluster::E2eCluster;
 use crate::error::E2eError;
 
 /// Timeout for the symbolizer pod to become ready.
-const POD_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const POD_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Time to wait after sending payloads for the LogSink to flush.
 const LOG_FLUSH_DELAY: Duration = Duration::from_secs(5);
 
 /// Timeout for the gRPC client to connect to the symbolizer.
 const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Timeout for debuginfod to finish indexing fixture ELFs.
-///
-/// Generous to account for scanning large vmlinux files (~450 MB each)
-/// in `/usr/lib/debug/boot/` on a cold k3s start.
-const DEBUGINFOD_INDEX_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// K8s manifests directory (relative to CARGO_MANIFEST_DIR).
 fn k8s_dir() -> String {
@@ -72,52 +65,6 @@ async fn connect_grpc() -> Result<CaptureServiceClient<Channel>, E2eError> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
-    }
-}
-
-/// Wait for the debuginfod sidecar to finish indexing by probing
-/// its HTTP endpoint for a known build_id.
-///
-/// Without this, the symbolizer may query debuginfod before indexing
-/// completes, get a 404, and permanently negative-cache the build_id.
-async fn wait_debuginfod_indexed(build_id_hex: &str) {
-    let url = format!("http://localhost:8002/buildid/{build_id_hex}/executable");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("failed to build HTTP client for debuginfod probe");
-
-    let deadline = tokio::time::Instant::now() + DEBUGINFOD_INDEX_TIMEOUT;
-    loop {
-        // debuginfod only supports GET (HEAD returns 400).
-        // Body is discarded — one-time probe during test setup.
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status() == StatusCode::OK => {
-                info!(build_id = build_id_hex, "debuginfod indexing confirmed");
-                return;
-            }
-            Ok(resp) => {
-                tracing::debug!(
-                    build_id = build_id_hex,
-                    status = %resp.status(),
-                    "debuginfod not ready yet, retrying..."
-                );
-            }
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "debuginfod probe failed, retrying..."
-                );
-            }
-        }
-
-        if tokio::time::Instant::now() > deadline {
-            panic!(
-                "debuginfod did not index build_id {build_id_hex} within {:?}",
-                DEBUGINFOD_INDEX_TIMEOUT
-            );
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -182,11 +129,6 @@ async fn symbolizer_e2e() {
     let hello = manifest.get("hello").expect("hello fixture not found");
     let expected = hello.expected_symbols();
 
-    // Wait for the debuginfod sidecar to index fixture ELFs.
-    // Without this, the symbolizer queries debuginfod before indexing
-    // completes, gets 404, and negative-caches the build_id.
-    wait_debuginfod_indexed(&hello.build_id_hex).await;
-
     let payload = fixture::build_user_payload("hello", hello);
     info!(session_id = %payload.session_id, "sending user-frame payload");
     client
@@ -236,15 +178,6 @@ async fn symbolizer_e2e() {
                 if kernel.known_symbols.is_empty() {
                     warn!("⚠️  Phase 2 skipped: no known kernel symbols in /proc/kallsyms");
                 } else {
-                    let build_id_hex: String = kernel
-                        .build_id
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect();
-
-                    info!(build_id = %build_id_hex, "waiting for debuginfod to index host kernel");
-                    wait_debuginfod_indexed(&build_id_hex).await;
-
                     let payload = fixture::build_kernel_payload(&kernel);
                     info!(session_id = %payload.session_id, "sending kernel-frame payload");
                     client

@@ -49,22 +49,41 @@ spec:
   - name: debuginfod
     image: debuginfod-fixtures:local
     imagePullPolicy: Never
-    # Scan baked-in fixtures AND the host kernel's debug symbols.
-    # -F: recursive file scan.  -t 0: foreground scan, no rescans.
-    command: ["debuginfod", "-F", "-t", "0", "-vvv", "/fixtures", "/host-debug"]
+    env:
+    - name: DEBUGINFOD_URLS
+      value: "" # Optional: set to "" for hermetic testing
+    command:
+      - "debuginfod"
+      - "-d"
+      - "/var/cache/debuginfod/db.sqlite"
+      - "-F" # -F: recursive file scan.  
+      - "-t" # -t 0: foreground scan, no rescans.
+      - "0"
+      - "-vvv"
+      - "/fixtures"
+      - "/host-debug"
     ports:
     - containerPort: 8002
       name: debuginfod
       protocol: TCP
+    startupProbe:
+      exec:
+        command:
+        - sh
+        - -c
+        - "curl -s http://localhost:8002/metrics | grep 'thread_busy{role=\"scan\"} 0'"
+      periodSeconds: 10
+      failureThreshold: 20
     volumeMounts:
-    - name: debuginfod-cache
-      mountPath: /root/.debuginfod_client
+    - name: debuginfod-db
+      mountPath: /var/cache/debuginfod
     - name: host-debug
       mountPath: /host-debug
       readOnly: true
   volumes:
-  - name: debuginfod-cache
-    emptyDir: {}
+  - name: debuginfod-db
+    emptyDir:
+      medium: Memory # SQLite backed by RAM ++fast e2e tests
   - name: host-debug
     # Custom path for faster indexing, only copying current kernel dbgsym
     hostPath:

@@ -26,6 +26,8 @@ spec:
     image: bistouri-agent:local
     imagePullPolicy: Never
     args:
+    - "--tenant-id"
+    - "bistouri"
     - "--proc-path"
     - "/host/proc"
     - "--log-level"

@@ -32,6 +32,14 @@
                     "items": {
                       "description": "Schema-generation wrapper for `TargetConfig`.\n\nIdentical wire format to `TargetConfig`; differs only in how the `rule`\nfield is represented in the OpenAPI schema (hand-written vs. derived).\nThe agent never instantiates this type at runtime.",
                       "properties": {
+                        "labels": {
+                          "additionalProperties": {
+                            "type": "string"
+                          },
+                          "default": {},
+                          "description": "Per-target labels (optional). Merged with agent-level labels.",
+                          "type": "object"
+                        },
                         "resources": {
                           "description": "PSI resources to watch for this target. At most 3 (Memory, Cpu, Io).",
                           "items": {
@@ -83,11 +91,16 @@
                             "type"
                           ],
                           "type": "object"
+                        },
+                        "service_id": {
+                          "description": "Logical service identity. Required for multi-tenant routing.",
+                          "type": "string"
                         }
                       },
                       "required": [
                         "resources",
-                        "rule"
+                        "rule",
+                        "service_id"
                       ],
                       "type": "object"
                     },
@@ -122,6 +135,10 @@
               {
                 "message": "duplicate resource type within a single target — each PSI resource may appear at most once per target",
                 "rule": "self.spec.targets.all(t,  [\"memory\", \"cpu\", \"io\"].all(res,    t.resources.filter(r, r.resource == res).size() <= 1  ))"
+              },
+              {
+                "message": "each target must declare a service_id",
+                "rule": "self.spec.targets.all(t, size(t.service_id) > 0)"
               }
             ]
           }
