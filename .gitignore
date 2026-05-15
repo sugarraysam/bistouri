@@ -33,9 +33,5 @@ docs/_book/
 docs/.quarto/
 __pycache__
 
-# Private storage backend (ClickHouse sink, schema migrations).
-# Not part of the open-source distribution — lives in a separate private repo.
-bistouri-storage/
-
 # embedded monorepo
 moon.yml
