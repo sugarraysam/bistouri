@@ -4,31 +4,37 @@ title: "The Heart of the Agent: eBPF Programs"
 
 ## eBPF in 5 Minutes
 
-To understand Bistouri, one must first view eBPF not merely as "code that runs in the kernel," but as a highly constrained, event-driven virtual machine. Our agent doesn't "run" continuously; it sleeps until the kernel encounters a specific trigger—a timer interrupt, a system call, or a process execution.
+To understand Bistouri, one must first view eBPF not merely as "code that runs in the kernel," but as a highly constrained, event-driven virtual machine. Our agent doesn't "run" continuously; it sleeps until the kernel encounters a specific trigger—a timer interrupt, a system call, a process execution, or a context switch.
 
 The constraints of this environment dictate our architecture. Because the eBPF verifier must prove our program is safe, we cannot use loops with unknown bounds or allocate memory dynamically. This leads us to a design where all memory is pre-allocated in "maps." Maps are the bridge between the transient world of kernel events and the persistent world of our Rust userspace agent.
 
 ## The Profiler Program
 
-The profiler consists of two primary entry points, each serving a distinct purpose in the lifecycle of a monitored application.
+The profiler consists of three primary entry points, each serving a distinct purpose in the lifecycle of a monitored application.
 
-The first is `handle_perf`, attached to a `perf_event`. This is our sampling engine. It fires periodically—ideally at a prime frequency like 19Hz to avoid aliasing with periodic application tasks—to capture the state of the CPU. The design here is a "filter-first" approach. The very first thing we do is check `pid_filter_map`. If the current Process ID isn't in that map, we exit immediately. This minimizes the overhead on the rest of the system—we only pay the full cost of stack walking for processes we actually care about.
+The first is `handle_perf`, attached to a `perf_event`. This is our on-CPU sampling engine. It fires periodically—ideally at a prime frequency like 19Hz to avoid aliasing with periodic application tasks—to capture the state of the CPU. The design here is a "filter-first" approach. The very first thing we do is check `pid_filter_map`. If the current Process ID isn't in that map, we exit immediately. This minimizes the overhead on the system—we only pay the full cost of stack walking for processes we actually care about.
 
-A major design choice in `handle_perf` is the use of the `BPF_F_USER_BUILD_ID` flag. This instructs the kernel to perform the VMA walk and resolve the ELF Build ID for every user-space frame *during* the stack walk. This is significantly more efficient than capturing raw instruction pointers and trying to resolve them in userspace by parsing `/proc/<pid>/maps`, which is often stale or race-prone.
+The second is `handle_sched_switch`, which implements our off-CPU profiler. Unlike the timer-based `handle_perf`, this fires on every scheduler context switch. To keep overhead negligible, it uses a very tight filter: it only captures a stack if the process is in the `pid_filter_map` and is transitioning into `TASK_UNINTERRUPTIBLE` (D state). This specifically targets processes blocked on disk I/O or kernel resources, directly complementing the signals we get from Linux PSI. 
 
-The second is `match_comm_on_exec`. Attached to the `sched_process_exec` tracepoint, this is a lifecycle hook. When a process calls `execve`, we check if its command name matches our watch list. This allows Bistouri to "discover" and start profiling new instances of a service the moment they start, rather than waiting for a userspace polling loop to find them.
+::: {.callout-note}
+## Off-CPU Rate Limiting
+Because context switches can happen much faster than 19Hz, we use a BPF LRU hash map (`off_cpu_last_ts`) to rate-limit off-CPU samples. We pass a sampling period from Rust into a `volatile const` variable in BPF `.rodata`. This allows the kernel to skip redundant off-CPU captures for the same PID if they occur too close together, ensuring the off-CPU profile matches the "cadence" of our on-CPU sampling.
+:::
+
+The third is `match_comm_on_exec`. Attached to the `sched_process_exec` tracepoint, this is a lifecycle hook. When a process calls `execve`, we check if its command name matches our watch list. This allows Bistouri to "discover" and start profiling new instances of a service the moment they start, rather than waiting for a userspace polling loop to find them.
 
 ## Shared Data Structures (Kernel ↔ Userspace)
 
-We use three distinct types of BPF maps, each chosen for its specific performance characteristics:
+We use four distinct types of BPF maps, each chosen for its specific performance characteristics:
 
-1.  **Hash Map (`pid_filter_map`):** Used for O(1) lookups of active targets. When the Orchestrator starts a capture session, it inserts the PID here. The eBPF program treats this as a read-only allow-list.
-2.  **LPM Trie (`comm_lpm_trie`):** The Longest Prefix Match trie is used for the "trigger" logic. We use `BPF_F_NO_PREALLOC` here, as required by the kernel for this map type. It allows for both exact matches and prefix-based matching (e.g., matching all processes starting with `worker-`).
-3.  **Ring Buffers:** We use three dedicated ring buffers (`stack_events`, `trigger_events`, and `errors`). Ring buffers are more memory-efficient than older per-CPU arrays when event rates are bursty. They also support `bpf_ringbuf_reserve`, which allows us to write data directly into the buffer memory, avoiding an extra copy from the eBPF stack.
+1.  **Hash Map (`pid_filter_map`):** Used for O(1) lookups of active targets. When the Orchestrator starts a capture session, it inserts the PID here. 
+2.  **LPM Trie (`comm_lpm_trie`):** The Longest Prefix Match trie is used for the "trigger" logic. It allows for both exact matches and prefix-based matching (e.g., matching all processes starting with `worker-`).
+3.  **LRU Hash (`off_cpu_last_ts`):** We use an LRU (Least Recently Used) map to store the last capture timestamp per PID. The LRU property is critical here: it lets the kernel automatically evict stale entries for processes that have exited, preventing a slow memory leak without requiring userspace to manually clean up timestamps.
+4.  **Ring Buffers:** We use dedicated ring buffers (`stack_events`, `trigger_events`, and `errors`). Ring buffers are more memory-efficient than older per-CPU arrays when event rates are bursty. 
 
 ::: {.callout-tip}
 ## Error Telemetry
-Bistouri treats eBPF failures as first-class telemetry. If we fail to reserve space in a ring buffer or `bpf_get_stack` fails, we report a tagged error event. This "meta-profiling" is essential for operators to know if the agent is dropping samples due to resource contention.
+Bistouri treats eBPF failures as first-class telemetry. If `bpf_get_stack` fails, we report a tagged error event specifying whether it was the kernel or user stack that failed. This "meta-profiling" is essential for operators to know if the agent is losing visibility due to memory unmapped or kernel restrictions.
 :::
 
 ## Satisfying the Verifier
@@ -36,20 +42,23 @@ Bistouri treats eBPF failures as first-class telemetry. If we fail to reserve sp
 The eBPF verifier is our most demanding "code reviewer." To satisfy it, we adopt several patterns:
 
 *   **Null Checks:** Every `bpf_map_lookup_elem` and `bpf_ringbuf_reserve` can return NULL. We must check these explicitly before accessing the pointer.
-*   **Bounded Copies:** When copying the process name (`comm`), we use `__builtin_memcpy` with fixed sizes (`TASK_COMM_LEN`). This ensures the verifier can statically prove we aren't overrunning our destination.
-*   **Stack Depth Limits:** We limit stack traces to 127 frames. This is a compromise between visibility and the eBPF program's complexity limit. Each frame in the user stack is a 32-byte `user_stack_frame` struct; capturing 127 of these pushes the limits of what we can safely handle within the eBPF execution context.
+*   **Bounded Copies:** When copying the process name, we use `__builtin_memcpy` with fixed sizes (`TASK_COMM_LEN`). This ensures the verifier can statically prove we aren't overrunning our destination.
+*   **CO-RE Accessors:** In `handle_sched_switch`, we use `BPF_CORE_READ` to access `prev_state` from the task struct. This ensures the program remains portable even if the field offset changes between kernel versions.
+*   **Stack Depth Limits:** We limit stack traces to 127 frames. This is a compromise between visibility and the eBPF program's complexity limit.
 
 ## Build Pipeline (libbpf-cargo)
 
 Bistouri uses `libbpf-cargo` to bridge the C and Rust worlds. The build process is orchestrated by `build.rs`, which invokes the `SkeletonBuilder`.
 
-This generates a "skeleton"—a Rust module that embeds the compiled BPF bytecode and provides a type-safe interface for loading the programs. A key component here is `vmlinux.h`, generated via CO-RE (Compile Once – Run Everywhere). Instead of relying on local kernel headers, we use a generated header that describes the kernel's internal structures. This allows a single Bistouri binary to run on different kernel versions, even if internal struct offsets have shifted.
+This generates a "skeleton"—a Rust module that embeds the compiled BPF bytecode. A key design point is the use of `vmlinux.h`, generated via CO-RE (Compile Once – Run Everywhere). Instead of relying on local kernel headers, we use a generated header that describes the kernel's internal structures. This allows a single Bistouri binary to run on different kernel versions, even if internal struct offsets have shifted.
+
+The pipeline also handles the configuration of BPF "global variables." In Rust, we can modify fields in `open_skel.maps.rodata_data` after opening but before loading the skeleton. We use this to inject the sampling frequency directly into the BPF bytecode, avoiding the overhead of a map lookup for every single sample.
 
 ## Memory Layout & repr(C)
 
 The data structures defined in `profiler.h` are the "contracts" between the kernel and userspace. Because C and Rust have different ideas about struct padding and alignment, these headers must be designed carefully.
 
-We use explicit width types (`__u32`, `__u64`) and manual padding (like `_pad` in `error_event`) to ensure consistency. In Rust, we mirror these with `#[repr(C)]`.
+We use explicit width types (`__u32`, `__u64`) and manual padding (like `_pad` in `stack_trace_event`) to ensure consistency. In Rust, we mirror these with `#[repr(C)]`.
 
 The `user_stack_frame` is particularly interesting. It contains a union:
 ```c
@@ -71,15 +80,17 @@ The following diagram illustrates how an event flows from a kernel trigger throu
 ```{mermaid}
 graph TD
     subgraph "Kernel Space"
-        P["Perf Event / Timer"] -->|"Trigger"| H["handle_perf"]
+        P["Perf Event / Timer"] -->|"Trigger"| H["handle_perf (On-CPU)"]
+        S["Sched Switch"] -->|"Trigger"| SS["handle_sched_switch (Off-CPU)"]
         E["execve"] -->|"Trigger"| M["match_comm_on_exec"]
 
         H --> L1{"PID in filter?"}
+        SS --> L1
         L1 -->|"No"| Exit["Exit"]
         L1 -->|"Yes"| R1["Reserve Ringbuf Space"]
 
-        R1 -->|"Success"| S["Capture Kernel & User Stacks"]
-        S -->|"Submit"| Sub["Submit Event"]
+        R1 -->|"Success"| ST["Capture Kernel & User Stacks"]
+        ST -->|"Submit"| Sub["Submit Event"]
         R1 -->|"Failure"| Err["Log to Error Map"]
 
         M --> L2{"Comm in Trie?"}
@@ -93,6 +104,7 @@ graph TD
         Err --> RB3[("errors Ringbuf")]
         T[("comm_lpm_trie")] -.-> L2
         F[("pid_filter_map")] -.-> L1
+        L[("off_cpu_last_ts")] -.-> SS
     end
 
     subgraph "User Space (Rust)"
@@ -105,5 +117,5 @@ graph TD
 ```
 
 ---
-_Auto-generated from commit `02320e5` by Gemini 3.1 Pro.
-Last updated: 2025-05-15_
+_Auto-generated from commit `ac794cd` by Gemini 3.1 Pro.
+Last updated: 2026-05-17_
