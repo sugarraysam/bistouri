@@ -8,9 +8,11 @@ The heart of Bistouri is a feedback loop between the kernel and userspace. We do
 
 The first stage is reactive. When a process executes (`match_comm_on_exec`), the kernel-side BPF program checks the new process's command name against a set of rules stored in an LPM (Longest Prefix Match) trie. If the process matches our criteria—for example, if it's a binary name we've been told to watch—the BPF program emits an event to the `trigger_events` ring buffer. This signals the userspace agent to "mark" the PID for monitoring by adding it to a fast-path allow-list hash map (`pid_filter_map`).
 
-The second stage is the actual sampling. We attach a BPF program to a software perf event (`CPU_CLOCK`) on every CPU. At a fixed frequency—by default 19Hz, a prime number chosen to avoid synchronization with periodic application tasks—the kernel interrupts the CPU and runs our handler. This handler checks the `pid_filter_map`. If the current PID isn't there, we exit immediately with minimal overhead. If it is, we perform the "heavy" work: walking the stack for both kernel and user space.
+The second stage is the actual sampling. We use a hybrid approach to capture both on-CPU and off-CPU activity. For on-CPU work, we attach a BPF program to a software perf event (`CPU_CLOCK`) on every CPU. At a fixed frequency—by default 19Hz, a prime number chosen to avoid synchronization with periodic application tasks—the kernel interrupts the CPU and runs our handler.
 
-This design ensures that the cost of profiling is proportional to the number of processes we are actually interested in, while the cost for everything else is just a single hash map lookup.
+For off-CPU work, we attach to the `sched_switch` tracepoint. If a monitored PID transitions to the `TASK_UNINTERRUPTIBLE` state—indicating it is blocked on I/O or a kernel resource—we capture a stack trace. This "off-CPU" profiling is rate-limited in the kernel to match the on-CPU sampling frequency, ensuring that highly contended locks or slow disks don't flood our buffers while still providing a complete picture of why a process is stalled.
+
+In both cases, the handler first checks the `pid_filter_map`. If the current PID isn't there, we exit immediately with minimal overhead. If it is, we perform the "heavy" work: walking the stack for both kernel and user space. This design ensures that the cost of profiling is proportional to the number of processes we are actually interested in.
 
 ## BPF Map Lifecycle
 
@@ -39,20 +41,20 @@ The LPM trie is the standard tool for this in the kernel. It allows us to store 
 
 ## Batch Updates & Performance
 
-To keep the probe overhead low, we avoid performing complex logic inside the BPF program attached to the perf event. The `handle_perf` program is the most frequently executed code path in our system.
+To keep the probe overhead low, we avoid performing complex logic inside the BPF programs. The `handle_perf` and `handle_sched_switch` programs are the most frequently executed code paths in our system.
 
-We've optimized this by moving the filtering logic to the `pid_filter_map`. When the userspace agent decides to "monitor" a PID, it performs a single map update. The BPF side then performs a single map lookup. We've considered batching these updates for high-churn environments, but given our "trigger-based" philosophy, the rate of change in the filter map is typically low enough that individual updates are sufficient and provide lower latency between a trigger event and the start of profiling.
+We've optimized this by moving the filtering logic to the `pid_filter_map`. When the userspace agent decides to "monitor" a PID, it performs a single map update. The BPF side then performs a single map lookup. We also use the BPF `.rodata` section to share configuration like the `off_cpu_period_ns`. Because this value is written by Rust before the skeleton is loaded and becomes read-only in the kernel, the BPF program can treat it as a constant, allowing the verifier to optimize the code path.
 
 ## Error Recovery
 
 One of the most overlooked aspects of eBPF design is "telemetry for the profiler itself." If a stack walk fails in the kernel, or if we run out of space in a ring buffer, how does the operator know?
 
 We implemented a dedicated `errors` ringbuffer. Inside the BPF programs, we use a tagged union (`ErrorEvent`) to report different failure modes:
-1.  **`ERR_STACK_FETCH`**: If `bpf_get_stack` returns a negative code (e.g., because the process exited while the stack was being walked).
-2.  **`ERR_RESERVE_STACK_RINGBUF`**: If the high-volume stack event ring buffer is full and we dropped a sample.
+1.  **`ERR_STACK_FETCH`**: If `bpf_get_stack` returns a negative code. We decode these in userspace (e.g., `-14` as `EFAULT` when process memory is unmapped) to provide actionable logs.
+2.  **`ERR_RESERVE_STACK_RINGBUF`**: If the 64MB stack event ring buffer is full.
 3.  **`ERR_RESERVE_TRIGGER_RINGBUF`**: If the trigger event ring buffer is full.
 
-In userspace, these are caught, decoded, and logged with actionable advice (e.g., "increase ring buffer size"). This allows us to distinguish between "there is no activity" and "the profiler is failing to capture data." The use of a C union in the BPF side, mapped to a Rust `enum` in the agent, gives us a type-safe way to handle these heterogeneous error events without the overhead of multiple maps.
+In userspace, these are caught, decoded, and logged with specific context—like suggesting an increase in buffer size if drops are detected. The use of a C union in the BPF side, mapped to a Rust `enum` in the agent, gives us a type-safe way to handle these heterogeneous error events without the overhead of multiple maps.
 
 ## Agent Lifecycle
 
@@ -62,18 +64,18 @@ The lifecycle of the agent is managed through a strict sequence of loading, atta
 stateDiagram-v2
     [*] --> Unloaded : "build()"
     Unloaded --> Loaded : "load()"
-    Loaded --> Attached : "attach_perf_events()"
+    Loaded --> Attached : "attach_progs()"
     Attached --> Polling : "start_polling()"
     Polling --> Attached : "cancel.cancel()"
     Attached --> [*] : "Drop"
 
     note right of Loaded : "Maps created, PROG_LOAD called"
-    note right of Attached : "Progs linked to CPU_CLOCK"
+    note right of Attached : "Links created for Perf Events and Tracepoints"
     note right of Polling : "Tokio task running AsyncRingBuffer"
 ```
 
 The `LoadedProfilerAgent` struct acts as a guard for the active profiling session. When the struct is dropped, the BPF links and the ring buffer are cleaned up in a specific sequence. This prevents use-after-free-like scenarios where the kernel might try to push data into a ring buffer that userspace has already unmapped.
 
 ---
-_Auto-generated from commit `02320e5` by Gemini 3.1 Pro.
-Last updated: 2026-05-10_
+_Auto-generated from commit `ac794cd` by Gemini 3.1 Pro.
+Last updated: 2026-05-17_

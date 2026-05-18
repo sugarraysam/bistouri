@@ -59,30 +59,30 @@ While BPF gives us high-performance, event-driven notifications for *new* proces
 
 To guarantee completeness, we implement a `proc_walk`. Every 30 seconds, the agent scans `/proc`, matches every running process against our userspace trie, and ensures a PSI watcher is active for every matching cgroup. This "belt and braces" approach combines the low latency of BPF with the reliability of a periodic scan.
 
-Additionally, the walk serves as a metadata collection phase. For every matched process, we read `/proc/<pid>/auxv` to resolve its vDSO address range. This information is stored in a shared LRU cache, allowing the profiler to classify stack frames without performing blocking I/O during the high-frequency sampling path.
+Additionally, the walk serves as a metadata collection phase. For every matched process, we read `/proc/<pid>/auxv` to resolve its vDSO address range. This information is stored in a shared `VdsoCache` (an LRU cache), allowing the profiler to classify stack frames (marking them as `[vdso]` instead of `[unknown]`) without performing blocking I/O during the high-frequency sampling path.
 
 ## Hot Reload Without Downtime
 
-Bistouri is designed for long-running production use, meaning we must support configuration changes without restarting the agent. The `TriggerAgent` manages this through an internal event loop.
+Bistouri is designed for long-running production use, meaning we must support configuration changes without restarting the agent. The `TriggerAgent` supports two discovery strategies:
 
-When a configuration file change is detected (via `inotify`), the agent:
+1.  **File Watcher:** Uses `inotify` to watch a YAML file on disk. It includes a 200ms debounce timer to handle "atomic" file swaps (common with Kubernetes ConfigMaps) where multiple filesystem events fire in rapid succession.
+2.  **Kubernetes Watcher:** Watches a `BistouriConfig` Custom Resource (CR) via the Kubernetes API. This allows for centralized configuration management across a cluster.
 
+When a change is detected, the agent:
 1.  Signals the current `proc_walk` to cancel.
 2.  Purges the `PsiRegistry`, effectively "unplugging" all current kernel watchers.
 3.  Rebuilds the userspace matcher and repopulates the BPF trie.
 4.  Immediately triggers a fresh `proc_walk` to re-establish watchers based on the new rules.
 
-This transition is atomic from the perspective of the event loop, ensuring we never have "leaked" watchers from an old configuration running alongside the new one.
-
 ## Eventual Consistency Model
 
 Because the BPF trie and the userspace agent communicate asynchronously via a ring buffer, there is a tiny window for race conditions during a hot reload. An old BPF rule might fire just as the userspace configuration is being cleared.
 
-We handle this by assigning a unique, monotonically increasing `rule_id` to every target in the config. When the `TriggerAgent` receives an event from BPF, it re-validates the `rule_id` against its current userspace matcher. If the ID is unknown or the process name no longer matches that ID, the event is dropped as "stale." This ensures that the system eventually converges on the correct state defined in the latest config file.
+We handle this by assigning a unique, monotonically increasing `rule_id` to every target in the config. When the `TriggerAgent` receives an event from BPF, it re-validates the `rule_id` against its current userspace matcher. If the ID is unknown or the process name no longer matches that ID, the event is dropped as "stale." This ensures that the system eventually converges on the correct state defined in the latest config.
 
 ## Data Flow
 
-The following diagram illustrates how a process discovery event flows from the kernel up to the point where a PSI watcher is registered.
+The following diagram illustrates how a process discovery event flows from the kernel up to the point where a PSI watcher is registered, and how configuration sources feed into the agent.
 
 ```{mermaid}
 graph TD
@@ -96,7 +96,13 @@ graph TD
         RING_BUF -->|"Event"| EV_LOOP["Event Loop"]
         PROC_SCAN["Periodic /proc Walk"] -->|"Match"| EV_LOOP
 
-        INOTIFY["inotify Watcher"] -->|"Reload Config"| EV_LOOP
+        subgraph "Watchers"
+            INOTIFY["inotify (File)"]
+            KUBE["kube-rs (CRD)"]
+        end
+
+        INOTIFY -->|"Reload"| EV_LOOP
+        KUBE -->|"Reload"| EV_LOOP
 
         EV_LOOP -->|"Validate Rule ID"| MATCHER["Comm Matcher"]
         MATCHER -->|"Valid"| PSI_REG["PSI Registry"]
@@ -110,5 +116,5 @@ graph TD
 ```
 
 ---
-_Auto-generated from commit `02320e5` by Gemini 3.1 Pro.
-Last updated: 2026-05-10_
+_Auto-generated from commit `ac794cd` by Gemini 3.1 Pro.
+Last updated: 2026-05-17_
