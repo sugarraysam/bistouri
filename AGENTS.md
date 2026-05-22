@@ -1,126 +1,52 @@
-# AI Agent Context & Guidelines for Bistouri
+# AI Agent Guidelines for Bistouri
 
-Welcome! You are assisting with Bistouri, a workspace containing an
-eBPF-based profiling agent written in Rust and a centralized symbolizer
-service.
+You are assisting with Bistouri, an eBPF-based profiling agent written
+in Rust and C. **Assume this is a standalone project.**
 
-## Project Goal
+## Architecture
 
-The goal of Bistouri is to capture stack traces from Linux processes
-dynamically, triggered by Pressure Stall Information (PSI) events
-(Memory, CPU, IO). These captured stack traces are sent to a centralized
-symbolizer service for cross-host symbol resolution.
+- **Agent (`agent/`)**: eBPF daemon capturing stack traces via PSI
+  triggers. Uses `tokio` and `libbpf-rs`. eBPF code is C.
+- **Shared API (`api/`)**: gRPC/Protobuf definitions.
+- **Symbolizer (`symbolizer/`)**: Centralized service for cross-host
+  resolution.
 
-## Workspace Structure
+## Strict Coding Constraints
 
-- `agent/`: The eBPF profiling agent daemon. Requires Linux kernel
-  headers and libbpf at build time.
-- `api/`: Shared gRPC/Protobuf definitions consumed by both agent and
-  symbolizer. No platform-specific dependencies.
-- `symbolizer/`: The centralized symbolizer service (downstream consumer
-  of agent payloads). No kernel dependencies.
+### Rust (Performance & Memory)
 
-## Architecture & Tech Stack
+- **Zero-Allocation Hot Paths**: Avoid `clone()`, `format!()`, and
+  implicit copies. Favor borrowing and strict lifetimes.
+- **Capacity Planning**: Use `with_capacity` universally when
+  initializing `Vec`, `HashMap`, etc.
+- **Static over Dynamic**: Prefer static dispatch with generics
+  (`impl Trait`) over `dyn Trait` to avoid vtable penalties.
+- **Async**: Use `#[async_trait::async_trait]`. Never block the `tokio`
+  event loop. Offload `/proc` walks or parsing to
+  `tokio::task::spawn_blocking`.
+- **Testing**: Use `rstest` table-tests for parameterized edge cases.
+  Keep coverage high.
 
-- User Space: Rust, using tokio for async operations and libbpf-rs for
-  interacting with the eBPF subsystem (agent only).
-- Kernel Space (eBPF): C, compiled to eBPF byte-code using libbpf-cargo
-  (agent only).
-- Network: gRPC (tonic) for agent → symbolizer communication, with
-  Protobuf schemas defined in the `api/` crate.
+### eBPF & Kernel (C & Rust integration)
 
-## Coding Rules & Guidelines
+- **Verifier Safe**: BPF code must have bounded loops and avoid complex
+  branching.
+- **Layout Parity**: Shared C/Rust structs MUST use `#[repr(C)]` in
+  Rust.
+- **Map Streaming**: Use BPF ring buffers over perf buffers for
+  high-throughput events.
+- **Naming Limits**: Never use the `bpf_` prefix for user-space types;
+  it is reserved for Linux kernel BPF helpers.
 
-### 1. Rust Best Practices
+## OSS Workflow & Building
 
-- Idiomatic Code: Use modern Rust idioms. Leverage the type system to
-  enforce state transitions and invariants.
-- Clean Code: Let the code speak for itself by using descriptive names.
-  Keep comments light; only use them where design choices are made or to
-  explain tradeoffs.
-- Modularity & Traits: Try to use Rust `trait`s wherever possible to make the
-  code modular and to allow reimplementing modules where it makes sense. However,
-  use them conservatively and only for important modules and functionalities
-  where future extensibility is very likely.
-- Interfaces & Boundaries: Use the `todo!()` macro where interface boundaries are
-  drawn. It is acceptable to not finish the implementation of something, as we
-  do modular bite-sized changes. When a boundary is reached, add a `todo!()`
-  to finish it later.
-- Clippy Checks: All code must pass cargo clippy without warnings. Fix
-  clippy lints as part of the development process.
-- Error Handling: Use thiserror for error handling. It is idiomatic for
-  each module to express and declare the specific errors they own,
-  rather than using a generic anyhow::Result everywhere. Propagate
-  errors using ? when appropriate.
-- Async: Use tokio for any I/O bound operations. Avoid blocking the
-  async runtime.
-- Async Traits: Always use the `async-trait` crate
-  (`#[async_trait::async_trait]`) for async trait definitions. Do not
-  use RPITIT (`impl Future<Output = ...> + Send`) or bare
-  `std::future::Future` return types in traits.
-- Safety: Minimize the use of unsafe. When unsafe is strictly required
-  (often the case when dealing with raw pointers from libbpf-rs or
-  libc), strictly document the safety invariants being upheld.
-- Testing: Favor the `rstest` crate with the table-test pattern
-  (`#[rstest]` + `#[case]`) for parametrized tests. This makes it
-  trivial to add coverage for newly discovered edge cases — just add a
-  new `#[case]` line. Use standalone `#[test]` only for complex
-  lifecycle tests that don't fit a table structure.
-- Allocation Discipline: Avoid unnecessary heap allocations on hot paths.
-  Do not call `.clone()`, `.to_string()`, or `format!()` unless strictly
-  required by an API boundary. Prefer borrowing (`&str` over `String`,
-  `&[T]` over `Vec<T>`) and use `Copy` types where possible. When a
-  value must be moved into a consuming call, read any fields needed for
-  logging/error context from the result of that call rather than cloning
-  them beforehand.
-- Units in Names: Variables, struct fields, CLI flags, and environment
-  variables that carry dimensional values must include the unit as a
-  suffix (e.g. `timeout_secs`, `budget_bytes`, `capacity_entries`,
-  `interval_ms`). This makes the expected unit self-documenting and
-  prevents callers from passing the wrong magnitude.
+This project is built using Make and Cargo natively.
 
-### 2. eBPF Specific Guidelines (agent/ crate only)
+- Run `make ci` from the root to execute formatting, clippy, and tests.
+- Run `make -C agent <target>` for agent-specific tasks (e.g.,
+  docker-build).
+- **All code must pass `make ci` before completion.**
 
-- eBPF Verifier: Keep eBPF programs simple to satisfy the Linux kernel
-  verifier. Avoid unbound loops and ensure memory accesses are
-  bounds-checked.
-- Shared Data Structures: Any struct shared between the eBPF C code and
-  the Rust user-space code MUST have an identical layout. Use
-  `#[repr(C)]` in Rust.
-- Map Interactions: Prefer eBPF ring buffers over perf buffers for
-  high-throughput event streaming from kernel to user-space.
-- Naming: The `bpf_` prefix is reserved for Linux kernel BPF helper
-  functions (e.g. `bpf_get_current_pid_tgid`, `bpf_ringbuf_reserve`).
-  Never use it for user-space types, map names, or variables. Use
-  descriptive domain names instead (e.g. `stack_trace_event` not
-  `bpf_perf_event`).
-
-### 3. Workflow & Building
-
-- The workspace is built from the repository root via `make ci`, which
-  runs `cargo fmt`, `cargo clippy`, and `cargo test` across all crates.
-- Agent-specific targets (docker-build, integration-tests) live in
-  `agent/Makefile` and are invoked via `make -C agent <target>`.
-- EBPF compilation is integrated into `agent/build.rs` via libbpf-cargo.
-- Running the agent binary requires root privileges (or appropriate
-  capabilities like `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`) to load
-  eBPF programs into the kernel.
-- Make Checks: All code modifications must pass `make ci` from the
-  workspace root.
-
-### 4. Eventual Consistency
-
-Bistouri operates under an eventual consistency model. During
-transient operations like config reloads, brief windows may exist
-where stale BPF events are generated or PSI watchers are temporarily
-absent. The system is designed to converge to the correct state within
-one proc_walk cycle. User-space filtering ensures no stale events
-produce incorrect side effects.
-
-### 5. Event Loop Protection
-
-The tokio event loop must never be blocked by CPU-heavy or I/O-bound
-synchronous work. Use `tokio::task::spawn_blocking` for operations
-like file parsing, /proc walking, or any computation that may take
-more than a trivial amount of time. Keep the event loop crisp and
-responsive to async events (PSI triggers, inotify, channels).
+> **Monorepo Note**: If working inside the Ringbuffer monorepo, the root
+> `AGENTS.md` takes precedence for tooling and execution. Use
+> `moon run bistouri:<task>` instead of `make`.
