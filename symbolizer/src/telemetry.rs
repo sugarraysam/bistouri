@@ -31,6 +31,12 @@ pub const METRIC_DEBUGINFOD_ERRORS: &str = "bistouri_symbolizer_debuginfod_error
 /// ELF parse failures.
 pub const METRIC_PARSE_FAILURES: &str = "bistouri_symbolizer_parse_failures";
 
+/// Sessions enqueued by the gRPC handler (fire-and-forget ingestion).
+pub const METRIC_SESSIONS_ENQUEUED: &str = "bistouri_symbolizer_sessions_enqueued";
+
+/// Sessions dropped because the processing queue was full (backpressure shed).
+pub const METRIC_SESSIONS_DROPPED: &str = "bistouri_symbolizer_sessions_dropped";
+
 /// Registers metric descriptions for the symbolizer. Call exactly once
 /// in `main()` or daemon start before any metric is incremented.
 pub fn describe_all() {
@@ -51,4 +57,12 @@ pub fn describe_all() {
     );
     metrics::describe_counter!(METRIC_DEBUGINFOD_ERRORS, "Debuginfod network/fetch errors");
     metrics::describe_counter!(METRIC_PARSE_FAILURES, "ELF parsing failures");
+    metrics::describe_counter!(
+        METRIC_SESSIONS_ENQUEUED,
+        "Sessions enqueued by the gRPC handler (fire-and-forget)"
+    );
+    metrics::describe_counter!(
+        METRIC_SESSIONS_DROPPED,
+        "Sessions dropped due to full processing queue"
+    );
 }

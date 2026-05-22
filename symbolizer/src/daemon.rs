@@ -14,7 +14,9 @@ use tracing::info;
 use crate::debuginfod::DebuginfodClient;
 use crate::resolve::cache::CachePool;
 use crate::resolve::SessionResolver;
-use crate::server::SymbolizerService;
+use crate::server::{
+    ProcessingWorker, SymbolizerService, DEFAULT_MAX_CONCURRENT_SESSIONS, DEFAULT_QUEUE_CAPACITY,
+};
 use crate::sink::SessionSink;
 
 /// Configuration for the symbolizer daemon.
@@ -22,14 +24,49 @@ use crate::sink::SessionSink;
 pub struct DaemonConfig {
     /// gRPC listen address.
     pub listen_addr: SocketAddr,
+
+    /// Processing queue capacity (pending sessions awaiting dispatch).
+    ///
+    /// When the queue is full, `ReportSession` returns `RESOURCE_EXHAUSTED`
+    /// instead of blocking. Defaults to [`DEFAULT_QUEUE_CAPACITY`] (1024).
+    pub queue_capacity: usize,
+
+    /// Maximum number of sessions resolved + stored concurrently.
+    ///
+    /// Controls the semaphore that bounds parallel `tokio::spawn` tasks.
+    /// Independent of `queue_capacity` — one controls buffer depth, the
+    /// other controls parallelism.
+    ///
+    /// Defaults to [`DEFAULT_MAX_CONCURRENT_SESSIONS`] (16).
+    pub max_concurrent_sessions: usize,
+}
+
+impl DaemonConfig {
+    fn effective_queue_capacity(&self) -> usize {
+        if self.queue_capacity == 0 {
+            DEFAULT_QUEUE_CAPACITY
+        } else {
+            self.queue_capacity
+        }
+    }
+
+    fn effective_max_concurrent(&self) -> usize {
+        if self.max_concurrent_sessions == 0 {
+            DEFAULT_MAX_CONCURRENT_SESSIONS
+        } else {
+            self.max_concurrent_sessions
+        }
+    }
 }
 
 /// Top-level lifecycle manager for the symbolizer service.
 ///
-/// Owns a `CancellationToken` for coordinated shutdown.
+/// Owns a `CancellationToken` for coordinated shutdown and handles for
+/// both the gRPC server and the background processing worker.
 pub struct SymbolizerDaemon {
     cancel: CancellationToken,
     server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
+    worker: ProcessingWorker,
 }
 
 impl SymbolizerDaemon {
@@ -51,7 +88,18 @@ impl SymbolizerDaemon {
 
         let resolver = Arc::new(SessionResolver::new(caches, client));
 
-        let service = SymbolizerService::new(resolver, sink);
+        let queue_capacity = config.effective_queue_capacity();
+        let max_concurrent = config.effective_max_concurrent();
+        info!(
+            queue_capacity,
+            max_concurrent, "processing pipeline configured"
+        );
+
+        // Spawn the dispatcher + worker pool. Returns the sender half
+        // that the gRPC service uses to enqueue payloads.
+        let (tx, worker) = ProcessingWorker::spawn(resolver, sink, queue_capacity, max_concurrent);
+
+        let service = SymbolizerService::new(tx);
 
         let addr = config.listen_addr;
         info!(addr = %addr, "gRPC server listening");
@@ -71,12 +119,24 @@ impl SymbolizerDaemon {
         Ok(Self {
             cancel,
             server_handle,
+            worker,
         })
     }
 
-    /// Shuts down the gRPC server gracefully.
+    /// Shuts down the gRPC server and background processing gracefully.
+    ///
+    /// 1. Cancel the gRPC server (stop accepting new connections).
+    ///    This drops the `SymbolizerService` which holds the only
+    ///    `mpsc::Sender` clone — the dispatcher sees channel-closed.
+    /// 2. Wait for the dispatcher to drain remaining items and all
+    ///    in-flight tasks to complete.
     pub async fn shutdown(self) {
+        // Stop accepting new RPCs — drops the service and its Sender.
         self.cancel.cancel();
         let _ = self.server_handle.await;
+
+        // Drain remaining queued sessions + wait for in-flight tasks.
+        self.worker.join().await;
+        info!("symbolizer daemon shutdown complete");
     }
 }
