@@ -26,13 +26,19 @@ impl LoadSegment {
     /// Returns `true` if `file_offset` falls within this segment.
     #[inline]
     pub(crate) fn contains(&self, file_offset: u64) -> bool {
-        file_offset >= self.p_offset && file_offset < self.p_offset + self.p_filesz
+        let Some(end) = self.p_offset.checked_add(self.p_filesz) else {
+            return false;
+        };
+        file_offset >= self.p_offset && file_offset < end
     }
 
     /// Returns `true` if `vaddr` falls within this segment's virtual address range.
     #[inline]
     pub(crate) fn contains_vaddr(&self, vaddr: u64) -> bool {
-        vaddr >= self.p_vaddr && vaddr < self.p_vaddr + self.p_filesz
+        let Some(end) = self.p_vaddr.checked_add(self.p_filesz) else {
+            return false;
+        };
+        vaddr >= self.p_vaddr && vaddr < end
     }
 
     /// Translates a file offset to a virtual address within this segment.
@@ -132,6 +138,33 @@ mod tests {
     #[case::at_end_exclusive(seg(0x1000, 0x400000, 0x2000), 0x402000, false)]
     #[case::before_start(seg(0x1000, 0x400000, 0x2000), 0x3FFFFF, false)]
     fn segment_contains_vaddr(
+        #[case] segment: LoadSegment,
+        #[case] vaddr: u64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(segment.contains_vaddr(vaddr), expected);
+    }
+
+    /// Repro: `contains()` and `contains_vaddr()` must not wrap around u64::MAX.
+    /// Before the fix, `p_offset + p_filesz` overflowed, making the upper-bound
+    /// check meaningless — any offset >= p_offset would incorrectly match.
+    #[rstest]
+    #[case::offset_wraps(seg(u64::MAX - 10, 0, 100), u64::MAX - 5, false)]
+    #[case::offset_at_max(seg(u64::MAX, 0, 1), u64::MAX, false)]
+    #[case::filesz_max(seg(1, 0, u64::MAX), 100, false)]
+    fn contains_overflow(
+        #[case] segment: LoadSegment,
+        #[case] offset: u64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(segment.contains(offset), expected);
+    }
+
+    #[rstest]
+    #[case::vaddr_wraps(seg(0, u64::MAX - 10, 100), u64::MAX - 5, false)]
+    #[case::vaddr_at_max(seg(0, u64::MAX, 1), u64::MAX, false)]
+    #[case::filesz_max(seg(0, 1, u64::MAX), 100, false)]
+    fn contains_vaddr_overflow(
         #[case] segment: LoadSegment,
         #[case] vaddr: u64,
         #[case] expected: bool,

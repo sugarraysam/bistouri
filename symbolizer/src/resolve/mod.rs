@@ -251,20 +251,20 @@ fn resolve_session_blocking(payload: proto::SessionPayload, caches: &CachePool) 
 
     // Convert proto Timestamp → Rust SystemTime.
     // The value was set by the agent at capture start — this is format
-    // conversion, not recomputation.
+    // conversion, not recomputation. Negative fields from malformed
+    // payloads are clamped to zero to prevent Duration::new() panics.
     let capture_start_time = payload
         .capture_start_time
         .as_ref()
-        .map(|ts| {
-            std::time::UNIX_EPOCH + std::time::Duration::new(ts.seconds as u64, ts.nanos as u32)
-        })
+        .map(proto_timestamp_to_system_time)
         .unwrap_or(std::time::UNIX_EPOCH);
 
     // Extract capture_duration from proto Duration.
+    // Same clamping as above for negative fields.
     let capture_duration = payload
         .capture_duration
         .as_ref()
-        .map(|d| std::time::Duration::new(d.seconds as u64, d.nanos as u32))
+        .map(proto_duration_to_std)
         .unwrap_or(std::time::Duration::ZERO);
 
     // Extract labels from metadata.
@@ -369,5 +369,74 @@ fn resolve_user_frame(
             SymbolInfo::placeholder(&ph.label),
         )),
         None => Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown())),
+    }
+}
+
+/// Converts a proto `Timestamp` to `SystemTime`, clamping negative fields.
+///
+/// Protobuf `Timestamp` uses `i64` seconds and `i32` nanos. Malformed
+/// payloads with negative values would wrap when cast to unsigned,
+/// causing `Duration::new()` to panic (nanos ≥ 1_000_000_000).
+#[inline]
+fn proto_timestamp_to_system_time(ts: &prost_types::Timestamp) -> std::time::SystemTime {
+    let secs = ts.seconds.max(0) as u64;
+    let nanos = ts.nanos.clamp(0, 999_999_999) as u32;
+    std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
+}
+
+/// Converts a proto `Duration` to `std::time::Duration`, clamping negative fields.
+#[inline]
+fn proto_duration_to_std(d: &prost_types::Duration) -> std::time::Duration {
+    let secs = d.seconds.max(0) as u64;
+    let nanos = d.nanos.clamp(0, 999_999_999) as u32;
+    std::time::Duration::new(secs, nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// Repro: negative `nanos` cast as `u32` wraps to > 999_999_999,
+    /// causing `Duration::new()` to panic. After the fix, negatives
+    /// are clamped to zero.
+    #[rstest]
+    #[case::negative_nanos_panicked(0, -1, 0, 0)]
+    #[case::negative_seconds(-100, 0, 0, 0)]
+    #[case::both_negative(-1, -1, 0, 0)]
+    #[case::normal_values(1000, 500_000_000, 1000, 500_000_000)]
+    #[case::nanos_at_max(0, 999_999_999, 0, 999_999_999)]
+    #[case::nanos_over_max(0, 1_000_000_000, 0, 999_999_999)]
+    fn proto_timestamp_clamps_negative(
+        #[case] seconds: i64,
+        #[case] nanos: i32,
+        #[case] expected_secs: u64,
+        #[case] expected_nanos: u32,
+    ) {
+        let ts = prost_types::Timestamp { seconds, nanos };
+        let result = proto_timestamp_to_system_time(&ts);
+        let expected =
+            std::time::UNIX_EPOCH + std::time::Duration::new(expected_secs, expected_nanos);
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case::negative_nanos_panicked(0, -1, 0, 0)]
+    #[case::negative_seconds(-100, 0, 0, 0)]
+    #[case::both_negative(-1, -1, 0, 0)]
+    #[case::normal_values(60, 500_000, 60, 500_000)]
+    #[case::nanos_over_max(0, 1_000_000_000, 0, 999_999_999)]
+    fn proto_duration_clamps_negative(
+        #[case] seconds: i64,
+        #[case] nanos: i32,
+        #[case] expected_secs: u64,
+        #[case] expected_nanos: u32,
+    ) {
+        let d = prost_types::Duration { seconds, nanos };
+        let result = proto_duration_to_std(&d);
+        assert_eq!(
+            result,
+            std::time::Duration::new(expected_secs, expected_nanos)
+        );
     }
 }

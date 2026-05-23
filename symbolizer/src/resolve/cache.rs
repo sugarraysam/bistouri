@@ -48,10 +48,7 @@ impl CacheEntry {
     /// Estimated weight in bytes for moka's byte-budget eviction.
     fn weight_bytes(&self) -> u32 {
         match self {
-            CacheEntry::Parsed(obj) => obj
-                .estimated_bytes
-                .try_into()
-                .expect("estimated_bytes exceeds u32::MAX"),
+            CacheEntry::Parsed(obj) => obj.estimated_bytes.try_into().unwrap_or(u32::MAX),
             CacheEntry::Unparseable => 1,
         }
     }
@@ -401,6 +398,42 @@ mod tests {
         if insert_unparseable {
             assert!(cache.is_unparseable(&bid), "{description}");
         }
+    }
+
+    /// Repro: `weight_bytes()` must not panic when `estimated_bytes > u32::MAX`.
+    /// Before the fix, this triggered `.expect()` and crashed the process.
+    #[rstest]
+    #[case::exactly_u32_max(u32::MAX as usize, u32::MAX)]
+    #[case::one_over_u32_max(u32::MAX as usize + 1, u32::MAX)]
+    #[case::very_large(usize::MAX, u32::MAX)]
+    #[case::zero(0, 0)]
+    #[case::normal(1024 * 1024, 1024 * 1024)]
+    fn weight_bytes_saturates_on_overflow(
+        #[case] estimated_bytes: usize,
+        #[case] expected_weight: u32,
+    ) {
+        let obj = Arc::new(CachedObject {
+            dwarf: Arc::new(
+                gimli::Dwarf::load(|_| -> std::result::Result<ArcReader, gimli::Error> {
+                    Ok(gimli::EndianArcSlice::new(
+                        Arc::from(&[] as &[u8]),
+                        gimli::RunTimeEndian::Little,
+                    ))
+                })
+                .unwrap(),
+            ),
+            pool: Mutex::new(Vec::new()),
+            segments: Vec::new(),
+            static_text_addr: None,
+            estimated_bytes,
+        });
+        let entry = CacheEntry::Parsed(obj);
+        assert_eq!(entry.weight_bytes(), expected_weight);
+    }
+
+    #[test]
+    fn weight_bytes_unparseable_is_one() {
+        assert_eq!(CacheEntry::Unparseable.weight_bytes(), 1);
     }
 
     #[rstest]
