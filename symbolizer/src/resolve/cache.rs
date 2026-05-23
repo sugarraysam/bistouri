@@ -508,11 +508,44 @@ mod tests {
             }
         }
 
-        // Verify pool grew to accommodate concurrency.
+        // Verify pool has at least the seed context.
         let pool_size = obj.pool.lock().unwrap().len();
         assert!(
             pool_size > 1,
-            "pool should have grown beyond the initial seed, got {pool_size}"
+            "pool should have at least the seed context, got {pool_size}"
         );
+    }
+
+    /// Verifies that borrowing multiple contexts concurrently (e.g., on the same thread
+    /// or across threads) causes the pool to grow beyond the initial seed context.
+    #[test]
+    fn pool_growth_on_demand() {
+        let fixture_path = format!(
+            "{}/tests/e2e/fixtures/bin/hello",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let elf_bytes = std::fs::read(&fixture_path)
+            .unwrap_or_else(|_| panic!("missing fixture: {fixture_path}"));
+
+        let obj = CachedObject::from_elf_bytes(&elf_bytes, "test", None)
+            .expect("failed to parse fixture ELF");
+
+        // Seed context is present.
+        assert_eq!(obj.pool.lock().unwrap().len(), 1);
+
+        // Borrow the first context (empties the pool).
+        let ctx1 = obj.borrow_context();
+        assert_eq!(obj.pool.lock().unwrap().len(), 0);
+
+        // Borrow a second context (forces creation of a new one).
+        let ctx2 = obj.borrow_context();
+        assert_eq!(obj.pool.lock().unwrap().len(), 0);
+
+        // Return both contexts.
+        obj.return_context(ctx1);
+        assert_eq!(obj.pool.lock().unwrap().len(), 1);
+
+        obj.return_context(ctx2);
+        assert_eq!(obj.pool.lock().unwrap().len(), 2);
     }
 }
