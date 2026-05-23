@@ -9,7 +9,7 @@ use object::Object;
 
 /// A loadable ELF segment extracted from a `PT_LOAD` program header.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct LoadSegment {
+pub struct LoadSegment {
     /// File offset of the segment start (`p_offset`).
     /// Static property of the ELF binary, identical for all copies.
     p_offset: u64,
@@ -87,7 +87,7 @@ pub(crate) fn extract_load_segments<'data>(object: &object::read::File<'data>) -
 ///
 /// Linear scan: ELF binaries have 2–4 PT_LOAD segments.
 #[inline]
-pub(crate) fn translate_file_offset(
+pub fn translate_file_offset(
     segments: &[LoadSegment],
     file_offset: u64,
     build_id_hex: &str,

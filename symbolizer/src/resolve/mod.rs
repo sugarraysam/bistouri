@@ -6,7 +6,7 @@
 
 pub mod build_id;
 pub mod cache;
-pub(crate) mod elf;
+pub mod elf;
 pub(crate) mod kernel;
 pub(crate) mod user;
 

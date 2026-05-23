@@ -81,10 +81,10 @@ fn estimate_context_pool_bytes(dwarf_bytes: usize) -> usize {
 ///
 /// DWARF walks are concurrent via a `Context` pool — the `Mutex` is
 /// held only for nanosecond `Vec::pop`/`Vec::push`, never during parsing.
-pub(crate) struct CachedObject {
+pub struct CachedObject {
     dwarf: Arc<gimli::Dwarf<ArcReader>>,
     pool: Mutex<Vec<addr2line::Context<ArcReader>>>,
-    pub(crate) segments: Vec<LoadSegment>,
+    pub segments: Vec<LoadSegment>,
     /// Static `_text` vaddr from ELF symtab (vmlinux only).
     pub(crate) static_text_addr: Option<u64>,
     /// Approximate heap bytes — used by moka weigher.
@@ -119,7 +119,7 @@ impl CachedObject {
     ///
     /// `static_text_addr` should be set for vmlinux objects (parsed by
     /// the caller from the same `object::File`).
-    pub(crate) fn from_elf_bytes(
+    pub fn from_elf_bytes(
         data: &[u8],
         build_id_hex: &str,
         static_text_addr: Option<u64>,
@@ -201,7 +201,7 @@ impl CachedObject {
 
     /// Looks up a virtual address in DWARF and returns resolved symbols.
     #[inline]
-    pub(crate) fn symbolize_vaddr(&self, vaddr: u64) -> ResolvedFrame {
+    pub fn symbolize_vaddr(&self, vaddr: u64) -> ResolvedFrame {
         let context = self.borrow_context();
         let frame = Self::walk_dwarf(&context, vaddr);
         self.return_context(context);
