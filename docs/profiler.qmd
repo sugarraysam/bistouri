@@ -10,7 +10,7 @@ The first stage is reactive. When a process executes (`match_comm_on_exec`), the
 
 The second stage is the actual sampling. We use a hybrid approach to capture both on-CPU and off-CPU activity. For on-CPU work, we attach a BPF program to a software perf event (`CPU_CLOCK`) on every CPU. At a fixed frequency—by default 19Hz, a prime number chosen to avoid synchronization with periodic application tasks—the kernel interrupts the CPU and runs our handler.
 
-For off-CPU work, we attach to the `sched_switch` tracepoint. If a monitored PID transitions to the `TASK_UNINTERRUPTIBLE` state—indicating it is blocked on I/O or a kernel resource—we capture a stack trace. This "off-CPU" profiling is rate-limited in the kernel to match the on-CPU sampling frequency, ensuring that highly contended locks or slow disks don't flood our buffers while still providing a complete picture of why a process is stalled.
+For off-CPU work, we attach to the `sched_switch` tracepoint. If a monitored PID transitions to the `TASK_UNINTERRUPTIBLE` state—indicating it is blocked on I/O or a kernel resource—we capture a stack trace. This "off-CPU" profiling is rate-limited in the kernel to match the on-CPU sampling frequency. We achieve this using a `BPF_MAP_TYPE_LRU_HASH` (`off_cpu_last_ts`) that tracks the last capture timestamp per PID. This ensures that highly contended locks or slow disks don't flood our buffers while still providing a complete picture of why a process is stalled.
 
 In both cases, the handler first checks the `pid_filter_map`. If the current PID isn't there, we exit immediately with minimal overhead. If it is, we perform the "heavy" work: walking the stack for both kernel and user space. This design ensures that the cost of profiling is proportional to the number of processes we are actually interested in.
 
@@ -31,7 +31,7 @@ Bistouri uses the modern `BPF_MAP_TYPE_RINGBUF` rather than the older `BPF_MAP_T
 
 Perf buffers allocate a separate memory region per CPU. If you have 128 CPUs, you have 128 buffers. This often leads to wasted memory if one CPU is idle while another is dropping samples. The modern Ring Buffer is a single, shared memory region for all CPUs. It supports high-performance reservation-based allocation, allowing us to write stack traces directly into the buffer memory (`bpf_ringbuf_reserve`) without extra copies.
 
-Furthermore, the Ring Buffer preserves the temporal order of events across CPUs more effectively. Unlike older profilers that rely on a dedicated blocking thread to poll BPF maps, Bistouri uses a custom `AsyncRingBuffer`. This wrapper registers the ring buffer's epoll file descriptor with the Tokio reactor. When the kernel pushes data, Tokio wakes the profiling task, which then drains the buffer. This integrates profiling naturally into the async event loop without sacrificing performance or starving the CPU.
+Furthermore, the Ring Buffer preserves the temporal order of events across CPUs more effectively. Unlike older profilers that rely on a dedicated blocking thread to poll BPF maps, Bistouri uses a custom `AsyncRingBuffer`. This wrapper registers the ring buffer's epoll file descriptor with the Tokio reactor using `AsyncFd`. When the kernel pushes data, Tokio wakes the profiling task, which then drains the buffer. This integrates profiling naturally into the async event loop without sacrificing performance or starving the CPU.
 
 ## LPM Trie for Cgroup Matching
 
@@ -45,6 +45,11 @@ To keep the probe overhead low, we avoid performing complex logic inside the BPF
 
 We've optimized this by moving the filtering logic to the `pid_filter_map`. When the userspace agent decides to "monitor" a PID, it performs a single map update. The BPF side then performs a single map lookup. We also use the BPF `.rodata` section to share configuration like the `off_cpu_period_ns`. Because this value is written by Rust before the skeleton is loaded and becomes read-only in the kernel, the BPF program can treat it as a constant, allowing the verifier to optimize the code path.
 
+::: {.callout-tip}
+## Key Insight: Kernel-Side Symbolization
+We use `bpf_get_stack` with the `BPF_F_USER_BUILD_ID` flag. This directs the kernel to resolve the ELF Build-ID and file offset for each user frame by walking the process's VMAs internally. This is significantly more efficient than capturing raw instruction pointers and resolving them in userspace, which would require racing against `/proc/<pid>/maps` updates.
+:::
+
 ## Error Recovery
 
 One of the most overlooked aspects of eBPF design is "telemetry for the profiler itself." If a stack walk fails in the kernel, or if we run out of space in a ring buffer, how does the operator know?
@@ -54,7 +59,7 @@ We implemented a dedicated `errors` ringbuffer. Inside the BPF programs, we use 
 2.  **`ERR_RESERVE_STACK_RINGBUF`**: If the 64MB stack event ring buffer is full.
 3.  **`ERR_RESERVE_TRIGGER_RINGBUF`**: If the trigger event ring buffer is full.
 
-In userspace, these are caught, decoded, and logged with specific context—like suggesting an increase in buffer size if drops are detected. The use of a C union in the BPF side, mapped to a Rust `enum` in the agent, gives us a type-safe way to handle these heterogeneous error events without the overhead of multiple maps.
+In userspace, these are caught, decoded, and logged with specific context. The `AsyncRingBuffer` also implements a strict failure policy: if it fails to consume events multiple times consecutively, it aborts the process. This "fail fast" design ensures that we don't continue running an agent with an irrecoverably broken BPF pipeline.
 
 ## Agent Lifecycle
 
@@ -77,5 +82,5 @@ stateDiagram-v2
 The `LoadedProfilerAgent` struct acts as a guard for the active profiling session. When the struct is dropped, the BPF links and the ring buffer are cleaned up in a specific sequence. This prevents use-after-free-like scenarios where the kernel might try to push data into a ring buffer that userspace has already unmapped.
 
 ---
-_Auto-generated from commit `ac794cd` by Gemini 3.1 Pro.
-Last updated: 2026-05-17_
+_Auto-generated from commit `16252f4` by Gemini 3.1 Pro.
+Last updated: 2025-02-15_

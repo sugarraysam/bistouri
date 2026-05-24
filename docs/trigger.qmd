@@ -28,13 +28,13 @@ To handle this efficiently, we use a dual-trie architecture:
 1.  **Userspace Radix Trie:** A standard radix trie allows us to store arbitrary rules and perform $O(L)$ lookups (where $L$ is the string length) during our periodic system scans.
 2.  **BPF LPM Trie:** We mirror these rules into a BPF `BPF_MAP_TYPE_LPM_TRIE`.
 
-The BPF trie is the "fast path." When a new process is `exec`'d, our BPF programs check the trie to see if the process name matches any profiling rules. If it does, it immediately notifies userspace to set up a PSI watcher for that process's cgroup.
+The BPF trie is the "fast path." When a new process is `exec`'d, our BPF programs check the trie to see if the process name matches any profiling rules. If it does, it immediately notifies userspace to set up a PSI watcher for that process's cgroup. To keep the interface clean, the BPF map value is a simple `rule_id`, which the userspace agent uses to look up the full configuration (including thresholds and labels).
 
 ## Configuration Matching & Glob Semantics
 
 Process naming is often messy. A pool of workers might be named `worker-01`, `worker-02`, etc. To handle this, Bistouri supports two types of matching: `Exact` and `Prefix`.
 
-The design of the prefix match is constrained by the Linux kernel's `TASK_COMM_LEN`, which limits process names to 15 characters (plus a null terminator). Our `BpfTrie` implementation must carefully translate these into Longest Prefix Match keys that the kernel understands.
+The design of the prefix match is constrained by the Linux kernel's `TASK_COMM_LEN`, which limits process names to 15 characters plus a null terminator. Our `BpfTrie` implementation must carefully translate these into Longest Prefix Match keys that the kernel understands.
 
 ```rust
 // In src/trigger/trie.rs: Translating a rule to a BPF-compatible key
@@ -65,7 +65,7 @@ Additionally, the walk serves as a metadata collection phase. For every matched 
 
 Bistouri is designed for long-running production use, meaning we must support configuration changes without restarting the agent. The `TriggerAgent` supports two discovery strategies:
 
-1.  **File Watcher:** Uses `inotify` to watch a YAML file on disk. It includes a 200ms debounce timer to handle "atomic" file swaps (common with Kubernetes ConfigMaps) where multiple filesystem events fire in rapid succession.
+1.  **File Watcher:** Uses `inotify` to watch a YAML file on disk. It includes a 200ms debounce timer to handle "atomic" file swaps. This is critical for Kubernetes environments, where ConfigMap updates often involve a rapid sequence of directory symlink renames that would otherwise trigger multiple redundant reloads.
 2.  **Kubernetes Watcher:** Watches a `BistouriConfig` Custom Resource (CR) via the Kubernetes API. This allows for centralized configuration management across a cluster.
 
 When a change is detected, the agent:
@@ -93,7 +93,7 @@ graph TD
     end
 
     subgraph "Userspace - Trigger Agent"
-        RING_BUF -->|"Event"| EV_LOOP["Event Loop"]
+        RING_BUF -->|"Event (rule_id)"| EV_LOOP["Event Loop"]
         PROC_SCAN["Periodic /proc Walk"] -->|"Match"| EV_LOOP
 
         subgraph "Watchers"
@@ -112,9 +112,9 @@ graph TD
     end
 
     PSI_FILE -->|"Threshold Crossed"| SPAWN
-    SPAWN -->|"Trigger"| PROFILER["Profiler Agent"]
+    SPAWN -->|"CaptureRequest"| PROFILER["Capture Orchestrator"]
 ```
 
 ---
-_Auto-generated from commit `ac794cd` by Gemini 3.1 Pro.
-Last updated: 2026-05-17_
+_Auto-generated from commit `16252f4` by Gemini 3.1 Pro.
+Last updated: 2026-05-24_

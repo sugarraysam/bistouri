@@ -47,7 +47,14 @@ Storing symbols for every kernel version across a fleet requires an efficient in
 
 The symbolizer uses a tiered approach to artifact storage. It first checks a **Negative Cache** to avoid repeatedly trying to fetch missing or malformed symbols (a common occurrence with proprietary or stripped binaries). If the binary is valid, it checks a **Tiered Debuginfod Client** which can read from a local filesystem mount (often a shared volume in Kubernetes) before falling back to a remote HTTP server.
 
-In memory, we use a byte-weighted LRU cache. Because a single `vmlinux` binary can be 500MB, we can't simply cache a fixed number of objects. The cache tracks the actual memory footprint of the parsed DWARF sections to ensure the symbolizer doesn't run out of memory when processing sessions from diverse kernel versions.
+In memory, we use a byte-weighted LRU cache. Because a single `vmlinux` binary can be 500MB, we can't simply cache a fixed number of objects. The cache tracks the actual memory footprint of the parsed DWARF sections. 
+
+::: {.callout-tip}
+## Design Detail: Context Pooling
+Parsing DWARF is expensive, and the resulting `addr2line::Context` is not `Sync`. To allow concurrent symbolization of the same binary across multiple threads without re-parsing, Bistouri uses a **Context Pool** inside each `CachedObject`. We borrow a context, perform the walk, and return it. This maximizes CPU throughput while keeping the memory-heavy DWARF data shared.
+:::
+
+The cache weigher also accounts for the lazy heap allocations made by these contexts (like interval trees and abbreviation tables) by estimating the total footprint as a fraction of the raw DWARF size. This ensures the symbolizer remains stable even when processing sessions from diverse kernel versions simultaneously.
 
 ## Deployment Model
 
@@ -67,19 +74,21 @@ The symbolizer operates as a reactive service. It remains dormant until a profil
 
 ```{mermaid}
 stateDiagram-v2
-    [*] --> Initializing: Load Local Cache
-    Initializing --> Listening: Start gRPC Server
+    [*] --> Initializing: "Load Local Cache"
+    Initializing --> Listening: "Start gRPC Server"
     
     state "Processing Session" as Processing {
-        Listening --> Fetching: "Async Prefetch (Network)"
-        Fetching --> Resolving: "Blocking Resolve (CPU)"
+        [*] --> Fetching: "Async Prefetch"
+        Fetching --> Resolving: "Blocking Resolve"
         Resolving --> Storing: "Sink::store()"
+        Storing --> [*]
     }
     
-    Storing --> Listening: Wait for Next Session
+    Listening --> Processing: "New Session"
+    Processing --> Listening: "Ready for Next"
     Listening --> [*]: Shutdown
 ```
 
 ---
-_Auto-generated from commit `ac794cd` by Gemini 3.1 Pro.
-Last updated: 2026-05-17_
+_Auto-generated from commit `16252f4` by Gemini 3.1 Pro.
+Last updated: 2026-05-24_
