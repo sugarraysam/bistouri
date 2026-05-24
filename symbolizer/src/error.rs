@@ -24,6 +24,9 @@ pub enum SymbolizerError {
 
     #[error("debuginfod returned HTTP {status} for build_id {build_id}")]
     DebuginfodNotFound { build_id: String, status: u16 },
+
+    #[error("debuginfod server error for build_id {build_id}: {reason}")]
+    DebuginfodServerError { build_id: String, reason: String },
 }
 
 /// Result alias for the symbolizer crate.
