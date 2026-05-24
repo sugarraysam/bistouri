@@ -8,7 +8,7 @@ Bistouri—the French word for a surgical scalpel—is a profiling agent designe
 
 The core premise is that profiling is most valuable when a system is under duress. By listening to Linux Pressure Stall Information (PSI) events, Bistouri identifies exactly when CPU, memory, or I/O pressure exceeds a defined threshold. It then dynamically activates eBPF-based stack capturing for the specific processes causing or suffering from that pressure. 
 
-Furthermore, Bistouri is designed as a distributed system. The agent is a "thin" collector; it captures raw memory addresses and build-id offsets from the kernel but does not attempt to resolve them into human-readable symbols locally. Instead, it ships these raw traces to a centralized Symbolizer service. This offloads the memory-intensive task of parsing DWARF and ELF data away from the production host, ensuring the "scalpel" doesn't become a "sledgehammer."
+Furthermore, Bistouri is designed as a distributed system. The agent is a "thin" collector; it captures raw memory addresses and build-id offsets from the kernel but does not attempt to resolve them into human-readable symbols locally. Instead, it ships these raw traces to a centralized Symbolizer service via gRPC. This offloads the memory-intensive task of parsing DWARF and ELF data away from the production host, ensuring the "scalpel" doesn't become a "sledgehammer."
 
 ## Why eBPF for Profiling?
 
@@ -23,7 +23,7 @@ Beyond standard on-CPU sampling, eBPF gives us the visibility to implement **off
 Bistouri is built on a "multi-phase" initialization pattern to manage the complex lifecycle of eBPF programs and their dependencies on the host system. This ensures that the agent only begins active collection when all dependencies—from kernel metadata to user-space channels—are correctly wired.
 
 1.  **Preflight:** We collect and validate kernel metadata (like the KASLR `_text` offset and kernel build ID) and verify host capabilities.
-2.  **Preparation:** We parse configurations and initialize the `TriggerAgent`. This stage sets up the asynchronous watchers (like PSI file descriptors) and resolves filesystem paths for cgroups.
+2.  **Preparation:** We parse configurations and initialize the `TriggerAgent`. This stage sets up the asynchronous watchers (like PSI file descriptors) and resolves filesystem paths for cgroups. In Kubernetes environments, this includes watching for `BistouriConfig` Custom Resources.
 3.  **Loading:** The `ProfilerAgent` loads the eBPF bytecode. At this point, the BPF programs are resident but essentially "blind"—they don't yet know which processes to profile.
 4.  **Activation:** We pass the BPF map handles (specifically a Longest Prefix Match trie and a PID filter) from the `ProfilerAgent` to the `TriggerAgent` and `CaptureOrchestrator`. Now, the trigger system can "arm" the profiler for specific targets in real-time.
 
@@ -37,9 +37,9 @@ The following diagram illustrates how pressure events flow from the kernel, thro
 graph TD
     subgraph "Kernel Space"
         PSI["PSI Events (/proc/pressure)"] -->|"Poll/Select"| UA["Trigger Agent"]
-        SCHED["Scheduler (sched_switch)"] --> BPF_PROG
+        SCHED["Scheduler (sched_switch)"] --> BPF_PROG["eBPF Profiler"]
         PERF["Perf Event (Timer)"] --> BPF_PROG
-        BPF_PROG["eBPF Profiler"] -->|"Stack Traces"| RB["Ring Buffer"]
+        BPF_PROG -->|"Stack Traces"| RB["Ring Buffer"]
         BPF_PROG -->|"Error Events"| ERR_RB["Error Ring Buffer"]
         LPM["LPM Trie Map"] -.->|"Filter"| BPF_PROG
         PIDF["PID Filter Map"] -.->|"Active PIDs"| BPF_PROG
@@ -68,8 +68,8 @@ The pipeline is designed to be "eventually consistent." When a cgroup or process
 
 1.  **The Trigger:** The Linux kernel wakes up our `TriggerAgent` via a `poll()` on a PSI file descriptor.
 2.  **The Resolution:** The agent looks up the relevant process metadata. We use `/proc/<pid>/cgroup` for BPF-originated events and a periodic `ProcWalker` to ensure all matching processes are identified even if exec tracing was missed.
-3.  **The Filtering:** We use a Longest Prefix Match (LPM) Trie in BPF for `exec` hooks and a standard Hash Map for active PID filtering. The `TriggerAgent` manages rule-based matching, while the `CaptureOrchestrator` manages the lifecycle of active PIDs.
-4.  **The Capture:** The BPF profiler uses dual triggers: a hardware timer (e.g., 19Hz) for on-CPU samples and a scheduler hook for off-CPU samples. It verifies the PID is "hot" in the filter map before capturing.
+3.  **The Filtering:** We use a Longest Prefix Match (LPM) Trie in BPF for `exec` hooks and a standard Hash Map for active PID filtering. The `TriggerAgent` manages rule-based matching, while the `CaptureOrchestrator` manages the lifecycle of active PIDs using a reference-counting mechanism.
+4.  **The Capture:** The BPF profiler uses dual triggers: a hardware timer (e.g., 19Hz) for on-CPU samples and a scheduler hook for off-CPU samples. To keep the data stream balanced, the off-CPU profiler is rate-limited to match the on-CPU frequency.
 5.  **The Consumption:** A dedicated async task drains the ring buffer. We use Tokio's `AsyncFd` to wrap the BPF ring buffer's epoll file descriptor, allowing BPF event consumption to yield efficiently to the async executor.
 6.  **The Export:** The `CaptureOrchestrator` deduplicates traces into dictionary-encoded sessions and serializes them using gRPC for the central `Symbolizer` service.
 
@@ -78,14 +78,15 @@ The pipeline is designed to be "eventually consistent." When a cgroup or process
 -   **Event Loop Integrity:** We use a multi-threaded Tokio runtime, but we strictly separate IO-bound tasks from blocking tasks. Since `/proc` walking and config parsing are CPU-heavy and synchronous, we dedicate threads to these via `spawn_blocking` to ensure the primary async loop remains responsive to new PSI events.
 -   **Minimal Threading Budget:** By default, Bistouri runs on a skeleton crew—one worker thread for IO and one for blocking. This is a "conservative by default" stance; we want the profiling tool to be the last thing contributing to the system pressure it's trying to measure.
 -   **Observability First:** Kernel-space is a black box. Bistouri uses a dedicated BPF error ring buffer to report issues like map reservation failures or `bpf_get_stack` errors back to user-space, where they are converted into Prometheus metrics.
+-   **Capacity Planning:** The agent performs internal capacity planning, pre-allocating buffers for session building (e.g., `compute_trace_capacity`) based on the configured sampling frequency and capture duration. This minimizes reallocations on the performance-sensitive ingestion path.
 -   **Safety and Performance:** We use `repr(C)` structs to share memory between Rust and C without serialization overhead. For heavy deduplication, we pre-compute hashes in user-space to make `HashMap` lookups O(1) during session building.
 
 ## Key Tradeoffs
 
 -   **LPM Trie vs. Hash Maps:** We chose an LPM Trie for the initial match-on-exec logic. While a Hash Map is faster for exact matches, the Trie allows us to define "pressure policies" based on process name prefixes, which is vital in containerized environments where naming conventions are common.
 -   **Eventual Consistency:** There is a tiny window where a process might start experiencing pressure but the user-space agent hasn't yet updated the BPF map. We accept this "lost sample" at the very start of a pressure spike in exchange for keeping the complex decision logic in Rust rather than in the verifier-constrained C environment of BPF.
--   **User-space Triggering:** One might ask why we don't trigger the profiler entirely in the kernel. The answer is policy. Defining what constitutes "too much pressure" involves complex configuration, threshold percentages, and multi-tenant metadata that is significantly easier and safer to manage in Rust.
+-   **User-space Triggering:** One might ask why we don't trigger the profiler entirely in the kernel. The answer is policy. Defining what constitutes "too much pressure" involves complex configuration, threshold percentages, and multi-tenant metadata (like Kubernetes CRDs) that is significantly easier and safer to manage in Rust.
 
 ---
-_Auto-generated from commit `ac794cd` by Gemini 3.1 Pro.
-Last updated: 2026-05-17_
+_Auto-generated from commit `16252f4` by Gemini 3.1 Pro.
+Last updated: 2026-05-24_
