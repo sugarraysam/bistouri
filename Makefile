@@ -35,6 +35,7 @@ test-tsan:
 	TSAN_OPTIONS="suppressions=$(CURDIR)/tsan_suppressions.txt" RUSTFLAGS="-Zsanitizer=thread" cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std --all-targets --all-features -- --skip bistouri_e2e --skip symbolizer_e2e
 
 docs-check:
+	./scripts/check_docs.sh
 	python3 scripts/check_docs.py
 
 ci: fmt clippy test build docs-check

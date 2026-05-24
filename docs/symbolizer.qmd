@@ -24,7 +24,7 @@ message KernelMeta {
 }
 ```
 
-By including the `build_id`, we eliminate the ambiguity of the `release` string (e.g., `5.15.0-generic`). A Build ID is a unique cryptographic hash of the kernel binary itself. This ensures that if we have two kernels with the same version string but different patches, we never accidentally use the wrong symbol table. 
+By including the `build_id`, we eliminate the ambiguity of the `release` string (e.g., `5.15.0-generic`). A Build ID is a unique cryptographic hash of the kernel binary itself. This ensures that if we have two kernels with the same version string but different patches, we never accidentally use the wrong symbol table.
 
 The `text_addr` is the runtime start of the kernel's executable code. Unlike a static KASLR offset, providing the actual runtime address of `_text` allows the symbolizer to calculate a stable offset regardless of how the kernel was relocated at boot: `vmlinux_vaddr = raw_ip - runtime_text_addr + static_text_addr`.
 
@@ -36,18 +36,25 @@ The symbolizer implements a two-phase pipeline designed to protect the async run
 2.  **Phase 2: Blocking Resolution**: Once all artifacts are locally available, the payload is moved to a blocking thread pool (`spawn_blocking`). This is where the CPU-intensive DWARF walking occurs.
 
 For each IP, the resolution follows a strict hierarchy:
-- **L2 Symbol Cache**: A fast lookup for `(BuildID, IP)` pairs that have been resolved previously.
+- **L2 Symbol Cache**: A fast lookup for `(BuildID, IP)` pairs that have been resolved previously, returning an `Arc<ResolvedFrame>` directly for zero-copy cache hits.
 - **L1 Object Cache**: If the IP is new, we locate the parsed ELF object in memory.
-- **Normalization**: For kernel IPs, we adjust using the `text_addr`. For user-space, the agent provides file-relative offsets directly from the eBPF walker, bypassing the need for `/proc/pid/maps` on the symbolizer side.
+- **Normalization**: For kernel IPs, we adjust using the `text_addr`. For user-space, the agent provides file-relative offsets directly from the eBPF walker. The symbolizer translates this file offset to a virtual address matching the DWARF structures by locating the containing `PT_LOAD` segment of the ELF binary and computing `vaddr = file_offset - p_offset + p_vaddr`. This bypasses the need for `/proc/pid/maps` on the symbolizer side and naturally handles ASLR.
 - **DWARF Walk**: If the object is cached but the IP is new, we perform a DWARF interval tree lookup to find function names and source locations.
 
 ## Build ID Indexing
 
-Storing symbols for every kernel version across a fleet requires an efficient indexing strategy. Bistouri's symbolizer treats the Build ID as the primary key. 
+Storing symbols for every kernel version across a fleet requires an efficient indexing strategy. Bistouri's symbolizer treats the Build ID as the primary key.
 
-The symbolizer uses a tiered approach to artifact storage. It first checks a **Negative Cache** to avoid repeatedly trying to fetch missing or malformed symbols (a common occurrence with proprietary or stripped binaries). If the binary is valid, it checks a **Tiered Debuginfod Client** which can read from a local filesystem mount (often a shared volume in Kubernetes) before falling back to a remote HTTP server.
+The symbolizer uses a tiered approach to artifact storage. It first checks a **Negative Cache** to avoid repeatedly trying to fetch missing or malformed symbols (a common occurrence with proprietary or stripped binaries).
 
-In memory, we use a byte-weighted LRU cache. Because a single `vmlinux` binary can be 500MB, we can't simply cache a fixed number of objects. The cache tracks the actual memory footprint of the parsed DWARF sections. 
+::: {.callout-note}
+## Design Detail: Error Classification
+A key aspect of our negative caching strategy is distinguishing permanent failures (like HTTP 404s or corrupted binaries) from transient network errors (such as timeouts). Permanent failures are stored in the negative cache with a configurable TTL, whereas transient errors bypass the negative cache completely. This guarantees that the pipeline automatically retries fetching when temporary infrastructure issues resolve.
+:::
+
+If the binary is valid, it checks a **Tiered Debuginfod Client** which can read from a local filesystem cache (often a shared volume in Kubernetes, typically populated by a sidecar) before falling back to a remote HTTP server.
+
+In memory, we use a byte-weighted LRU cache. Because a single `vmlinux` binary can be 500MB, we can't simply cache a fixed number of objects. The cache tracks the actual memory footprint of the parsed DWARF sections.
 
 ::: {.callout-tip}
 ## Design Detail: Context Pooling
@@ -74,21 +81,21 @@ The symbolizer operates as a reactive service. It remains dormant until a profil
 
 ```{mermaid}
 stateDiagram-v2
-    [*] --> Initializing: "Load Local Cache"
-    Initializing --> Listening: "Start gRPC Server"
-    
-    state "Processing Session" as Processing {
-        [*] --> Fetching: "Async Prefetch"
-        Fetching --> Resolving: "Blocking Resolve"
-        Resolving --> Storing: "Sink::store()"
+    [*] --> Initializing : Load Local Cache
+    Initializing --> Listening : Start gRPC Server
+
+    state Processing {
+        [*] --> Fetching : Async Prefetch
+        Fetching --> Resolving : Blocking Resolve
+        Resolving --> Storing : Sink.store()
         Storing --> [*]
     }
-    
-    Listening --> Processing: "New Session"
-    Processing --> Listening: "Ready for Next"
-    Listening --> [*]: Shutdown
+
+    Listening --> Processing : New Session
+    Processing --> Listening : Ready for Next
+    Listening --> [*] : Shutdown
 ```
 
 ---
-_Auto-generated from commit `16252f4` by Gemini 3.1 Pro.
+_Auto-generated from commit `1f05a74` by Gemini 3.1 Pro.
 Last updated: 2026-05-24_

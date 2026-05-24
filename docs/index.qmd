@@ -10,6 +10,11 @@ The core premise is that profiling is most valuable when a system is under dures
 
 Furthermore, Bistouri is designed as a distributed system. The agent is a "thin" collector; it captures raw memory addresses and build-id offsets from the kernel but does not attempt to resolve them into human-readable symbols locally. Instead, it ships these raw traces to a centralized Symbolizer service via gRPC. This offloads the memory-intensive task of parsing DWARF and ELF data away from the production host, ensuring the "scalpel" doesn't become a "sledgehammer."
 
+::: {.callout-note}
+## Why Thin Collection Matters
+Running symbol resolution on production hosts requires loading massive ELF/DWARF tables, which can trigger page faults, exhaust memory limits, and disrupt the very workloads you are attempting to diagnose. By streaming raw build-ids and offsets, Bistouri maintains an incredibly light host footprint.
+:::
+
 ## Why eBPF for Profiling?
 
 Traditional profilers often rely on signals or `ptrace`, both of which introduce significant latency and can alter the timing of the very issues you are trying to debug. eBPF allows us to run profiling logic directly within the kernel's interrupt context or at specific tracepoints with nanosecond overhead.
@@ -18,23 +23,34 @@ We chose eBPF because it provides a safe, programmable way to bridge the gap bet
 
 Beyond standard on-CPU sampling, eBPF gives us the visibility to implement **off-CPU profiling**. By hooking into the scheduler (`sched_switch`), Bistouri can capture stack traces when a process is blocked in a "D-state" (uninterruptible sleep), which is often the smoking gun for I/O-related stalls that on-CPU profilers miss entirely.
 
+::: {.callout-tip}
+## Unified Profiling Cadence
+To prevent off-CPU collection from flooding the system with traces during extreme blocking events, our eBPF program enforces a rate limit on scheduler hook events using an LRU hash map (`off_cpu_last_ts`). This limit is dynamically adjusted to match the on-CPU sampling frequency, keeping the overall trace stream beautifully balanced.
+:::
+
 ## Architecture at a Glance
 
-Bistouri is built on a "multi-phase" initialization pattern to manage the complex lifecycle of eBPF programs and their dependencies on the host system. This ensures that the agent only begins active collection when all dependencies—from kernel metadata to user-space channels—are correctly wired.
+Bistouri is built on a "multi-phase" initialization pattern managed by the `BistouriDaemon` to coordinate the complex lifecycles of eBPF programs, kernel maps, and asynchronous user-space actors. This guarantees that we do not load heavy BPF objects or hook kernel events until all validation checks pass.
 
-1.  **Preflight:** We collect and validate kernel metadata (like the KASLR `_text` offset and kernel build ID) and verify host capabilities.
-2.  **Preparation:** We parse configurations and initialize the `TriggerAgent`. This stage sets up the asynchronous watchers (like PSI file descriptors) and resolves filesystem paths for cgroups. In Kubernetes environments, this includes watching for `BistouriConfig` Custom Resources.
-3.  **Loading:** The `ProfilerAgent` loads the eBPF bytecode. At this point, the BPF programs are resident but essentially "blind"—they don't yet know which processes to profile.
-4.  **Activation:** We pass the BPF map handles (specifically a Longest Prefix Match trie and a PID filter) from the `ProfilerAgent` to the `TriggerAgent` and `CaptureOrchestrator`. Now, the trigger system can "arm" the profiler for specific targets in real-time.
+``` {mermaid}
+flowchart TD
+    A["1. Preflight"] -->|"Verify KASLR, release, build-id"| B["2. Preparation"]
+    B -->|"Build TriggerAgent & resolve cgroups"| C["3. Loading"]
+    C -->|"Mutate .rodata, load BPF skeleton"| D["4. Activation"]
+    D -->|"Duplicate map FDs & arm profiler"| E["Active Profiling"]
+```
 
-This separation ensures that we don't load heavy BPF objects until we are sure the configuration is valid, and it allows the user-space event loop to remain decoupled from the kernel-space data collection.
+1.  **Preflight:** We collect and validate kernel metadata—specifically the KASLR `_text` base address from `/proc/kallsyms`, the kernel build ID from `/sys/kernel/notes`, and the kernel release string. If `/proc/kallsyms` is blocked by a restrictive `kptr_restrict` setting, we fail early rather than generating corrupt user/kernel trace coordinates.
+2.  **Preparation:** We parse configurations (watching for changes either via local file `inotify` or Kubernetes `BistouriConfig` Custom Resources) and initialize the `TriggerAgent`. We resolve filesystem paths for cgroups by looking up the cgroup2 mount point inside `/proc/mounts`.
+3.  **Loading:** The `ProfilerAgent` modifies read-only BPF configuration variables—such as setting `off_cpu_period_ns` in the skeleton's `.rodata` section to match the user's configured sampling frequency—and loads the BPF skeleton.
+4.  **Activation:** We extract standalone, thread-safe map handles (`MapHandle`) by duplicating the underlying file descriptors for the Longest Prefix Match (LPM) trie (`comm_lpm_trie`) and the PID filter map (`pid_filter_map`). These are handed to the `TriggerAgent` and `CaptureOrchestrator` to enable real-time filtering, reference-counted PID tracking, and immediate trigger evaluation.
 
 ## Component Map
 
 The following diagram illustrates how pressure events flow from the kernel, through our reactive logic, and out to the centralized symbolization infrastructure.
 
-```{mermaid}
-graph TD
+``` {mermaid}
+flowchart TD
     subgraph "Kernel Space"
         PSI["PSI Events (/proc/pressure)"] -->|"Poll/Select"| UA["Trigger Agent"]
         SCHED["Scheduler (sched_switch)"] --> BPF_PROG["eBPF Profiler"]
@@ -64,22 +80,27 @@ graph TD
 
 ## The Event Pipeline
 
-The pipeline is designed to be "eventually consistent." When a cgroup or process starts experiencing pressure, the following sequence occurs:
+The pipeline is designed to be "eventually consistent" and highly resilient, ensuring that the kernel-to-user-space boundary doesn't choke under heavy event volume:
 
-1.  **The Trigger:** The Linux kernel wakes up our `TriggerAgent` via a `poll()` on a PSI file descriptor.
-2.  **The Resolution:** The agent looks up the relevant process metadata. We use `/proc/<pid>/cgroup` for BPF-originated events and a periodic `ProcWalker` to ensure all matching processes are identified even if exec tracing was missed.
-3.  **The Filtering:** We use a Longest Prefix Match (LPM) Trie in BPF for `exec` hooks and a standard Hash Map for active PID filtering. The `TriggerAgent` manages rule-based matching, while the `CaptureOrchestrator` manages the lifecycle of active PIDs using a reference-counting mechanism.
-4.  **The Capture:** The BPF profiler uses dual triggers: a hardware timer (e.g., 19Hz) for on-CPU samples and a scheduler hook for off-CPU samples. To keep the data stream balanced, the off-CPU profiler is rate-limited to match the on-CPU frequency.
-5.  **The Consumption:** A dedicated async task drains the ring buffer. We use Tokio's `AsyncFd` to wrap the BPF ring buffer's epoll file descriptor, allowing BPF event consumption to yield efficiently to the async executor.
-6.  **The Export:** The `CaptureOrchestrator` deduplicates traces into dictionary-encoded sessions and serializes them using gRPC for the central `Symbolizer` service.
+1.  **The Trigger:** The Linux kernel wakes up our `TriggerAgent` via a `poll()` on a cgroup's PSI file descriptor. Unlike standard reads, PSI monitors register interest using `POLLPRI` (priority events), notifying us immediately when a threshold is breached.
+2.  **The Resolution:** The agent looks up the relevant process metadata. When matching processes, we read `/proc/<pid>/cgroup` from the host's filesystem perspective to prevent container namespace escape bugs, resolving absolute paths directly under the cgroup2 mount point.
+3.  **The Filtering:** Rule matching uses a user-space Radix Trie for initial execution matching alongside a BPF LPM Trie for kernel-space execution hooks (`match_comm_on_exec`). The `CaptureOrchestrator` translates rule matches into active profile targets, using a reference-counting mechanism to ensure a PID is only added to the `pid_filter_map` once, and removed promptly when all overlapping capture sessions finalize.
+4.  **The Capture:** The BPF profiler captures stack traces utilizing two mechanisms: hardware timers for on-CPU samples and a tracepoint hook on `sched_switch` for off-CPU samples.
+5.  **The Consumption:** The agent consumes raw ring buffer structures using `AsyncRingBuffer`, which wraps the `libbpf` epoll file descriptor in a Tokio `AsyncFd`. If consumption fails due to internal errors, the handler retries up to three consecutive times before aborting the process. This prevents the agent from running in a "silent failure" state where it consumes resources but registers no events.
+6.  **The Export:** Completed sessions are converted into protobuf payloads, employing user-space dictionary encoding to deduplicate redundant user-space stack frame mappings (such as duplicate DSOs and identical build IDs) before sending them downstream via gRPC.
+
+::: {.callout-important}
+## Handling Unresolved and vDSO Frames
+Many frames in a user-space stack trace point to volatile regions like anonymous memory maps or JIT compilation zones, or to standard vDSO (virtual Dynamic Shared Object) pages mapped by the kernel for rapid syscall execution. To handle these correctly, Bistouri reads `/proc/<pid>/auxv` to resolve the process's vDSO range at capture time, keeping this data in a local LRU `VdsoCache` to avoid repeating costly procfs I/O operations.
+:::
 
 ## Design Principles
 
--   **Event Loop Integrity:** We use a multi-threaded Tokio runtime, but we strictly separate IO-bound tasks from blocking tasks. Since `/proc` walking and config parsing are CPU-heavy and synchronous, we dedicate threads to these via `spawn_blocking` to ensure the primary async loop remains responsive to new PSI events.
+-   **Event Loop Integrity:** We run Bistouri on a multi-threaded Tokio runtime, but we enforce a strict separation between I/O-bound tasks and blocking tasks. Walking `/proc` or parsing YAML configurations are heavily synchronous, CPU-intensive, and prone to blocking threads. We offload all such tasks to a dedicated blocking pool via `spawn_blocking` to ensure the core async reactor can process kernel notifications without jitter.
 -   **Minimal Threading Budget:** By default, Bistouri runs on a skeleton crew—one worker thread for IO and one for blocking. This is a "conservative by default" stance; we want the profiling tool to be the last thing contributing to the system pressure it's trying to measure.
--   **Observability First:** Kernel-space is a black box. Bistouri uses a dedicated BPF error ring buffer to report issues like map reservation failures or `bpf_get_stack` errors back to user-space, where they are converted into Prometheus metrics.
--   **Capacity Planning:** The agent performs internal capacity planning, pre-allocating buffers for session building (e.g., `compute_trace_capacity`) based on the configured sampling frequency and capture duration. This minimizes reallocations on the performance-sensitive ingestion path.
--   **Safety and Performance:** We use `repr(C)` structs to share memory between Rust and C without serialization overhead. For heavy deduplication, we pre-compute hashes in user-space to make `HashMap` lookups O(1) during session building.
+-   **Zero-Allocation Hot Paths:** In the core execution loop, dynamic memory allocations are our biggest enemy. To optimize performance, the agent pre-allocates session trace capacity on startup using a simple heuristic (`(freq * duration) / 4`), clamping the capacity between 16 and 256. 
+-   **Pre-computed Hashing:** When stack traces are built from raw BPF ring buffer structures, we compute their content hashes exactly once and cache them on the `StackTrace` structure. Subsequent lookups in our session deduplication `HashMap` are `O(1)` operations, avoiding costly nested vector equality comparisons.
+-   **Kernel-Space Observability:** Because kernel-space execution is a black box, Bistouri uses a dedicated `errors` BPF ring buffer (64KB). When a helper fails—such as `bpf_get_stack` returning `-14` (EFAULT) due to a target process exiting mid-sample—the kernel writes an explicit error event. User-space consumes these events and translates them directly into Prometheus metrics, transforming silent kernel drops into visible telemetry.
 
 ## Key Tradeoffs
 
@@ -88,5 +109,5 @@ The pipeline is designed to be "eventually consistent." When a cgroup or process
 -   **User-space Triggering:** One might ask why we don't trigger the profiler entirely in the kernel. The answer is policy. Defining what constitutes "too much pressure" involves complex configuration, threshold percentages, and multi-tenant metadata (like Kubernetes CRDs) that is significantly easier and safer to manage in Rust.
 
 ---
-_Auto-generated from commit `16252f4` by Gemini 3.1 Pro.
+_Auto-generated from commit `1f05a74` by Gemini 3.1 Pro.
 Last updated: 2026-05-24_

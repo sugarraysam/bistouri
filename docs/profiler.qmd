@@ -14,6 +14,8 @@ For off-CPU work, we attach to the `sched_switch` tracepoint. If a monitored PID
 
 In both cases, the handler first checks the `pid_filter_map`. If the current PID isn't there, we exit immediately with minimal overhead. If it is, we perform the "heavy" work: walking the stack for both kernel and user space. This design ensures that the cost of profiling is proportional to the number of processes we are actually interested in.
 
+To handle scenarios where a process experiences multiple concurrent pressures (e.g., both CPU and Memory stalls), the userspace `CaptureOrchestrator` manages PID profiling sessions using a reference-counting scheme. When a pressure event first fires, the orchestrator increments a userspace reference count for that PID and adds it to the kernel's `pid_filter_map` allow-list. Subsequent triggers for different resources on the same PID simply increment this reference count. As the respective capture windows expire, the orchestrator decrements the count, only deleting the PID from the BPF allow-list when the reference count drops to zero. This ensures a process is not prematurely unmasked while other profiling sessions are still actively sampling it.
+
 ## BPF Map Lifecycle
 
 Managing BPF maps requires a careful dance between the lifetime of the BPF object and the Rust handles that manipulate them. In Bistouri, we use `libbpf-rs` to manage the skeleton, but we've made a specific design choice regarding map access: we use a custom `MapHandle`.
@@ -50,6 +52,10 @@ We've optimized this by moving the filtering logic to the `pid_filter_map`. When
 We use `bpf_get_stack` with the `BPF_F_USER_BUILD_ID` flag. This directs the kernel to resolve the ELF Build-ID and file offset for each user frame by walking the process's VMAs internally. This is significantly more efficient than capturing raw instruction pointers and resolving them in userspace, which would require racing against `/proc/<pid>/maps` updates.
 :::
 
+However, this kernel-side resolution has a known blind spot: special memory regions like the virtual Dynamic Shared Object (vDSO) — where the kernel maps high-performance syscall entry points directly into user memory — do not have an ELF Build-ID. For these frames, `bpf_get_stack` falls back to reporting raw instruction pointers (status `FallbackIp`).
+
+To handle this without resorting to expensive, continuous userspace memory-map walks, Bistouri's `ProcWalker` queries `/proc/<pid>/auxv` during its process scans. It extracts the `AT_SYSINFO_EHDR` (the vDSO base address) and `AT_PAGESZ` entries to compute the process's vDSO boundaries, caching them in a thread-safe LRU `VdsoCache`. When parsing userspace stack events, the symbolization pipeline checks fallback instruction pointers against this cached range. This allows Bistouri to accurately label syscall entry-points as `[vdso]` rather than discarding them as corrupted frames or leaving them as `[unknown]`.
+
 ## Error Recovery
 
 One of the most overlooked aspects of eBPF design is "telemetry for the profiler itself." If a stack walk fails in the kernel, or if we run out of space in a ring buffer, how does the operator know?
@@ -82,5 +88,5 @@ stateDiagram-v2
 The `LoadedProfilerAgent` struct acts as a guard for the active profiling session. When the struct is dropped, the BPF links and the ring buffer are cleaned up in a specific sequence. This prevents use-after-free-like scenarios where the kernel might try to push data into a ring buffer that userspace has already unmapped.
 
 ---
-_Auto-generated from commit `16252f4` by Gemini 3.1 Pro.
-Last updated: 2025-02-15_
+_Auto-generated from commit `1f05a74` by Gemini 3.1 Pro.
+Last updated: 2026-05-24_

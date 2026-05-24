@@ -2,6 +2,10 @@ project:
   type: book
   output-dir: _book
 
+# Enforces strict execution: any failing code block will fail the entire Quarto build
+execute:
+  error: false
+
 book:
   title: "Bistouri — Building an eBPF Profiler"
   chapters:
@@ -24,5 +28,7 @@ format:
     highlight-style: github
     mainfont: "Inter, system-ui, -apple-system, sans-serif"
     monofont: "JetBrains Mono, Fira Code, monospace"
+    # Forces Quarto to render diagrams at build time, catching syntax errors in CI
+    mermaid-format: svg
     mermaid:
       theme: default

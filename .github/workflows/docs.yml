@@ -24,6 +24,9 @@ jobs:
       - name: Install genai SDK
         run: pip install google-genai
 
+      - name: Setup Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+
       - name: Generate documentation
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

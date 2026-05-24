@@ -26,7 +26,7 @@ import google.genai as genai
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-MODEL = "gemini-3-flash-preview"
+MODEL = "gemini-3.5-flash"
 DOCS_DIR = Path("docs")
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 RATE_LIMIT_SECONDS = 12  # 5 requests/minute = 1 every 12 seconds
@@ -152,7 +152,7 @@ SECTION SKELETON (follow this structure exactly):
 
 SOURCE CODE:
 {code_context}
-"""
+{rendered_html_context}"""
 
 INCREMENTAL_PROMPT = """\
 Below is the CURRENT version of this chapter and the CURRENT source code.
@@ -179,7 +179,8 @@ SECTION SKELETON (must match exactly):
 
 CURRENT SOURCE CODE:
 {code_context}
-"""
+{rendered_html_context}"""
+
 
 # ── Chapter definitions ───────────────────────────────────────────────────────
 #
@@ -315,7 +316,16 @@ CHAPTERS = [
 
 # ── Source file extensions to include ────────────────────────────────────────
 
-SOURCE_EXTENSIONS = {".rs", ".c", ".h", ".toml", ".md", ".yml", ".yaml", ".proto"}
+SOURCE_EXTENSIONS = {
+    ".rs",
+    ".c",
+    ".h",
+    ".toml",
+    ".md",
+    ".yml",
+    ".yaml",
+    ".proto",
+}
 
 
 # ── Workspace discovery ───────────────────────────────────────────────────────
@@ -342,7 +352,9 @@ def discover_crates() -> dict[str, Path]:
     # full package name. If the convention ever changes, update this prefix.
     prefix = "bistouri-"
     return {
-        pkg["name"].removeprefix(prefix): Path(pkg["manifest_path"]).parent / "src"
+        pkg["name"].removeprefix(prefix): (
+            Path(pkg["manifest_path"]).parent / "src"
+        )
         for pkg in meta["packages"]
     }
 
@@ -412,7 +424,10 @@ def read_sources(sources: list, crate_map: dict[str, Path]) -> str:
             rel = path.relative_to(WORKSPACE_ROOT)
             context += f"\n--- File: {rel} ---\n{path.read_text()}\n"
         else:
-            print(f"  ⚠  Source path not found: {path} — skipping.", file=sys.stderr)
+            print(
+                f"  ⚠  Source path not found: {path} — skipping.",
+                file=sys.stderr,
+            )
 
     return context
 
@@ -430,6 +445,48 @@ def strip_wrapping_fences(text: str) -> str:
     if match:
         return match.group(1)
     return text
+
+
+def check_quarto_installed() -> bool:
+    """Check if quarto command is available in the system PATH."""
+    try:
+        subprocess.run(["quarto", "--version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def render_docs() -> None:
+    """Render Quarto docs to local HTML under docs/_book."""
+    if not check_quarto_installed():
+        print(
+            "ERROR: Quarto CLI is not installed.\n"
+            "Please install the Quarto CLI to run the docs generator.\n"
+            "Installation guide: https://quarto.org/docs/get-started/",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("Rendering Quarto documentation to generate HTML context...")
+    try:
+        subprocess.run(
+            ["quarto", "render", str(DOCS_DIR)],
+            cwd=WORKSPACE_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        print("  ✓ Quarto rendering successful.")
+    except subprocess.CalledProcessError as e:
+        print(
+            f"ERROR: Quarto rendering failed:\n"
+            f"Command: {' '.join(e.cmd)}\n"
+            f"Exit code: {e.returncode}\n"
+            f"Stdout: {e.stdout}\n"
+            f"Stderr: {e.stderr}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 async def generate_chapter(
@@ -455,16 +512,30 @@ async def generate_chapter(
         ):
             existing_content = content
 
+    # Find the corresponding HTML file under _book
+    rendered_html_context = ""
+    html_filename = output_path.with_suffix(".html").name
+    html_path = DOCS_DIR / "_book" / html_filename
+    if html_path.exists():
+        try:
+            html_content = html_path.read_text()
+            rendered_html_context = f"\nRENDERED HTML (for visual/rendering self-verification):\n{html_content}\n"
+            print(f"  → Found rendered HTML context for {chapter['filename']}")
+        except Exception as e:
+            print(f"  ⚠  Failed to read rendered HTML file {html_path}: {e}", file=sys.stderr)
+
     if existing_content is not None:
         user_prompt = INCREMENTAL_PROMPT.format(
             existing_chapter_content=existing_content,
             code_context=code_context,
             skeleton=chapter["skeleton"],
+            rendered_html_context=rendered_html_context,
         )
     else:
         user_prompt = FIRST_DRAFT_PROMPT.format(
             code_context=code_context,
             skeleton=chapter["skeleton"],
+            rendered_html_context=rendered_html_context,
         )
 
     system_instruction = SYSTEM_PROMPT.format(
@@ -492,8 +563,28 @@ async def generate_chapter(
     print(f"  ✓ {chapter['filename']}")
 
 
+def load_env() -> None:
+    """Load environment variables from .env file if it exists in the workspace root."""
+    env_path = WORKSPACE_ROOT / ".env"
+    if env_path.exists():
+        print(f"Loading environment variables from {env_path}...")
+        try:
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip("'\"")
+                    os.environ[key] = val
+        except Exception as e:
+            print(f"Warning: Failed to load .env file: {e}", file=sys.stderr)
+
+
 async def main() -> None:
     """Generate all documentation chapters."""
+    load_env()
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print(
@@ -519,6 +610,9 @@ async def main() -> None:
 
     DOCS_DIR.mkdir(exist_ok=True)
 
+    # Render current docs first so we have the HTML files matching each qmd
+    render_docs()
+
     print(f"\nGenerating docs from commit {commit_sha} ({date_str})")
     print(f"Model: {MODEL}")
     print(f"Rate limit: {RATE_LIMIT_SECONDS}s between calls\n")
@@ -531,7 +625,9 @@ async def main() -> None:
 
         print(f"  Generating {chapter['filename']}...")
         try:
-            await generate_chapter(client, chapter, crate_map, commit_sha, date_str)
+            await generate_chapter(
+                client, chapter, crate_map, commit_sha, date_str
+            )
         except Exception as e:
             print(f"  ✗ {chapter['filename']}: {e}", file=sys.stderr)
             # Continue with remaining chapters rather than failing entirely
