@@ -496,7 +496,8 @@ mod tests {
     }
 
     /// Verifies that multiple threads can walk the DWARF of the same
-    /// `CachedObject` concurrently without panics or incorrect results.
+    /// `CachedObject` concurrently without panics or incorrect results,
+    /// and that the pool grows on demand under true concurrent load.
     #[test]
     fn concurrent_symbolize_vaddr() {
         let fixture_path = format!(
@@ -514,16 +515,20 @@ mod tests {
         let vaddr = crate::resolve::elf::translate_file_offset(&obj.segments, 6213, "test")
             .expect("segment translation failed for offset 6213");
 
-        // Spawn 8 threads all resolving the same vaddr concurrently. Use barrier
-        // to ensure concurrency.
+        // Spawn 8 threads. Use a barrier after borrowing but before returning
+        // to guarantee that all 8 threads hold a context simultaneously,
+        // forcing the pool to grow to 8.
         let barrier = Arc::new(Barrier::new(8));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let obj = obj.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
+                    let ctx = obj.borrow_context();
                     barrier.wait();
-                    obj.symbolize_vaddr(vaddr)
+                    let frame = CachedObject::walk_dwarf(&ctx, vaddr);
+                    obj.return_context(ctx);
+                    frame
                 })
             })
             .collect();
@@ -541,11 +546,11 @@ mod tests {
             }
         }
 
-        // Verify pool has at least the seed context.
+        // Verify pool has grown to hold all concurrent contexts.
         let pool_size = obj.pool.lock().unwrap().len();
-        assert!(
-            pool_size > 1,
-            "pool should have at least the seed context, got {pool_size}"
+        assert_eq!(
+            pool_size, 8,
+            "pool should have grown to 8 contexts, got {pool_size}"
         );
     }
 
