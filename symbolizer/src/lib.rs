@@ -28,6 +28,7 @@
 //! daemon.shutdown().await;
 //! ```
 
+pub mod cli;
 pub mod daemon;
 pub mod debuginfod;
 pub mod model;

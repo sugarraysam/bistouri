@@ -13,15 +13,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
 use crate::telemetry::{
-    METRIC_LATENCY_SECONDS, METRIC_RESOLUTIONS_ERROR, METRIC_RESOLUTIONS_SUCCESS,
-    METRIC_RESOLUTIONS_TOTAL, METRIC_SESSIONS_DROPPED, METRIC_SESSIONS_ENQUEUED,
+    METRIC_INFLIGHT_SESSIONS, METRIC_LATENCY_SECONDS, METRIC_RESOLUTIONS_ERROR,
+    METRIC_RESOLUTIONS_SUCCESS, METRIC_RESOLUTIONS_TOTAL, METRIC_RX_QUEUE_DEPTH,
+    METRIC_SESSIONS_DROPPED, METRIC_SESSIONS_ENQUEUED,
 };
 
 use crate::debuginfod::DebuginfodClient;
@@ -30,12 +31,6 @@ use crate::sink::SessionSink;
 use bistouri_api::v1 as proto;
 use bistouri_api::v1::capture_service_server::CaptureService;
 
-/// Default processing queue capacity (pending payloads awaiting dispatch).
-pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 1024;
-
-/// Default max concurrent sessions being resolved + stored in parallel.
-pub(crate) const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 16;
-
 /// gRPC handler that receives `SessionPayload`s from agents and enqueues
 /// them for asynchronous resolution + storage.
 ///
@@ -43,11 +38,17 @@ pub(crate) const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 16;
 /// Cloning is cheap (Arc'd internally by tokio).
 pub(crate) struct SymbolizerService {
     tx: mpsc::Sender<proto::SessionPayload>,
+    /// Fixed at construction for O(1) queue depth computation.
+    queue_max_capacity: usize,
 }
 
 impl SymbolizerService {
     pub(crate) fn new(tx: mpsc::Sender<proto::SessionPayload>) -> Self {
-        Self { tx }
+        let queue_max_capacity = tx.max_capacity();
+        Self {
+            tx,
+            queue_max_capacity,
+        }
     }
 }
 
@@ -76,6 +77,9 @@ impl CaptureService for SymbolizerService {
         match self.tx.try_send(payload) {
             Ok(()) => {
                 counter!(METRIC_SESSIONS_ENQUEUED).increment(1);
+                // Record queue depth: items currently buffered.
+                let depth = self.queue_max_capacity - self.tx.capacity();
+                gauge!(METRIC_RX_QUEUE_DEPTH).set(depth as f64);
                 Ok(Response::new(()))
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -85,6 +89,7 @@ impl CaptureService for SymbolizerService {
                     "processing queue full — dropping session"
                 );
                 counter!(METRIC_SESSIONS_DROPPED).increment(1);
+                gauge!(METRIC_RX_QUEUE_DEPTH).set(self.queue_max_capacity as f64);
                 Err(Status::resource_exhausted(
                     "symbolizer processing queue full",
                 ))
@@ -170,7 +175,9 @@ async fn dispatcher_loop<C, S>(
         let sink = sink.clone();
 
         tasks.spawn(async move {
+            gauge!(METRIC_INFLIGHT_SESSIONS).increment(1.0);
             process_session(resolver, sink, payload).await;
+            gauge!(METRIC_INFLIGHT_SESSIONS).decrement(1.0);
             drop(permit); // Release the semaphore slot.
         });
     }

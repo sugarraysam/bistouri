@@ -7,7 +7,7 @@
 //!   `Context` pool inside each `CachedObject`.
 //! - **Negative cache**: TTL-based cache for 404'd build IDs.
 //! - **Symbol cache (L2)**: `(BuildId, address) → Arc<ResolvedFrame>` —
-//!   zero-copy cache hits.
+//!   byte-weighted with [`BYTES_PER_L2_ENTRY`] per slot for zero-copy hits.
 
 use object::{Object, ObjectSection};
 use std::sync::{Arc, Mutex};
@@ -250,6 +250,7 @@ impl CachedObject {
 #[derive(Clone)]
 pub struct ObjectCache {
     objects: MokaCache<BuildId, CacheEntry>,
+    max_capacity_bytes: u64,
 }
 
 impl ObjectCache {
@@ -259,6 +260,7 @@ impl ObjectCache {
                 .weigher(|_key: &BuildId, value: &CacheEntry| -> u32 { value.weight_bytes() })
                 .max_capacity(max_capacity_bytes)
                 .build(),
+            max_capacity_bytes,
         }
     }
 
@@ -284,6 +286,24 @@ impl ObjectCache {
             CacheEntry::Parsed(obj) => Some(obj),
             CacheEntry::Unparseable => None,
         }
+    }
+
+    /// Current number of entries in the cache.
+    #[inline]
+    pub fn entry_count(&self) -> u64 {
+        self.objects.entry_count()
+    }
+
+    /// Current weighted byte usage of the cache.
+    #[inline]
+    pub fn weighted_size(&self) -> u64 {
+        self.objects.weighted_size()
+    }
+
+    /// Maximum capacity in bytes.
+    #[inline]
+    pub fn max_capacity_bytes(&self) -> u64 {
+        self.max_capacity_bytes
     }
 }
 
@@ -313,22 +333,56 @@ impl NegativeCache {
     pub(crate) fn is_negative(&self, build_id: &BuildId) -> bool {
         self.entries.contains_key(build_id)
     }
+
+    /// Current number of entries in the negative cache.
+    #[inline]
+    pub fn entry_count(&self) -> u64 {
+        self.entries.entry_count()
+    }
 }
 
 pub(crate) type SymbolKey = (BuildId, u64);
 
-/// Cache for resolved symbols — `Arc<ResolvedFrame>` for zero-copy hits.
+/// Approximate cost per L2 symbol cache entry.
 ///
-/// `Clone` is cheap (moka is internally `Arc`-wrapped).
+/// Breakdown:
+///   Key:   `(BuildId, u64)` = `([u8; 20], u64)` = 28 bytes
+///   Value: `Arc<ResolvedFrame>` pointer = 8 bytes
+///          `SymbolInfo` (function ~80B, file ~60B, line 4B) ≈ 144 bytes
+///   Moka:  per-entry overhead (hash, pointers, freq sketch) ≈ 64 bytes
+///   Total: ~244 bytes → rounded up to 256 (power of 2).
+pub const BYTES_PER_L2_ENTRY: u64 = 256;
+
+/// Byte-budget cache for resolved symbols — `Arc<ResolvedFrame>` for zero-copy hits.
+///
+/// Sized by byte budget, internally divided by [`BYTES_PER_L2_ENTRY`] to
+/// compute the entry count. `Clone` is cheap (moka is internally `Arc`-wrapped).
 #[derive(Clone)]
 pub struct SymbolCache {
     entries: MokaCache<SymbolKey, Arc<ResolvedFrame>>,
+    budget_bytes: u64,
 }
 
 impl SymbolCache {
+    /// Creates a new symbol cache with the given byte budget.
+    ///
+    /// Internally divides by [`BYTES_PER_L2_ENTRY`] to compute entry count.
+    pub fn new_byte_budget(budget_bytes: u64) -> Self {
+        let max_entries = budget_bytes / BYTES_PER_L2_ENTRY;
+        Self {
+            entries: MokaCache::builder().max_capacity(max_entries).build(),
+            budget_bytes,
+        }
+    }
+
+    /// Creates a new symbol cache with the given entry capacity.
+    ///
+    /// Deprecated: prefer [`SymbolCache::new_byte_budget`] for consistent
+    /// byte-budget sizing across all caches.
     pub fn new(capacity: u64) -> Self {
         Self {
             entries: MokaCache::builder().max_capacity(capacity).build(),
+            budget_bytes: capacity * BYTES_PER_L2_ENTRY,
         }
     }
 
@@ -339,6 +393,24 @@ impl SymbolCache {
 
     pub(crate) fn insert(&self, key: SymbolKey, frame: Arc<ResolvedFrame>) {
         self.entries.insert(key, frame);
+    }
+
+    /// Current number of entries in the cache.
+    #[inline]
+    pub fn entry_count(&self) -> u64 {
+        self.entries.entry_count()
+    }
+
+    /// Estimated current byte usage (entry_count × BYTES_PER_L2_ENTRY).
+    #[inline]
+    pub fn estimated_byte_usage(&self) -> u64 {
+        self.entries.entry_count() * BYTES_PER_L2_ENTRY
+    }
+
+    /// Byte budget this cache was created with.
+    #[inline]
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
     }
 }
 

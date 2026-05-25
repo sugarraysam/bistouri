@@ -26,6 +26,7 @@ async-trait = "0.1"
 faster-hex = "0.10"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
+parse-size = "1"
 prost-types = "0.14"
 
 [dev-dependencies]

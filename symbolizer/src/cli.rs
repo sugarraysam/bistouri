@@ -1,0 +1,203 @@
+//! Shared CLI arguments for any binary embedding the symbolizer daemon.
+//!
+//! Use `#[command(flatten)]` to embed [`CommonArgs`] into your binary's
+//! `Args` struct. This is the single source of truth for all symbolizer
+//! daemon configuration — no duplication, no skew.
+//!
+//! ```ignore
+//! use bistouri_symbolizer::cli::CommonArgs;
+//!
+//! #[derive(clap::Parser)]
+//! struct Args {
+//!     #[command(flatten)]
+//!     common: CommonArgs,
+//!
+//!     // Your binary-specific args...
+//!     #[arg(long, env = "CLICKHOUSE_URL")]
+//!     clickhouse_url: String,
+//! }
+//! ```
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::daemon::{
+    DaemonConfig, DEFAULT_DEBUGINFOD_FETCH_CONCURRENCY, DEFAULT_MAX_CONCURRENT_SESSIONS,
+    DEFAULT_QUEUE_CAPACITY,
+};
+use crate::resolve::cache::{CachePool, NegativeCache, ObjectCache, SymbolCache};
+
+/// Thin wrapper around [`parse_size::parse_size`] for clap `value_parser` compatibility.
+///
+/// `parse_size::parse_size` is generic over `impl AsRef<str>`, producing a
+/// monomorphized function that doesn't satisfy clap's `for<'a> Fn(&'a str)`
+/// higher-ranked lifetime bound. This concrete wrapper fixes the lifetime.
+fn parse_memory_size(s: &str) -> Result<u64, parse_size::Error> {
+    parse_size::parse_size(s)
+}
+
+/// Shared CLI arguments for the symbolizer daemon.
+///
+/// Embed in your binary's `Args` via `#[command(flatten)]`.
+/// All fields have sensible defaults and respect env vars.
+#[derive(clap::Args, Debug, Clone)]
+pub struct CommonArgs {
+    /// gRPC listen address.
+    #[arg(long, default_value = "0.0.0.0:50051", env = "SYMBOLIZER_LISTEN_ADDR")]
+    pub listen_addr: String,
+
+    /// Prometheus metrics port.
+    #[arg(long, default_value_t = 9091, env = "SYMBOLIZER_METRICS_PORT")]
+    pub metrics_port: u16,
+
+    /// Debuginfod server URL.
+    #[arg(long, default_value = "http://localhost:8002", env = "DEBUGINFOD_URL")]
+    pub debuginfod_url: String,
+
+    /// Local debuginfod cache directory (shared volume).
+    /// If set, artifacts are read from disk before falling back to HTTP.
+    #[arg(long, env = "DEBUGINFOD_CACHE_PATH")]
+    pub debuginfod_cache_path: Option<PathBuf>,
+
+    /// Byte budget for user-space object cache (L1).
+    /// Default: 256 MiB — fits ~15–250 typical user-space debuginfo objects.
+    #[arg(
+        long,
+        default_value = "256MiB",
+        env = "SYMBOLIZER_USER_OBJECT_BUDGET_BYTES",
+        value_parser = parse_memory_size
+    )]
+    pub user_object_budget_bytes: u64,
+
+    /// Byte budget for kernel object cache (L1).
+    /// Default: 512 MiB — guarantees at least one vmlinux (200–400 MB)
+    /// plus headroom for kernel modules.
+    #[arg(
+        long,
+        default_value = "512MiB",
+        env = "SYMBOLIZER_KERNEL_OBJECT_BUDGET_BYTES",
+        value_parser = parse_memory_size
+    )]
+    pub kernel_object_budget_bytes: u64,
+
+    /// Byte budget for user symbol cache (L2).
+    /// Internally divided by 256 bytes/entry to compute entry count.
+    /// (Key: 28B + Arc<ResolvedFrame>: ~152B + moka overhead: ~64B = ~256B/entry)
+    #[arg(
+        long,
+        default_value = "128MiB",
+        env = "SYMBOLIZER_USER_SYMBOL_BUDGET_BYTES",
+        value_parser = parse_memory_size
+    )]
+    pub user_symbol_budget_bytes: u64,
+
+    /// Byte budget for kernel symbol cache (L2).
+    /// Internally divided by 256 bytes/entry to compute entry count.
+    /// (Key: 28B + Arc<ResolvedFrame>: ~152B + moka overhead: ~64B = ~256B/entry)
+    #[arg(
+        long,
+        default_value = "128MiB",
+        env = "SYMBOLIZER_KERNEL_SYMBOL_BUDGET_BYTES",
+        value_parser = parse_memory_size
+    )]
+    pub kernel_symbol_budget_bytes: u64,
+
+    /// Maximum number of negative cache entries (404'd build IDs).
+    #[arg(
+        long,
+        default_value_t = 4096,
+        env = "SYMBOLIZER_NEGATIVE_CACHE_ENTRIES"
+    )]
+    pub negative_cache_entries: u64,
+
+    /// Negative cache TTL in seconds.
+    #[arg(long, default_value_t = 300, env = "SYMBOLIZER_NEGATIVE_TTL_SECS")]
+    pub negative_ttl_secs: u64,
+
+    /// Log level filter (e.g. "info", "bistouri_symbolizer=debug").
+    /// Falls back to RUST_LOG env var, then "info".
+    #[arg(long, env = "RUST_LOG")]
+    pub log_level: Option<String>,
+
+    /// Processing queue capacity.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_QUEUE_CAPACITY,
+        env = "SYMBOLIZER_QUEUE_CAPACITY"
+    )]
+    pub queue_capacity: usize,
+
+    /// Maximum number of sessions resolved + stored concurrently.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_CONCURRENT_SESSIONS,
+        env = "SYMBOLIZER_MAX_CONCURRENT_SESSIONS"
+    )]
+    pub max_concurrent_sessions: usize,
+
+    /// Maximum number of concurrent debuginfod fetches during prefetch.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DEBUGINFOD_FETCH_CONCURRENCY,
+        env = "DEBUGINFOD_FETCH_CONCURRENCY"
+    )]
+    pub debuginfod_fetch_concurrency: usize,
+
+    /// Interval in seconds for reporting cache gauge metrics.
+    /// Should match your Prometheus scrape interval (default: 15s).
+    #[arg(long, default_value_t = 15, env = "SYMBOLIZER_GAUGE_INTERVAL_SECS")]
+    pub gauge_interval_secs: u64,
+}
+
+impl CommonArgs {
+    /// Constructs the [`CachePool`] from the configured byte budgets.
+    pub fn build_caches(&self) -> CachePool {
+        CachePool {
+            user_objects: ObjectCache::new(self.user_object_budget_bytes),
+            kernel_objects: ObjectCache::new(self.kernel_object_budget_bytes),
+            user_symbols: SymbolCache::new_byte_budget(self.user_symbol_budget_bytes),
+            kernel_symbols: SymbolCache::new_byte_budget(self.kernel_symbol_budget_bytes),
+            negative: NegativeCache::new(
+                self.negative_cache_entries,
+                Duration::from_secs(self.negative_ttl_secs),
+            ),
+        }
+    }
+
+    /// Builds the [`DaemonConfig`] from the shared args.
+    pub fn build_daemon_config(&self) -> anyhow::Result<DaemonConfig> {
+        Ok(DaemonConfig {
+            listen_addr: self.listen_addr.parse()?,
+            queue_capacity: self.queue_capacity,
+            max_concurrent_sessions: self.max_concurrent_sessions,
+            debuginfod_fetch_concurrency: self.debuginfod_fetch_concurrency,
+            gauge_interval_secs: self.gauge_interval_secs,
+        })
+    }
+
+    /// Initializes the tracing subscriber with the configured log level.
+    ///
+    /// Resolution: `--log-level` flag > `RUST_LOG` env > `"info"`.
+    pub fn init_logging(&self) {
+        let filter = self.log_level.as_deref().unwrap_or("info").to_string();
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
+            .init();
+    }
+
+    /// Starts the Prometheus metrics exporter on `0.0.0.0:{metrics_port}`.
+    pub fn init_metrics(&self) -> anyhow::Result<()> {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(([0, 0, 0, 0], self.metrics_port))
+            .install()
+            .map_err(|e| anyhow::anyhow!("metrics server on port {}: {e}", self.metrics_port))
+    }
+
+    /// Total cache budget in bytes (sum of all L1 + L2 budgets).
+    pub fn total_cache_budget(&self) -> u64 {
+        self.user_object_budget_bytes
+            + self.kernel_object_budget_bytes
+            + self.user_symbol_budget_bytes
+            + self.kernel_symbol_budget_bytes
+    }
+}
