@@ -1,56 +1,42 @@
 # syntax=docker/dockerfile:1
-# We use a multi-stage build to keep the final image as lightweight as possible.
+FROM rust:1-bookworm AS chef
 
-# ------------------------------------------------------------------------------
-# Stage 1: Builder
-# ------------------------------------------------------------------------------
-# We use the rust bookworm image to ensure glibc compatibility with the runtime stage.
-FROM rust:1-bookworm AS builder
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        llvm \
+        libelf-dev \
+        zlib1g-dev \
+        make \
+        pkg-config \
+        protobuf-compiler \
+        libprotobuf-dev
 
-# Install eBPF and C compilation dependencies
-RUN apt-get update && apt-get install -y \
-    clang \
-    llvm \
-    libelf-dev \
-    zlib1g-dev \
-    make \
-    pkg-config \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
-
-# libbpf-cargo requires rustfmt to format the generated skeleton
-RUN rustup component add rustfmt
-
-# Set up the working directory
+RUN cargo install cargo-chef --locked
 WORKDIR /app
 
-# Copy the actual source code
+FROM chef AS planner
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Build the Rust application using BuildKit cache mounts.
-# This caches the cargo registry and target directory, making subsequent builds blazingly fast.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo chef cook --release --recipe-path recipe.json -p bistouri-agent
+
+COPY . .
+RUN rustup component add rustfmt
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release -p bistouri-agent \
-    # Copy the compiled binary out of the cached target directory so it can be picked up by the next stage
     && cp target/release/bistouri-agent /app/bistouri-agent
 
-# ------------------------------------------------------------------------------
-# Stage 2: Runtime
-# ------------------------------------------------------------------------------
-# We use the bookworm-slim image for runtime. It provides glibc and minimal tools.
 FROM debian:bookworm-slim
-
-# Install runtime libraries required by libbpf dynamically
-RUN apt-get update && apt-get install -y \
-    libelf1 \
-    zlib1g \
-    && rm -rf /var/lib/apt/lists/*
-
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libelf1 \
+        zlib1g
 WORKDIR /app
-
-# Copy the compiled binary from the builder stage
 COPY --from=builder /app/bistouri-agent .
-
-# Set the default executable
 ENTRYPOINT ["/app/bistouri-agent"]

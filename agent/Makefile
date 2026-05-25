@@ -9,7 +9,7 @@ help:
 # Build from repo root context so workspace Cargo.toml + api/ crate are available.
 # The Dockerfile lives here but the build context is the parent directory.
 docker-build:
-	DOCKER_BUILDKIT=1 docker build -t bistouri-agent -f Dockerfile ..
+	docker buildx build --load -t bistouri-agent -f Dockerfile ..
 
 # Run E2E integration tests in a k3s cluster
 e2e:

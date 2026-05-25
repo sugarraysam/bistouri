@@ -28,7 +28,7 @@ make -C "$REPO_ROOT" validate-deployment
 
 if [[ "${SKIP_BUILD:-false}" != "true" ]]; then
     e2e_info "Building agent Docker image..."
-    DOCKER_BUILDKIT=1 docker build -t bistouri-agent:local \
+    docker buildx build --load -t bistouri-agent:local \
         -f "${REPO_ROOT}/agent/Dockerfile" "$REPO_ROOT"
     e2e_info "Building stress workload Docker image..."
     docker build -t bistouri-stress:local \

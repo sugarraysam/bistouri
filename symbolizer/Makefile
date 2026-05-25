@@ -9,7 +9,7 @@ help:
 
 # Build the symbolizer Docker image.
 docker-build:
-	DOCKER_BUILDKIT=1 docker build -t bistouri-symbolizer:local -f Dockerfile ..
+	docker buildx build --load -t bistouri-symbolizer:local -f Dockerfile ..
 
 # Build the debuginfod fixtures Docker image.
 docker-build-debuginfod:
