@@ -30,9 +30,6 @@ use crate::model::{
 };
 use bistouri_api::v1 as proto;
 
-/// Maximum number of concurrent debuginfod fetches during prefetch.
-const MAX_CONCURRENT_FETCHES: usize = 16;
-
 /// Orchestrates the full symbolization pipeline for a `SessionPayload`.
 ///
 /// Generic over the debuginfod client type for static dispatch.
@@ -42,10 +39,11 @@ pub struct SessionResolver<C: DebuginfodClient> {
     caches: CachePool,
     client: Arc<C>,
     kernel: KernelResolver<C>,
+    debuginfod_fetch_concurrency: usize,
 }
 
 impl<C: DebuginfodClient + 'static> SessionResolver<C> {
-    pub fn new(caches: CachePool, client: Arc<C>) -> Self {
+    pub fn new(caches: CachePool, client: Arc<C>, debuginfod_fetch_concurrency: usize) -> Self {
         let kernel = KernelResolver::new(
             caches.kernel_objects.clone(),
             caches.negative.clone(),
@@ -55,6 +53,7 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
             caches,
             client,
             kernel,
+            debuginfod_fetch_concurrency,
         }
     }
 
@@ -137,7 +136,7 @@ impl<C: DebuginfodClient + 'static> SessionResolver<C> {
             .collect();
 
         // Fetch concurrently in bounded batches.
-        for chunk in unique_ids.chunks(MAX_CONCURRENT_FETCHES) {
+        for chunk in unique_ids.chunks(self.debuginfod_fetch_concurrency) {
             let mut set = tokio::task::JoinSet::new();
             for &bid in chunk {
                 let cache = self.caches.user_objects.clone();

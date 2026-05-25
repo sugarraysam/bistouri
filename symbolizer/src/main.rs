@@ -139,8 +139,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = DaemonConfig {
         listen_addr: args.listen_addr.parse()?,
-        queue_capacity: 0,          // use default
-        max_concurrent_sessions: 0, // use default
+        queue_capacity: None,
+        max_concurrent_sessions: None,
+        debuginfod_fetch_concurrency: None,
     };
 
     // Log-only sink — for production storage, build a custom binary

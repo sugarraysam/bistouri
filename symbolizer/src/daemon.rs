@@ -29,7 +29,7 @@ pub struct DaemonConfig {
     ///
     /// When the queue is full, `ReportSession` returns `RESOURCE_EXHAUSTED`
     /// instead of blocking. Defaults to [`DEFAULT_QUEUE_CAPACITY`] (1024).
-    pub queue_capacity: usize,
+    pub queue_capacity: Option<usize>,
 
     /// Maximum number of sessions resolved + stored concurrently.
     ///
@@ -38,24 +38,26 @@ pub struct DaemonConfig {
     /// other controls parallelism.
     ///
     /// Defaults to [`DEFAULT_MAX_CONCURRENT_SESSIONS`] (16).
-    pub max_concurrent_sessions: usize,
+    pub max_concurrent_sessions: Option<usize>,
+
+    /// Maximum number of concurrent debuginfod fetches during prefetch.
+    ///
+    /// Defaults to 16.
+    pub debuginfod_fetch_concurrency: Option<usize>,
 }
 
 impl DaemonConfig {
     fn effective_queue_capacity(&self) -> usize {
-        if self.queue_capacity == 0 {
-            DEFAULT_QUEUE_CAPACITY
-        } else {
-            self.queue_capacity
-        }
+        self.queue_capacity.unwrap_or(DEFAULT_QUEUE_CAPACITY)
     }
 
     fn effective_max_concurrent(&self) -> usize {
-        if self.max_concurrent_sessions == 0 {
-            DEFAULT_MAX_CONCURRENT_SESSIONS
-        } else {
-            self.max_concurrent_sessions
-        }
+        self.max_concurrent_sessions
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_SESSIONS)
+    }
+
+    fn effective_debuginfod_fetch_concurrency(&self) -> usize {
+        self.debuginfod_fetch_concurrency.unwrap_or(16)
     }
 }
 
@@ -86,10 +88,12 @@ impl SymbolizerDaemon {
     {
         let cancel = CancellationToken::new();
 
-        let resolver = Arc::new(SessionResolver::new(caches, client));
-
         let queue_capacity = config.effective_queue_capacity();
         let max_concurrent = config.effective_max_concurrent();
+        let fetch_concurrency = config.effective_debuginfod_fetch_concurrency();
+
+        let resolver = Arc::new(SessionResolver::new(caches, client, fetch_concurrency));
+
         info!(
             queue_capacity,
             max_concurrent, "processing pipeline configured"
