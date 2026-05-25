@@ -36,13 +36,25 @@ e2e_error() { echo -e "${RED}[${E2E_LOG_PREFIX}]${NC} $*" >&2; }
 # Kill all k3s processes, wipe state. Safe to call even if k3s isn't running.
 nuke_k3s() {
 	e2e_info "Nuking k3s state..."
-	sudo k3s kubectl delete pods --all -n default 2>/dev/null || true
-	sudo k3s-killall.sh 2>/dev/null || true
-	sudo pkill -9 "k3s" 2>/dev/null || true
-	sudo rm -fr /var/lib/rancher/k3s/server/db || true
+
 	if systemctl is-active --quiet k3s 2>/dev/null; then
 		sudo systemctl stop k3s
 	fi
+
+	# Kill all lingering processes, containers, and clear iptables
+	sudo k3s-killall.sh 2>/dev/null || true
+	sudo pkill -9 "k3s" 2>/dev/null || true
+
+	# Wipe the ENTIRE k3s state directory (not just the DB)
+	sudo rm -rf /var/lib/rancher/k3s || true
+
+	# Wipe the CNI configuration (CRITICAL for fixing CIDRAssignmentFailed)
+	sudo rm -rf /etc/cni/net.d || true
+
+	# Clear out lingering kubelet pod state
+	sudo rm -rf /var/lib/kubelet/pods || true
+
+	# fix tty
 	stty sane 2>/dev/null || true
 }
 
@@ -85,9 +97,9 @@ start_fresh_k3s() {
 # Uses a temp copy so non-root processes can read it.
 setup_kubeconfig() {
 	e2e_info "Configuring KUBECONFIG..."
-	sudo cp /etc/rancher/k3s/k3s.yaml /tmp/bistouri-e2e-kubeconfig
-	sudo chown "$(id -u):$(id -g)" /tmp/bistouri-e2e-kubeconfig
-	export KUBECONFIG=/tmp/bistouri-e2e-kubeconfig
+	sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+	sudo chown $(id -u):$(id -g) ~/.kube/config
+	chmod 600 ~/.kube/config
 }
 
 # Import one or more Docker images into k3s containerd.
