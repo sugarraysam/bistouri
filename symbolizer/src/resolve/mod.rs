@@ -35,15 +35,19 @@ use bistouri_api::v1 as proto;
 /// Generic over the debuginfod client type for static dispatch.
 /// Caches are split into kernel and user-space pools so vmlinux objects
 /// (200+ MB) are never evicted by user-space churn.
-pub struct SessionResolver<C: DebuginfodClient> {
+pub struct SessionResolver {
     caches: CachePool,
-    client: Arc<C>,
-    kernel: KernelResolver<C>,
+    client: Arc<dyn DebuginfodClient>,
+    kernel: KernelResolver,
     debuginfod_fetch_concurrency: usize,
 }
 
-impl<C: DebuginfodClient + 'static> SessionResolver<C> {
-    pub fn new(caches: CachePool, client: Arc<C>, debuginfod_fetch_concurrency: usize) -> Self {
+impl SessionResolver {
+    pub fn new(
+        caches: CachePool,
+        client: Arc<dyn DebuginfodClient>,
+        debuginfod_fetch_concurrency: usize,
+    ) -> Self {
         let kernel = KernelResolver::new(
             caches.kernel_objects.clone(),
             caches.negative.clone(),

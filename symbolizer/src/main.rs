@@ -5,9 +5,7 @@ use tracing::info;
 
 use bistouri_symbolizer::cli::CommonArgs;
 use bistouri_symbolizer::daemon::SymbolizerDaemon;
-use bistouri_symbolizer::debuginfod::filesystem::FilesystemDebuginfodClient;
 use bistouri_symbolizer::debuginfod::http::HttpDebuginfodClient;
-use bistouri_symbolizer::debuginfod::tiered::TieredDebuginfodClient;
 use bistouri_symbolizer::sink::log::LogSink;
 
 /// Bistouri symbolizer service — resolves raw stack traces from agents
@@ -53,20 +51,11 @@ async fn main() -> anyhow::Result<()> {
     let sink = Arc::new(LogSink);
 
     // Build the debuginfod client.
-    // If a cache path is provided, compose filesystem + HTTP (tiered).
-    // Otherwise, use HTTP only.
     let http_client = HttpDebuginfodClient::new(common.debuginfod_url.clone())
         .map_err(|e| anyhow::anyhow!("failed to create debuginfod client: {e:#}"))?;
+    let client = common.build_client(http_client);
 
-    let daemon = if let Some(cache_path) = &common.debuginfod_cache_path {
-        info!(path = %cache_path.display(), "enabling filesystem-backed debuginfod (tiered)");
-        let fs_client = FilesystemDebuginfodClient::new(cache_path.clone());
-        let client = Arc::new(TieredDebuginfodClient::new(fs_client, http_client));
-        SymbolizerDaemon::start(config, client, sink, caches).await?
-    } else {
-        let client = Arc::new(http_client);
-        SymbolizerDaemon::start(config, client, sink, caches).await?
-    };
+    let daemon = SymbolizerDaemon::start(config, client, sink, caches).await?;
 
     tokio::signal::ctrl_c().await?;
     info!("received Ctrl-C, shutting down");

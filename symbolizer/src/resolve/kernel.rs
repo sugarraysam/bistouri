@@ -30,16 +30,19 @@ pub(crate) const DEFAULT_STATIC_TEXT_ADDR: u64 = 0xffff_ffff_8100_0000;
 /// Long-lived kernel frame resolver.
 ///
 /// Owns cloned cache handles (moka caches are internally `Arc`-wrapped,
-/// so cloning is a pointer bump). Generic over the client type to
-/// eliminate vtable dispatch on cache-miss fetches.
-pub(crate) struct KernelResolver<C> {
+/// so cloning is a pointer bump).
+pub(crate) struct KernelResolver {
     cache: ObjectCache,
     negative: NegativeCache,
-    client: Arc<C>,
+    client: Arc<dyn DebuginfodClient>,
 }
 
-impl<C: DebuginfodClient> KernelResolver<C> {
-    pub(crate) fn new(cache: ObjectCache, negative: NegativeCache, client: Arc<C>) -> Self {
+impl KernelResolver {
+    pub(crate) fn new(
+        cache: ObjectCache,
+        negative: NegativeCache,
+        client: Arc<dyn DebuginfodClient>,
+    ) -> Self {
         Self {
             cache,
             negative,

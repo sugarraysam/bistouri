@@ -312,34 +312,30 @@ async fn symbolizer_e2e() {
         .expect("failed to scrape metrics");
 
     // We expect some total resolutions (from phases 1, 2, 3)
-    let total_resolutions = scrape.counter("bistouri_symbolizer_resolutions_total", None);
+    let total_resolutions = scrape.counter("symbolizer_resolutions_total", None);
     assert!(total_resolutions > 0.0, "expected >0 total resolutions");
 
     // Phase 1 guarantees at least one success
-    let success_resolutions = scrape.counter("bistouri_symbolizer_resolutions_success", None);
+    let success_resolutions = scrape.counter("symbolizer_resolutions_success", None);
     assert!(
         success_resolutions > 0.0,
         "expected >0 successful resolutions"
     );
 
     // Cache hits and misses should be non-zero because we do lookups
-    let symbol_hits_user =
-        scrape.counter("bistouri_symbolizer_cache_hits", Some(("kind", "symbol")));
+    let symbol_hits_user = scrape.counter("symbolizer_cache_hits", Some(("kind", "symbol")));
     assert!(symbol_hits_user > 0.0, "expected >0 user symbol cache hits");
     // Let's just check the total cache misses for any space.
     // The scrape.counter signature from agent metrics.rs is: `pub(crate) fn counter(&self, name: &str, label: Option<(&str, &str)>) -> f64`
-    let misses_object_user =
-        scrape.counter("bistouri_symbolizer_cache_misses", Some(("space", "user")));
+    let misses_object_user = scrape.counter("symbolizer_cache_misses", Some(("space", "user")));
     assert!(
         misses_object_user > 0.0,
         "expected >0 user object cache misses"
     );
 
     // We should also see latency histograms
-    let latency_total = scrape.counter(
-        "bistouri_symbolizer_latency_seconds_count",
-        Some(("phase", "total")),
-    );
+    let latency_total =
+        scrape.counter("symbolizer_latency_seconds_count", Some(("phase", "total")));
     assert!(
         latency_total > 0.0,
         "expected >0 latency metrics for total phase"

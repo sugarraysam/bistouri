@@ -75,14 +75,13 @@ impl SymbolizerDaemon {
     ///
     /// Returns immediately with a running daemon. Call `shutdown()` to
     /// stop the server gracefully.
-    pub async fn start<C, S>(
+    pub async fn start<S>(
         config: DaemonConfig,
-        client: Arc<C>,
+        client: Arc<dyn DebuginfodClient>,
         sink: Arc<S>,
         caches: CachePool,
     ) -> anyhow::Result<Self>
     where
-        C: DebuginfodClient + 'static,
         S: SessionSink + 'static + ?Sized,
     {
         let cancel = CancellationToken::new();

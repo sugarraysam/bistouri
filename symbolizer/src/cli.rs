@@ -200,4 +200,92 @@ impl CommonArgs {
             + self.user_symbol_budget_bytes
             + self.kernel_symbol_budget_bytes
     }
+
+    /// Wraps a given `DebuginfodClient` with a filesystem-backed cache if `debuginfod_cache_path` is set.
+    pub fn build_client<C>(
+        &self,
+        base_client: C,
+    ) -> std::sync::Arc<dyn crate::debuginfod::DebuginfodClient>
+    where
+        C: crate::debuginfod::DebuginfodClient + 'static,
+    {
+        if let Some(cache_path) = &self.debuginfod_cache_path {
+            tracing::info!(path = %cache_path.display(), "enabling filesystem cache (L1)");
+            let fs_client =
+                crate::debuginfod::filesystem::FilesystemDebuginfodClient::new(cache_path.clone());
+            std::sync::Arc::new(crate::debuginfod::tiered::TieredDebuginfodClient::new(
+                fs_client,
+                base_client,
+            ))
+        } else {
+            std::sync::Arc::new(base_client)
+        }
+    }
+
+    /// Validates total cache budget against the cgroup v2 memory limit.
+    ///
+    /// Fails hard if total cache budget exceeds the configured threshold
+    /// of the cgroup limit or 100% of the limit (guaranteed OOM).
+    pub fn validate_cache_vs_cgroup(&self, threshold: f64) -> anyhow::Result<()> {
+        let total_cache = self.total_cache_budget();
+        let total_cache_mb = total_cache / (1024 * 1024);
+
+        let cgroup_limit = self.read_cgroup_memory_limit()?;
+        let cgroup_limit_mb = cgroup_limit / (1024 * 1024);
+        let threshold_bytes = (cgroup_limit as f64 * threshold) as u64;
+        let headroom_mb = cgroup_limit.saturating_sub(total_cache) / (1024 * 1024);
+
+        tracing::info!(
+            total_cache_mb,
+            cgroup_limit_mb,
+            threshold_pct = format!("{:.0}%", threshold * 100.0),
+            headroom_mb,
+            "cache budget vs cgroup memory"
+        );
+
+        if total_cache > cgroup_limit {
+            anyhow::bail!(
+                "total cache budget ({total_cache_mb} MiB) EXCEEDS cgroup memory limit \
+                 ({cgroup_limit_mb} MiB). OOM is guaranteed. \
+                 Reduce cache budgets or increase container memory limit."
+            );
+        }
+
+        if total_cache > threshold_bytes {
+            anyhow::bail!(
+                "total cache budget ({total_cache_mb} MiB) exceeds {:.0}% of cgroup memory \
+                 limit ({cgroup_limit_mb} MiB). Headroom: {headroom_mb} MiB. \
+                 Reduce cache budgets or increase container memory limit.",
+                threshold * 100.0
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Reads the cgroup v2 memory limit from `/sys/fs/cgroup/memory.max`.
+    ///
+    /// Fails hard if:
+    /// - cgroup v2 is not available (we always run in k8s containers)
+    /// - `memory.max` is "max" (unbounded — pod has no resource limits)
+    fn read_cgroup_memory_limit(&self) -> anyhow::Result<u64> {
+        let contents = std::fs::read_to_string("/sys/fs/cgroup/memory.max").map_err(|e| {
+            anyhow::anyhow!(
+                "cgroup v2 memory.max not available: {e}. \
+                 The symbolizer must run inside a cgroup v2 container \
+                 with memory limits defined."
+            )
+        })?;
+        let trimmed = contents.trim();
+        if trimmed == "max" {
+            anyhow::bail!(
+                "cgroup memory.max is 'max' (unbounded). \
+                 The pod has no memory resource limit defined. \
+                 Set spec.containers[].resources.limits.memory in the pod manifest."
+            );
+        }
+        trimmed
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("failed to parse cgroup memory.max '{trimmed}': {e}"))
+    }
 }

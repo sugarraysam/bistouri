@@ -24,4 +24,4 @@ fixtures:
 
 # Run symbolizer E2E tests (requires k3s + Docker).
 e2e:
-	RUST_LOG=debug ./tests/e2e/run-e2e-wrapper.sh
+	bash tests/e2e/run-e2e-wrapper.sh

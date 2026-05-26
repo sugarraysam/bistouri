@@ -25,7 +25,6 @@ use crate::telemetry::{
     METRIC_SESSIONS_DROPPED, METRIC_SESSIONS_ENQUEUED,
 };
 
-use crate::debuginfod::DebuginfodClient;
 use crate::resolve::SessionResolver;
 use crate::sink::SessionSink;
 use bistouri_api::v1 as proto;
@@ -118,14 +117,13 @@ impl ProcessingWorker {
     ///
     /// `max_concurrent` controls the semaphore — how many sessions can
     /// be resolved + stored in parallel. Independent of `queue_capacity`.
-    pub(crate) fn spawn<C, S>(
-        resolver: Arc<SessionResolver<C>>,
+    pub(crate) fn spawn<S>(
+        resolver: Arc<SessionResolver>,
         sink: Arc<S>,
         queue_capacity: usize,
         max_concurrent: usize,
     ) -> (mpsc::Sender<proto::SessionPayload>, Self)
     where
-        C: DebuginfodClient + 'static,
         S: SessionSink + 'static + ?Sized,
     {
         let (tx, rx) = mpsc::channel(queue_capacity);
@@ -152,13 +150,12 @@ impl ProcessingWorker {
 ///
 /// On shutdown (channel closed), all in-flight tasks are joined before
 /// the dispatcher exits — no orphaned handles.
-async fn dispatcher_loop<C, S>(
-    resolver: Arc<SessionResolver<C>>,
+async fn dispatcher_loop<S>(
+    resolver: Arc<SessionResolver>,
     sink: Arc<S>,
     mut rx: mpsc::Receiver<proto::SessionPayload>,
     semaphore: Arc<Semaphore>,
 ) where
-    C: DebuginfodClient + 'static,
     S: SessionSink + 'static + ?Sized,
 {
     let mut tasks = tokio::task::JoinSet::new();
@@ -192,12 +189,11 @@ async fn dispatcher_loop<C, S>(
 ///
 /// Metrics and errors are recorded here — the gRPC handler never sees
 /// them (fire-and-forget).
-async fn process_session<C, S>(
-    resolver: Arc<SessionResolver<C>>,
+async fn process_session<S>(
+    resolver: Arc<SessionResolver>,
     sink: Arc<S>,
     payload: proto::SessionPayload,
 ) where
-    C: DebuginfodClient + 'static,
     S: SessionSink + 'static + ?Sized,
 {
     let start_time = Instant::now();
