@@ -35,92 +35,91 @@ e2e_error() { echo -e "${RED}[${E2E_LOG_PREFIX}]${NC} $*" >&2; }
 
 # Kill all k3s processes, wipe state. Safe to call even if k3s isn't running.
 nuke_k3s() {
-    e2e_info "Nuking k3s state..."
+	e2e_info "Nuking k3s state..."
 
-    if systemctl is-active --quiet k3s 2>/dev/null; then
-        sudo systemctl stop k3s
-    fi
+	if systemctl is-active --quiet k3s 2>/dev/null; then
+		sudo systemctl stop k3s
+	fi
 
-    # Kill all lingering processes, containers, and clear iptables
-    sudo k3s-killall.sh 2>/dev/null || true
-    sudo pkill -9 "k3s" 2>/dev/null || true
+	# Kill all lingering processes, containers, and clear iptables
+	sudo k3s-killall.sh 2>/dev/null || true
+	sudo pkill -9 "k3s" 2>/dev/null || true
 
-    # Wipe the ENTIRE k3s state directory (not just the DB)
-    sudo rm -rf /var/lib/rancher/k3s || true
+	# Wipe the ENTIRE k3s state directory (not just the DB)
+	sudo rm -rf /var/lib/rancher/k3s || true
 
-    # Wipe the CNI configuration (CRITICAL for fixing CIDRAssignmentFailed)
-    sudo rm -rf /etc/cni/net.d || true
+	# Wipe the CNI configuration (CRITICAL for fixing CIDRAssignmentFailed)
+	sudo rm -rf /etc/cni/net.d || true
 
-    # Clear out lingering kubelet pod state
-    sudo rm -rf /var/lib/kubelet/pods 2>/dev/null || true
+	# Clear out lingering kubelet pod state
+	sudo rm -rf /var/lib/kubelet/pods 2>/dev/null || true
 
-    # fix tty
-    stty sane 2>/dev/null || true
+	# fix tty
+	stty sane 2>/dev/null || true
 }
 
 # Start a fresh k3s cluster from scratch and wait for readiness.
 # Always nukes first — E2E tests demand a clean slate.
 start_fresh_k3s() {
-    nuke_k3s
+	nuke_k3s
 
-    e2e_info "Starting k3s fresh..."
-    sudo nohup k3s server \
-        --disable=traefik \
-        --disable=servicelb \
-        --disable=metrics-server \
-        --write-kubeconfig-mode=644 \
-        >/tmp/k3s.log 2>&1 &
+	e2e_info "Starting k3s fresh..."
+	sudo nohup k3s server \
+		--disable=traefik \
+		--disable=metrics-server \
+		--write-kubeconfig-mode=644 \
+		>/tmp/k3s.log 2>&1 &
 
-    e2e_info "Waiting for k3s API server..."
-    local retries=30
-    while ! k3s kubectl cluster-info &>/dev/null; do
-        retries=$((retries - 1))
-        if [ "$retries" -le 0 ]; then
-            e2e_error "k3s failed to start within 60 seconds"
-            exit 1
-        fi
-        sleep 2
-    done
+	e2e_info "Waiting for k3s API server..."
+	local retries=30
+	while ! k3s kubectl cluster-info &>/dev/null; do
+		retries=$((retries - 1))
+		if [ "$retries" -le 0 ]; then
+			e2e_error "k3s failed to start within 60 seconds"
+			exit 1
+		fi
+		sleep 2
+	done
 
-    # API server is up, but the node may not have registered yet.
-    e2e_info "Waiting for node to register..."
-    until sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -q .; do
-        sleep 2
-    done
+	# API server is up, but the node may not have registered yet.
+	e2e_info "Waiting for node to register..."
+	until sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -q .; do
+		sleep 2
+	done
 
-    e2e_info "Waiting for node to be Ready..."
-    sudo k3s kubectl wait --for=condition=Ready node --all --timeout=60s
-    e2e_info "k3s ready"
+	e2e_info "Waiting for node to be Ready..."
+	sudo k3s kubectl wait --for=condition=Ready node --all --timeout=60s
+	e2e_info "k3s ready"
 }
 
 # Configure KUBECONFIG so cargo test / kubectl can reach the cluster.
 # Uses a temp copy so non-root processes can read it.
 setup_kubeconfig() {
-    e2e_info "Configuring KUBECONFIG..."
-    sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
-    sudo chown $(id -u):$(id -g) ~/.kube/config
-    chmod 600 ~/.kube/config
+	e2e_info "Configuring KUBECONFIG..."
+	sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+	sudo chown $(id -u):$(id -g) ~/.kube/config
+	chmod 600 ~/.kube/config
 }
 
 # Import one or more Docker images into k3s containerd.
 # Usage: import_k3s_images image1:tag image2:tag ...
 import_k3s_images() {
-    e2e_info "Importing images into k3s containerd..."
-    for img in "$@"; do
-        docker save "$img" | sudo k3s ctr images import -
-    done
+	e2e_info "Importing images into k3s containerd..."
+	for img in "$@"; do
+		docker save "$img" | sudo k3s ctr images import -
+	done
 }
 
 # Register the cleanup trap. Call this after start_fresh_k3s().
 # Respects SKIP_CLEANUP=true for debugging failed runs.
 register_cleanup_trap() {
-    trap _e2e_cleanup EXIT
+	trap _e2e_cleanup EXIT
 }
 
 _e2e_cleanup() {
-    if [[ "${SKIP_CLEANUP:-false}" != "true" ]]; then
-        nuke_k3s
-    else
-        e2e_warn "SKIP_CLEANUP=true — k3s left running for debugging"
-    fi
+	if [[ "${SKIP_CLEANUP:-false}" != "true" ]]; then
+		nuke_k3s
+	else
+		e2e_warn "SKIP_CLEANUP=true — k3s left running for debugging"
+	fi
 }
