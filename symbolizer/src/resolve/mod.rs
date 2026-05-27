@@ -18,7 +18,10 @@ use std::time::Instant;
 use metrics::{counter, histogram};
 use tracing::{debug, error, info};
 
-use crate::telemetry::{METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_LATENCY_SECONDS};
+use crate::telemetry::{
+    METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_DWARF_WALK_SECONDS, METRIC_FRAMES_PER_SESSION,
+    METRIC_LATENCY_SECONDS, METRIC_PREFETCH_SECONDS, METRIC_SPAWN_BLOCKING_WAIT_SECONDS,
+};
 
 use self::build_id::{BuildId, BUILD_ID_SIZE};
 use self::cache::{CachePool, ObjectCache, SymbolCache};
@@ -76,6 +79,7 @@ impl SessionResolver {
             .and_then(|m| m.kernel_meta.as_ref());
 
         // Phase 1: Prefetch user + kernel build IDs concurrently.
+        let prefetch_start = Instant::now();
         let user_prefetch = self.prefetch_user_build_ids(&payload);
         if let Some(km) = kernel_meta {
             let kernel_prefetch = self.kernel.ensure_cached(&km.build_id);
@@ -83,6 +87,7 @@ impl SessionResolver {
         } else {
             user_prefetch.await;
         }
+        histogram!(METRIC_PREFETCH_SECONDS).record(prefetch_start.elapsed().as_secs_f64());
 
         // Pre-extract metadata before moving the payload into spawn_blocking.
         let session_id = payload.session_id.clone();
@@ -97,7 +102,14 @@ impl SessionResolver {
         // Phase 2: Symbolize in blocking context. Payload is moved, not cloned.
         // moka caches are Clone (internally Arc-wrapped) — cheap to move.
         let caches = self.caches.clone();
-        match tokio::task::spawn_blocking(move || resolve_session_blocking(payload, &caches)).await
+        // Measure time waiting for a spawn_blocking slot.
+        let blocking_enqueue_time = Instant::now();
+        match tokio::task::spawn_blocking(move || {
+            let wait_duration = blocking_enqueue_time.elapsed();
+            histogram!(METRIC_SPAWN_BLOCKING_WAIT_SECONDS).record(wait_duration.as_secs_f64());
+            resolve_session_blocking(payload, &caches)
+        })
+        .await
         {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -220,6 +232,13 @@ fn resolve_session_blocking(payload: proto::SessionPayload, caches: &CachePool) 
         })
         .collect();
 
+    // Emit frames-per-session histogram for workload characterization.
+    let total_frames: usize = traces
+        .iter()
+        .map(|t| t.kernel_frames.len() + t.user_frames.len())
+        .sum();
+    histogram!(METRIC_FRAMES_PER_SESSION).record(total_frames as f64);
+
     // Move metadata out of the payload — no cloning.
     let metadata = payload.metadata.as_ref();
     let comm = metadata
@@ -340,7 +359,10 @@ fn resolve_kernel_frame_blocking(
     }
     counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "kernel").increment(1);
 
+    let dwarf_start = Instant::now();
     let frame = Arc::new(kernel::resolve_kernel_addr(&obj, vmlinux_vaddr));
+    histogram!(METRIC_DWARF_WALK_SECONDS, "space" => "kernel")
+        .record(dwarf_start.elapsed().as_secs_f64());
     symbols.insert(key, frame.clone());
     histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
         .record(start_time.elapsed().as_secs_f64());

@@ -19,7 +19,8 @@ use crate::resolve::SessionResolver;
 use crate::server::{ProcessingWorker, SymbolizerService};
 use crate::sink::SessionSink;
 use crate::telemetry::{
-    METRIC_CACHE_CAPACITY_BYTES, METRIC_CACHE_USAGE_BYTES, METRIC_NEGATIVE_CACHE_ENTRIES,
+    METRIC_CACHE_CAPACITY_BYTES, METRIC_CACHE_USAGE_BYTES, METRIC_NEGATIVE_CACHE_CAPACITY,
+    METRIC_NEGATIVE_CACHE_ENTRIES,
 };
 
 /// Default processing queue capacity.
@@ -174,6 +175,7 @@ fn record_cache_capacities(caches: &CachePool) {
         .set(caches.user_symbols.budget_bytes() as f64);
     gauge!(METRIC_CACHE_CAPACITY_BYTES, "tier" => "l2", "space" => "kernel")
         .set(caches.kernel_symbols.budget_bytes() as f64);
+    gauge!(METRIC_NEGATIVE_CACHE_CAPACITY).set(caches.negative.max_capacity() as f64);
 }
 
 /// Periodically records cache usage gauges.
@@ -186,6 +188,15 @@ async fn cache_gauge_reporter(caches: CachePool, interval: Duration, cancel: Can
             biased;
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
+                // Force moka's deferred maintenance before reading gauges.
+                // Without this, weighted_size() can return stale values (even 0)
+                // because moka batches bookkeeping into async maintenance tasks.
+                // Cost: O(pending_ops), typically microseconds per cache.
+                caches.user_objects.run_pending_tasks();
+                caches.kernel_objects.run_pending_tasks();
+                caches.user_symbols.run_pending_tasks();
+                caches.kernel_symbols.run_pending_tasks();
+
                 // L1 object caches: moka weighted_size() returns actual bytes.
                 gauge!(METRIC_CACHE_USAGE_BYTES, "tier" => "l1", "space" => "user")
                     .set(caches.user_objects.weighted_size() as f64);
@@ -194,9 +205,9 @@ async fn cache_gauge_reporter(caches: CachePool, interval: Duration, cancel: Can
 
                 // L2 symbol caches: estimated byte usage.
                 gauge!(METRIC_CACHE_USAGE_BYTES, "tier" => "l2", "space" => "user")
-                    .set(caches.user_symbols.estimated_byte_usage() as f64);
+                    .set(caches.user_symbols.weighted_byte_usage() as f64);
                 gauge!(METRIC_CACHE_USAGE_BYTES, "tier" => "l2", "space" => "kernel")
-                    .set(caches.kernel_symbols.estimated_byte_usage() as f64);
+                    .set(caches.kernel_symbols.weighted_byte_usage() as f64);
 
                 // Negative cache entry count.
                 gauge!(METRIC_NEGATIVE_CACHE_ENTRIES)

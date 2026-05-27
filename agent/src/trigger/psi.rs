@@ -56,6 +56,10 @@ impl PsiRegistry {
         service_id: String,
         labels: HashMap<String, String>,
     ) -> PsiRegisterResult {
+        // Reap dead watchers first so the gauge stays accurate and stale
+        // entries don't block re-registration for recycled cgroup IDs.
+        self.reap_dead_watchers();
+
         let registry_key = (cgroup_id, resource);
 
         if self.watchers.contains_key(&registry_key) {
@@ -91,6 +95,17 @@ impl PsiRegistry {
             handle.abort();
         }
         metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(0.0);
+    }
+
+    /// Removes watchers whose async task has completed (cgroup deleted, fd error).
+    /// This prevents stale entries from accumulating and keeps the gauge accurate.
+    fn reap_dead_watchers(&mut self) {
+        let before = self.watchers.len();
+        self.watchers.retain(|_, handle| !handle.is_finished());
+        let reaped = before - self.watchers.len();
+        if reaped > 0 {
+            metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(self.watchers.len() as f64);
+        }
     }
 
     fn build_async_fd(

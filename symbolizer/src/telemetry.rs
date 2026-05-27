@@ -58,6 +58,26 @@ pub const METRIC_CACHE_CAPACITY_BYTES: &str = "symbolizer_cache_capacity_bytes";
 /// Negative cache entry count (gauge).
 pub const METRIC_NEGATIVE_CACHE_ENTRIES: &str = "symbolizer_negative_cache_entries";
 
+/// Negative cache maximum capacity (gauge, set once at startup).
+pub const METRIC_NEGATIVE_CACHE_CAPACITY: &str = "symbolizer_negative_cache_capacity";
+
+/// Time spent in the blocking DWARF walk (addr2line), excluding cache hits (histogram).
+/// If this is always near-zero, the symbolizer isn't doing real CPU work.
+pub const METRIC_DWARF_WALK_SECONDS: &str = "symbolizer_dwarf_walk_seconds";
+
+/// Number of frames resolved per session (histogram).
+/// Validates payload complexity — low values mean the symbolizer isn't working hard.
+pub const METRIC_FRAMES_PER_SESSION: &str = "symbolizer_frames_per_session";
+
+/// Time spent in async Phase 1 prefetch (debuginfod fetches) per session (histogram).
+/// Separates network latency from CPU-bound DWARF walk time.
+pub const METRIC_PREFETCH_SECONDS: &str = "symbolizer_prefetch_seconds";
+
+/// Time a session waits for a `spawn_blocking` slot (histogram).
+/// If tokio's blocking pool is saturated, tasks queue up here — invisible
+/// without this metric.
+pub const METRIC_SPAWN_BLOCKING_WAIT_SECONDS: &str = "symbolizer_spawn_blocking_wait_seconds";
+
 /// Registers metric descriptions for the symbolizer. Call exactly once
 /// in `main()` or daemon start before any metric is incremented.
 pub fn describe_all() {
@@ -106,6 +126,26 @@ pub fn describe_all() {
     );
     metrics::describe_gauge!(
         METRIC_NEGATIVE_CACHE_ENTRIES,
-        "Current number of negative cache entries (404'd build IDs)"
+        "Current number of negative-cached (404'd) build IDs"
+    );
+    metrics::describe_gauge!(
+        METRIC_NEGATIVE_CACHE_CAPACITY,
+        "Maximum number of negative cache entries"
+    );
+    metrics::describe_histogram!(
+        METRIC_DWARF_WALK_SECONDS,
+        "Time spent in the blocking DWARF walk (addr2line), excluding cache hits"
+    );
+    metrics::describe_histogram!(
+        METRIC_FRAMES_PER_SESSION,
+        "Number of frames resolved per session"
+    );
+    metrics::describe_histogram!(
+        METRIC_PREFETCH_SECONDS,
+        "Time spent in async Phase 1 prefetch (debuginfod fetches) per session"
+    );
+    metrics::describe_histogram!(
+        METRIC_SPAWN_BLOCKING_WAIT_SECONDS,
+        "Time a session waits for a spawn_blocking slot in tokio's blocking pool"
     );
 }

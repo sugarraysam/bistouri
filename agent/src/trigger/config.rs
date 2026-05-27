@@ -10,7 +10,7 @@ pub(crate) use bistouri_api::config::{MatchRule, PsiResource, ResourceConfig, Ta
 /// Maximum length for `service_id` — aligns with K8s/DNS naming conventions.
 const SERVICE_ID_MAX_LEN: usize = 32;
 
-/// Validates that `service_id` matches `^[a-z][a-z0-9_]*$` and is 1–32 chars.
+/// Validates that `service_id` matches `^[a-z][a-z0-9_-]*$` and is 1–32 chars.
 fn validate_service_id(id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(TriggerError::InvalidServiceId {
@@ -33,10 +33,10 @@ fn validate_service_id(id: &str) -> Result<()> {
         });
     }
     for ch in chars {
-        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_') {
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
             return Err(TriggerError::InvalidServiceId {
                 service_id: id.into(),
-                reason: "must contain only lowercase letters, digits, and underscores [a-z0-9_]",
+                reason: "must contain only lowercase letters, digits, underscores, and hyphens [a-z0-9_-]",
             });
         }
     }
@@ -366,7 +366,7 @@ targets:
     #[case::leading_digit("1service", true)]
     #[case::uppercase("API", true)]
     #[case::mixed_case("apiGateway", true)]
-    #[case::hyphen("api-gateway", true)]
+    #[case::hyphen("api-gateway", false)]
     #[case::empty("", true)]
     #[case::dot("api.gateway", true)]
     #[case::space("api gateway", true)]

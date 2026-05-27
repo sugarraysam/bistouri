@@ -54,8 +54,12 @@ impl CacheEntry {
     }
 }
 
-/// Expected number of concurrent threads borrowing from the context pool.
-const EXPECTED_CONTEXT_POOL_SIZE: usize = 4;
+/// Maximum contexts kept in each `CachedObject`'s pool. Beyond this,
+/// returned contexts are dropped instead of pooled. Prevents unbounded
+/// memory growth under high concurrency — without this cap, the pool
+/// grows to `max_concurrent_sessions` per cached object, with each
+/// `addr2line::Context` consuming 5–50 MB of parsed DWARF ASTs.
+const MAX_POOL_SIZE: usize = 4;
 
 /// The estimated fraction of the raw DWARF size that a single `addr2line::Context`
 /// will allocate on the heap for parsed ASTs and interval trees (1/20 = 5%).
@@ -71,7 +75,7 @@ fn estimate_context_pool_bytes(dwarf_bytes: usize) -> usize {
     let context_stack_bytes = std::mem::size_of::<addr2line::Context<ArcReader>>();
     let context_heap_bytes = dwarf_bytes / CONTEXT_HEAP_FRACTION_DIVISOR;
 
-    (context_stack_bytes + context_heap_bytes) * EXPECTED_CONTEXT_POOL_SIZE
+    (context_stack_bytes + context_heap_bytes) * MAX_POOL_SIZE
 }
 
 /// A parsed and cached ELF object, ready for symbolization.
@@ -191,9 +195,17 @@ impl CachedObject {
     }
 
     /// Returns a `Context` to the pool for reuse.
+    ///
+    /// If the pool is already at [`MAX_POOL_SIZE`], the context is dropped
+    /// instead of pooled. This bounds memory at `MAX_POOL_SIZE × context_bytes`
+    /// per cached object — matching the weigher's estimate.
     #[inline]
     fn return_context(&self, ctx: addr2line::Context<ArcReader>) {
-        self.pool.lock().unwrap().push(ctx);
+        let mut pool = self.pool.lock().unwrap();
+        if pool.len() < MAX_POOL_SIZE {
+            pool.push(ctx);
+        }
+        // else: ctx is dropped here, reclaiming its heap memory.
     }
 
     /// Looks up a virtual address in DWARF and returns resolved symbols.
@@ -255,11 +267,12 @@ pub struct ObjectCache {
 
 impl ObjectCache {
     pub fn new(max_capacity_bytes: u64) -> Self {
+        let builder = MokaCache::builder()
+            .weigher(|_key: &BuildId, value: &CacheEntry| -> u32 { value.weight_bytes() })
+            .max_capacity(max_capacity_bytes);
+
         Self {
-            objects: MokaCache::builder()
-                .weigher(|_key: &BuildId, value: &CacheEntry| -> u32 { value.weight_bytes() })
-                .max_capacity(max_capacity_bytes)
-                .build(),
+            objects: builder.build(),
             max_capacity_bytes,
         }
     }
@@ -295,6 +308,10 @@ impl ObjectCache {
     }
 
     /// Current weighted byte usage of the cache.
+    ///
+    /// Call [`run_pending_tasks()`](Self::run_pending_tasks) first for
+    /// accurate values — moka defers weight tracking to background
+    /// maintenance that runs during `get()`/`insert()` calls.
     #[inline]
     pub fn weighted_size(&self) -> u64 {
         self.objects.weighted_size()
@@ -305,6 +322,16 @@ impl ObjectCache {
     pub fn max_capacity_bytes(&self) -> u64 {
         self.max_capacity_bytes
     }
+
+    /// Forces moka's deferred maintenance (eviction, weight tracking).
+    ///
+    /// Moka batches internal bookkeeping for performance. This method
+    /// flushes all pending operations so that `weighted_size()` and
+    /// `entry_count()` return accurate values. Cost is O(pending_ops),
+    /// typically microseconds.
+    pub fn run_pending_tasks(&self) {
+        self.objects.run_pending_tasks();
+    }
 }
 
 /// TTL-based negative cache for debuginfod 404s.
@@ -313,6 +340,7 @@ impl ObjectCache {
 #[derive(Clone)]
 pub struct NegativeCache {
     entries: MokaCache<BuildId, ()>,
+    max_capacity: u64,
 }
 
 impl NegativeCache {
@@ -322,6 +350,7 @@ impl NegativeCache {
                 .max_capacity(capacity)
                 .time_to_live(ttl)
                 .build(),
+            max_capacity: capacity,
         }
     }
 
@@ -338,6 +367,12 @@ impl NegativeCache {
     #[inline]
     pub fn entry_count(&self) -> u64 {
         self.entries.entry_count()
+    }
+
+    /// Maximum number of entries the negative cache can hold.
+    #[inline]
+    pub fn max_capacity(&self) -> u64 {
+        self.max_capacity
     }
 }
 
@@ -366,23 +401,35 @@ pub struct SymbolCache {
 impl SymbolCache {
     /// Creates a new symbol cache with the given byte budget.
     ///
-    /// Internally divides by [`BYTES_PER_L2_ENTRY`] to compute entry count.
+    /// Uses moka's byte-weighted eviction (matching L1 `ObjectCache`)
+    /// with a fixed per-entry weight of [`BYTES_PER_L2_ENTRY`].
     pub fn new_byte_budget(budget_bytes: u64) -> Self {
-        let max_entries = budget_bytes / BYTES_PER_L2_ENTRY;
+        let builder = MokaCache::builder()
+            .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
+                BYTES_PER_L2_ENTRY as u32
+            })
+            .max_capacity(budget_bytes);
+
         Self {
-            entries: MokaCache::builder().max_capacity(max_entries).build(),
+            entries: builder.build(),
             budget_bytes,
         }
     }
 
     /// Creates a new symbol cache with the given entry capacity.
     ///
-    /// Deprecated: prefer [`SymbolCache::new_byte_budget`] for consistent
-    /// byte-budget sizing across all caches.
+    /// Converts to byte budget internally for consistent byte-weighted
+    /// eviction across all caches.
     pub fn new(capacity: u64) -> Self {
+        let budget_bytes = capacity * BYTES_PER_L2_ENTRY;
         Self {
-            entries: MokaCache::builder().max_capacity(capacity).build(),
-            budget_bytes: capacity * BYTES_PER_L2_ENTRY,
+            entries: MokaCache::builder()
+                .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
+                    BYTES_PER_L2_ENTRY as u32
+                })
+                .max_capacity(budget_bytes)
+                .build(),
+            budget_bytes,
         }
     }
 
@@ -401,16 +448,26 @@ impl SymbolCache {
         self.entries.entry_count()
     }
 
-    /// Estimated current byte usage (entry_count × BYTES_PER_L2_ENTRY).
+    /// Current byte usage as tracked by moka's byte-weighted eviction.
+    ///
+    /// Call [`run_pending_tasks()`](Self::run_pending_tasks) first for
+    /// accurate values.
     #[inline]
-    pub fn estimated_byte_usage(&self) -> u64 {
-        self.entries.entry_count() * BYTES_PER_L2_ENTRY
+    pub fn weighted_byte_usage(&self) -> u64 {
+        self.entries.weighted_size()
     }
 
     /// Byte budget this cache was created with.
     #[inline]
     pub fn budget_bytes(&self) -> u64 {
         self.budget_bytes
+    }
+
+    /// Forces moka's deferred maintenance (eviction, weight tracking).
+    ///
+    /// See [`ObjectCache::run_pending_tasks()`] for rationale.
+    pub fn run_pending_tasks(&self) {
+        self.entries.run_pending_tasks();
     }
 }
 
@@ -425,7 +482,39 @@ mod tests {
         [byte; BUILD_ID_SIZE]
     }
 
-    /// Tests for NegativeCache and ObjectCache entry behavior.
+    /// Creates a `CachedObject` with a synthetic weight for testing moka
+    /// weigher behavior without needing a real ELF binary.
+    fn make_test_object_with_weight(weight: usize) -> CachedObject {
+        CachedObject {
+            dwarf: Arc::new(
+                gimli::Dwarf::load(|_| -> std::result::Result<ArcReader, gimli::Error> {
+                    Ok(gimli::EndianArcSlice::new(
+                        Arc::from(&[] as &[u8]),
+                        gimli::RunTimeEndian::Little,
+                    ))
+                })
+                .unwrap(),
+            ),
+            pool: Mutex::new(Vec::new()),
+            segments: Vec::new(),
+            static_text_addr: None,
+            estimated_bytes: weight,
+        }
+    }
+
+    /// Creates a `CachedObject` from the fixture ELF binary.
+    fn make_fixture_cached_object() -> CachedObject {
+        let fixture_path = format!(
+            "{}/tests/e2e/fixtures/bin/hello",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let elf_bytes = std::fs::read(&fixture_path)
+            .unwrap_or_else(|_| panic!("missing fixture: {fixture_path}"));
+        CachedObject::from_elf_bytes(&elf_bytes, "test", None).expect("failed to parse fixture ELF")
+    }
+
+    // ── NegativeCache + ObjectCache entry behavior ─────────────────────
+
     #[rstest]
     #[case::negative_cache_miss(0xAA, false, "negative cache miss before insert")]
     #[case::negative_cache_hit(0xAA, true, "negative cache hit after insert")]
@@ -472,8 +561,8 @@ mod tests {
         }
     }
 
-    /// Repro: `weight_bytes()` must not panic when `estimated_bytes > u32::MAX`.
-    /// Before the fix, this triggered `.expect()` and crashed the process.
+    // ── CacheEntry::weight_bytes() saturation ─────────────────────────
+
     #[rstest]
     #[case::exactly_u32_max(u32::MAX as usize, u32::MAX)]
     #[case::one_over_u32_max(u32::MAX as usize + 1, u32::MAX)]
@@ -484,21 +573,7 @@ mod tests {
         #[case] estimated_bytes: usize,
         #[case] expected_weight: u32,
     ) {
-        let obj = Arc::new(CachedObject {
-            dwarf: Arc::new(
-                gimli::Dwarf::load(|_| -> std::result::Result<ArcReader, gimli::Error> {
-                    Ok(gimli::EndianArcSlice::new(
-                        Arc::from(&[] as &[u8]),
-                        gimli::RunTimeEndian::Little,
-                    ))
-                })
-                .unwrap(),
-            ),
-            pool: Mutex::new(Vec::new()),
-            segments: Vec::new(),
-            static_text_addr: None,
-            estimated_bytes,
-        });
+        let obj = Arc::new(make_test_object_with_weight(estimated_bytes));
         let entry = CacheEntry::Parsed(obj);
         assert_eq!(entry.weight_bytes(), expected_weight);
     }
@@ -507,6 +582,182 @@ mod tests {
     fn weight_bytes_unparseable_is_one() {
         assert_eq!(CacheEntry::Unparseable.weight_bytes(), 1);
     }
+
+    // ── L1 ObjectCache: moka weigher accuracy ─────────────────────────
+    //
+    // Validates that moka's `weighted_size()` accurately reflects the
+    // sum of inserted entry weights AFTER `run_pending_tasks()`.
+
+    #[rstest]
+    #[case::small_object(1024, 1024, "1 KiB object")]
+    #[case::megabyte_object(1_000_000, 1_000_000, "1 MiB object")]
+    #[case::large_object(50_000_000, 50_000_000, "50 MiB object")]
+    fn l1_weighted_size_tracks_inserts(
+        #[case] estimated_bytes: usize,
+        #[case] expected_weight: u64,
+        #[case] description: &str,
+    ) {
+        let cache = ObjectCache::new(100_000_000); // 100 MiB budget
+        let obj = make_test_object_with_weight(estimated_bytes);
+        cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), expected_weight, "{description}");
+    }
+
+    // ── L1 ObjectCache: eviction under pressure ───────────────────────
+    //
+    // Validates that moka evicts entries when total weight exceeds the
+    // byte budget — the core invariant for memory-bounded caching.
+
+    #[rstest]
+    #[case::three_in_two_budget(3, 1_000_000, 2_000_000, 2, "one evicted")]
+    #[case::five_in_two_budget(5, 1_000_000, 2_000_000, 2, "three evicted")]
+    #[case::exact_fit(2, 500_000, 1_000_000, 2, "exact fit, no eviction")]
+    fn l1_eviction_under_pressure(
+        #[case] insert_count: usize,
+        #[case] weight_per_object: usize,
+        #[case] budget: u64,
+        #[case] expected_max_entries: u64,
+        #[case] description: &str,
+    ) {
+        let cache = ObjectCache::new(budget);
+        for i in 0..insert_count {
+            let obj = make_test_object_with_weight(weight_per_object);
+            cache.insert(dummy_build_id(i as u8), CacheEntry::Parsed(Arc::new(obj)));
+        }
+        cache.run_pending_tasks();
+        assert!(
+            cache.entry_count() <= expected_max_entries,
+            "{description}: entry_count={}, expected <={}",
+            cache.entry_count(),
+            expected_max_entries,
+        );
+        assert!(
+            cache.weighted_size() <= budget,
+            "{description}: weighted_size={}, budget={}",
+            cache.weighted_size(),
+            budget,
+        );
+    }
+
+    // ── L2 SymbolCache: byte-weighted accuracy ────────────────────────
+    //
+    // Validates that L2's weigher correctly assigns BYTES_PER_L2_ENTRY
+    // per entry and that weighted_size() reflects the sum.
+
+    #[rstest]
+    #[case::single_entry(1, BYTES_PER_L2_ENTRY, "one entry")]
+    #[case::ten_entries(10, BYTES_PER_L2_ENTRY * 10, "ten entries")]
+    #[case::hundred_entries(100, BYTES_PER_L2_ENTRY * 100, "100 entries")]
+    fn l2_weighted_size_tracks_entries(
+        #[case] insert_count: u64,
+        #[case] expected_bytes: u64,
+        #[case] description: &str,
+    ) {
+        let cache = SymbolCache::new_byte_budget(1_000_000);
+        let frame = Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
+        for i in 0..insert_count {
+            cache.insert((dummy_build_id(0x01), i), frame.clone());
+        }
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_byte_usage(), expected_bytes, "{description}");
+    }
+
+    // ── L2 SymbolCache: eviction under pressure ──────────────────────
+
+    #[rstest]
+    #[case::over_budget(5, 3, "evicts to stay within budget")]
+    #[case::exact_budget(3, 3, "exact fit, no eviction")]
+    #[case::large_excess(20, 5, "heavy eviction")]
+    fn l2_eviction_behavior(
+        #[case] insert_count: u64,
+        #[case] budget_entries: u64,
+        #[case] description: &str,
+    ) {
+        let budget = budget_entries * BYTES_PER_L2_ENTRY;
+        let cache = SymbolCache::new_byte_budget(budget);
+        let frame = Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
+        for i in 0..insert_count {
+            cache.insert((dummy_build_id(0x01), i), frame.clone());
+        }
+        cache.run_pending_tasks();
+        assert!(
+            cache.entry_count() <= budget_entries,
+            "{description}: entry_count={}, expected <={}",
+            cache.entry_count(),
+            budget_entries,
+        );
+        assert!(
+            cache.weighted_byte_usage() <= budget,
+            "{description}: weighted_byte_usage={}, budget={}",
+            cache.weighted_byte_usage(),
+            budget,
+        );
+    }
+
+    // ── Context pool capping ──────────────────────────────────────────
+    //
+    // Validates the memory leak fix: return_context() must drop excess
+    // contexts instead of pooling them unboundedly.
+
+    #[rstest]
+    #[case::at_cap(MAX_POOL_SIZE, MAX_POOL_SIZE, "pool stays at cap")]
+    #[case::over_cap(MAX_POOL_SIZE + 4, MAX_POOL_SIZE, "excess contexts dropped")]
+    #[case::double_over(MAX_POOL_SIZE * 2, MAX_POOL_SIZE, "double overflow dropped")]
+    #[case::under_cap(2, 2, "pool grows normally below cap")]
+    #[case::single(1, 1, "single context returned")]
+    fn context_pool_capped(
+        #[case] borrow_count: usize,
+        #[case] expected_pool_size: usize,
+        #[case] description: &str,
+    ) {
+        let obj = make_fixture_cached_object();
+        let mut contexts: Vec<_> = (0..borrow_count).map(|_| obj.borrow_context()).collect();
+        for ctx in contexts.drain(..) {
+            obj.return_context(ctx);
+        }
+        assert_eq!(
+            obj.pool.lock().unwrap().len(),
+            expected_pool_size,
+            "{description}"
+        );
+    }
+
+    // ── run_pending_tasks() accuracy ──────────────────────────────────
+    //
+    // Validates that weighted_size() is accurate AFTER run_pending_tasks.
+
+    #[test]
+    fn l1_weighted_size_accurate_after_run_pending_tasks() {
+        let cache = ObjectCache::new(100_000_000);
+        let obj = make_test_object_with_weight(1_000_000);
+        cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
+
+        // After run_pending_tasks: must be accurate.
+        cache.run_pending_tasks();
+        assert_eq!(
+            cache.weighted_size(),
+            1_000_000,
+            "weighted_size must be accurate after run_pending_tasks"
+        );
+    }
+
+    #[test]
+    fn l2_weighted_size_accurate_after_run_pending_tasks() {
+        let cache = SymbolCache::new_byte_budget(1_000_000);
+        let frame = Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
+        cache.insert((dummy_build_id(0x01), 0x1000), frame);
+
+        // After run_pending_tasks: must reflect one entry.
+        cache.run_pending_tasks();
+        assert_eq!(
+            cache.weighted_byte_usage(),
+            BYTES_PER_L2_ENTRY,
+            "L2 weighted_byte_usage must equal BYTES_PER_L2_ENTRY for one entry"
+        );
+    }
+
+    // ── L2 SymbolCache: basic hit/miss behavior ──────────────────────
 
     #[rstest]
     #[case::miss_on_empty(16, &[], (0xCC, 0x1234), false)]
@@ -528,6 +779,8 @@ mod tests {
         let key = (dummy_build_id(lookup_key.0), lookup_key.1);
         assert_eq!(cache.get(&key).is_some(), expect_hit);
     }
+
+    // ── ELF fixture integration tests ────────────────────────────────
 
     #[test]
     fn fixture_hello_resolves_target_function() {
@@ -567,9 +820,8 @@ mod tests {
         }
     }
 
-    /// Verifies that multiple threads can walk the DWARF of the same
-    /// `CachedObject` concurrently without panics or incorrect results,
-    /// and that the pool grows on demand under true concurrent load.
+    /// Verifies concurrent DWARF walks don't panic and pool is capped
+    /// at MAX_POOL_SIZE after all threads return their contexts.
     #[test]
     fn concurrent_symbolize_vaddr() {
         let fixture_path = format!(
@@ -588,8 +840,7 @@ mod tests {
             .expect("segment translation failed for offset 6213");
 
         // Spawn 8 threads. Use a barrier after borrowing but before returning
-        // to guarantee that all 8 threads hold a context simultaneously,
-        // forcing the pool to grow to 8.
+        // to guarantee that all 8 threads hold a context simultaneously.
         let barrier = Arc::new(Barrier::new(8));
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -618,27 +869,18 @@ mod tests {
             }
         }
 
-        // Verify pool has grown to hold all concurrent contexts.
+        // Pool is capped at MAX_POOL_SIZE — 4 excess contexts were dropped.
         let pool_size = obj.pool.lock().unwrap().len();
         assert_eq!(
-            pool_size, 8,
-            "pool should have grown to 8 contexts, got {pool_size}"
+            pool_size, MAX_POOL_SIZE,
+            "pool should be capped at {MAX_POOL_SIZE}, got {pool_size}"
         );
     }
 
-    /// Verifies that borrowing multiple contexts concurrently (e.g., on the same thread
-    /// or across threads) causes the pool to grow beyond the initial seed context.
+    /// Verifies pool growth on demand and capping behavior.
     #[test]
     fn pool_growth_on_demand() {
-        let fixture_path = format!(
-            "{}/tests/e2e/fixtures/bin/hello",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let elf_bytes = std::fs::read(&fixture_path)
-            .unwrap_or_else(|_| panic!("missing fixture: {fixture_path}"));
-
-        let obj = CachedObject::from_elf_bytes(&elf_bytes, "test", None)
-            .expect("failed to parse fixture ELF");
+        let obj = make_fixture_cached_object();
 
         // Seed context is present.
         assert_eq!(obj.pool.lock().unwrap().len(), 1);

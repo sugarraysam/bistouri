@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+
 [dependencies]
 bistouri-api = { path = "../api" }
 tokio = { version = "1", features = ["full"] }
@@ -11,7 +14,7 @@ tonic = { version = "0.14", features = ["transport"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 prost = "0.14"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
@@ -28,6 +31,9 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 parse-size = "1"
 prost-types = "0.14"
+# Optional: jemalloc with heap profiling for memory leak investigation.
+tikv-jemallocator = { version = "0.7", features = ["profiling"], optional = true }
+tikv-jemalloc-ctl = { version = "0.7", optional = true }
 
 [dev-dependencies]
 bistouri-sys = { path = "../sys" }

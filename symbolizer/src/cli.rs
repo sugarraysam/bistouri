@@ -182,6 +182,7 @@ impl CommonArgs {
         let filter = self.log_level.as_deref().unwrap_or("info").to_string();
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
+            .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
             .init();
     }
 

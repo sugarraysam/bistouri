@@ -37,6 +37,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
         libelf1 \
         zlib1g
+
 WORKDIR /app
 COPY --from=builder /app/bistouri-agent .
 ENTRYPOINT ["/app/bistouri-agent"]
