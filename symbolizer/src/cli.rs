@@ -135,7 +135,7 @@ pub struct CommonArgs {
     )]
     pub max_concurrent_sessions: usize,
 
-    /// Maximum number of concurrent debuginfod fetches during prefetch.
+    /// Maximum number of global concurrent debuginfod fetches (managed by the fetch coordinator).
     #[arg(
         long,
         default_value_t = DEFAULT_DEBUGINFOD_FETCH_CONCURRENCY,

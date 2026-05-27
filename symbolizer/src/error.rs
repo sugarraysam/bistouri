@@ -31,3 +31,37 @@ pub enum SymbolizerError {
 
 /// Result alias for the symbolizer crate.
 pub type Result<T> = std::result::Result<T, SymbolizerError>;
+
+impl Clone for SymbolizerError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::HttpClientInit { source } => Self::DebuginfodServerError {
+                build_id: String::new(),
+                reason: format!("HTTP client initialization failed: {source}"),
+            },
+            Self::DebuginfodFetch { build_id, source } => Self::DebuginfodServerError {
+                build_id: build_id.clone(),
+                reason: source.to_string(),
+            },
+            Self::ElfParse { build_id, reason } => Self::ElfParse {
+                build_id: build_id.clone(),
+                reason: reason.clone(),
+            },
+            Self::SegmentNotFound {
+                build_id,
+                file_offset,
+            } => Self::SegmentNotFound {
+                build_id: build_id.clone(),
+                file_offset: *file_offset,
+            },
+            Self::DebuginfodNotFound { build_id, status } => Self::DebuginfodNotFound {
+                build_id: build_id.clone(),
+                status: *status,
+            },
+            Self::DebuginfodServerError { build_id, reason } => Self::DebuginfodServerError {
+                build_id: build_id.clone(),
+                reason: reason.clone(),
+            },
+        }
+    }
+}

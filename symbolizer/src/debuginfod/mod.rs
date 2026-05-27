@@ -5,12 +5,13 @@
 //! - `GET /buildid/<hex_build_id>/debuginfo`  → DWARF debuginfo
 
 pub mod concurrent;
+pub mod coordinator;
 pub mod filesystem;
 pub mod http;
 pub mod tiered;
 
 /// Artifact type to request from debuginfod.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactKind {
     /// Stripped executable (has PT_LOAD segments, may have .symtab).
     Executable,

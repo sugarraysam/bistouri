@@ -10,7 +10,7 @@ pub mod elf;
 pub(crate) mod kernel;
 pub(crate) mod user;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use std::time::Instant;
@@ -24,9 +24,9 @@ use crate::telemetry::{
 };
 
 use self::build_id::{BuildId, BUILD_ID_SIZE};
-use self::cache::{CachePool, ObjectCache, SymbolCache};
+use self::cache::{CachePool, CachedObject, SymbolCache};
 use self::kernel::KernelResolver;
-use crate::debuginfod::DebuginfodClient;
+use crate::debuginfod::coordinator::FetchCoordinator;
 use crate::model::{
     CaptureSourceInfo, ResolvedFrame, ResolvedSession, ResolvedTrace, SymbolInfo, RESOURCE_CPU,
     RESOURCE_IO, RESOURCE_MEMORY, RESOURCE_UNKNOWN,
@@ -40,27 +40,21 @@ use bistouri_api::v1 as proto;
 /// (200+ MB) are never evicted by user-space churn.
 pub struct SessionResolver {
     caches: CachePool,
-    client: Arc<dyn DebuginfodClient>,
+    coordinator: Arc<FetchCoordinator>,
     kernel: KernelResolver,
-    debuginfod_fetch_concurrency: usize,
 }
 
 impl SessionResolver {
-    pub fn new(
-        caches: CachePool,
-        client: Arc<dyn DebuginfodClient>,
-        debuginfod_fetch_concurrency: usize,
-    ) -> Self {
+    pub fn new(caches: CachePool, coordinator: Arc<FetchCoordinator>) -> Self {
         let kernel = KernelResolver::new(
             caches.kernel_objects.clone(),
             caches.negative.clone(),
-            client.clone(),
+            coordinator.clone(),
         );
         Self {
             caches,
-            client,
+            coordinator,
             kernel,
-            debuginfod_fetch_concurrency,
         }
     }
 
@@ -81,12 +75,15 @@ impl SessionResolver {
         // Phase 1: Prefetch user + kernel build IDs concurrently.
         let prefetch_start = Instant::now();
         let user_prefetch = self.prefetch_user_build_ids(&payload);
-        if let Some(km) = kernel_meta {
-            let kernel_prefetch = self.kernel.ensure_cached(&km.build_id);
+        let kernel_prefetch = async {
+            if let Some(km) = kernel_meta {
+                self.kernel.ensure_cached(&km.build_id).await
+            } else {
+                None
+            }
+        };
+        let (pinned_user_objects, pinned_kernel_object) =
             tokio::join!(user_prefetch, kernel_prefetch);
-        } else {
-            user_prefetch.await;
-        }
         histogram!(METRIC_PREFETCH_SECONDS).record(prefetch_start.elapsed().as_secs_f64());
 
         // Pre-extract metadata before moving the payload into spawn_blocking.
@@ -107,7 +104,7 @@ impl SessionResolver {
         match tokio::task::spawn_blocking(move || {
             let wait_duration = blocking_enqueue_time.elapsed();
             histogram!(METRIC_SPAWN_BLOCKING_WAIT_SECONDS).record(wait_duration.as_secs_f64());
-            resolve_session_blocking(payload, &caches)
+            resolve_session_blocking(payload, pinned_user_objects, pinned_kernel_object, &caches)
         })
         .await
         {
@@ -139,9 +136,11 @@ impl SessionResolver {
 
     /// Ensures all unique user-space build IDs are cached.
     ///
-    /// Fetches are dispatched concurrently up to `MAX_CONCURRENT_FETCHES`
-    /// to avoid overwhelming the debuginfod server.
-    async fn prefetch_user_build_ids(&self, payload: &proto::SessionPayload) {
+    /// Fetches are deduplicated and concurrency-bounded globally by the FetchCoordinator.
+    async fn prefetch_user_build_ids(
+        &self,
+        payload: &proto::SessionPayload,
+    ) -> HashMap<BuildId, Arc<CachedObject>> {
         let mut seen = HashSet::new();
         let unique_ids: Vec<BuildId> = payload
             .mappings
@@ -151,33 +150,43 @@ impl SessionResolver {
             .filter(|bid| seen.insert(*bid))
             .collect();
 
-        // Fetch concurrently in bounded batches.
-        for chunk in unique_ids.chunks(self.debuginfod_fetch_concurrency) {
-            let mut set = tokio::task::JoinSet::new();
-            for &bid in chunk {
-                let cache = self.caches.user_objects.clone();
-                let negative = self.caches.negative.clone();
-                let client = self.client.clone();
-                set.spawn(async move {
-                    user::ensure_cached(&bid, &cache, &negative, client.as_ref()).await;
-                });
+        let mut set = tokio::task::JoinSet::new();
+        for &bid in &unique_ids {
+            let cache = self.caches.user_objects.clone();
+            let negative = self.caches.negative.clone();
+            let coordinator = self.coordinator.clone();
+            set.spawn(async move {
+                let obj = user::ensure_cached(&bid, &cache, &negative, coordinator.as_ref()).await;
+                (bid, obj)
+            });
+        }
+
+        let mut pinned = HashMap::with_capacity(unique_ids.len());
+        while let Some(res) = set.join_next().await {
+            if let Ok((bid, Some(obj))) = res {
+                pinned.insert(bid, obj);
             }
-            // Await all in this batch before starting the next.
-            while set.join_next().await.is_some() {}
         }
 
         debug!(
             unique_build_ids = unique_ids.len(),
+            pinned_objects = pinned.len(),
             session_id = %payload.session_id,
             "user build IDs prefetched"
         );
+        pinned
     }
 }
 
 /// CPU-bound symbolization of all frames in a session.
 ///
 /// Takes ownership of the payload — no cloning required.
-fn resolve_session_blocking(payload: proto::SessionPayload, caches: &CachePool) -> ResolvedSession {
+fn resolve_session_blocking(
+    payload: proto::SessionPayload,
+    pinned_user_objects: HashMap<BuildId, Arc<CachedObject>>,
+    pinned_kernel_object: Option<Arc<CachedObject>>,
+    caches: &CachePool,
+) -> ResolvedSession {
     // Pre-extract kernel metadata once, not per-frame.
     let metadata = payload.metadata.as_ref();
     let kernel_meta = metadata.and_then(|m| m.kernel_meta.as_ref());
@@ -199,7 +208,7 @@ fn resolve_session_blocking(payload: proto::SessionPayload, caches: &CachePool) 
                                 raw_ip,
                                 runtime_text_addr,
                                 kernel_bid,
-                                &caches.kernel_objects,
+                                &pinned_kernel_object,
                                 &caches.kernel_symbols,
                             )
                         })
@@ -215,7 +224,7 @@ fn resolve_session_blocking(payload: proto::SessionPayload, caches: &CachePool) 
                             resolve_user_frame(
                                 uf,
                                 &payload.mappings,
-                                &caches.user_objects,
+                                &pinned_user_objects,
                                 &caches.user_symbols,
                             )
                         })
@@ -322,7 +331,7 @@ fn resolve_kernel_frame_blocking(
     raw_ip: u64,
     runtime_text_addr: u64,
     kernel_bid: Option<&BuildId>,
-    cache: &ObjectCache,
+    pinned_kernel_object: &Option<Arc<CachedObject>>,
     symbols: &SymbolCache,
 ) -> Arc<ResolvedFrame> {
     let start_time = Instant::now();
@@ -334,7 +343,7 @@ fn resolve_kernel_frame_blocking(
         return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
     };
 
-    let Some(obj) = cache.get_object(bid) else {
+    let Some(obj) = pinned_kernel_object else {
         counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "kernel").increment(1);
         histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
             .record(start_time.elapsed().as_secs_f64());
@@ -360,7 +369,7 @@ fn resolve_kernel_frame_blocking(
     counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "kernel").increment(1);
 
     let dwarf_start = Instant::now();
-    let frame = Arc::new(kernel::resolve_kernel_addr(&obj, vmlinux_vaddr));
+    let frame = Arc::new(kernel::resolve_kernel_addr(obj, vmlinux_vaddr));
     histogram!(METRIC_DWARF_WALK_SECONDS, "space" => "kernel")
         .record(dwarf_start.elapsed().as_secs_f64());
     symbols.insert(key, frame.clone());
@@ -373,7 +382,7 @@ fn resolve_kernel_frame_blocking(
 fn resolve_user_frame(
     frame: &proto::UserFrame,
     mappings: &[proto::Mapping],
-    cache: &ObjectCache,
+    pinned_user_objects: &HashMap<BuildId, Arc<CachedObject>>,
     symbols: &SymbolCache,
 ) -> Arc<ResolvedFrame> {
     match frame.frame.as_ref() {
@@ -382,7 +391,12 @@ fn resolve_user_frame(
             match mapping {
                 Some(m) => {
                     if let Ok(build_id) = <&[u8; BUILD_ID_SIZE]>::try_from(m.build_id.as_slice()) {
-                        user::resolve_frame(build_id, resolved.file_offset, cache, symbols)
+                        user::resolve_frame(
+                            build_id,
+                            resolved.file_offset,
+                            pinned_user_objects,
+                            symbols,
+                        )
                     } else {
                         Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()))
                     }

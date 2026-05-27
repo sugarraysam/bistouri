@@ -18,14 +18,17 @@ use crate::telemetry::{
 use super::build_id::{self, BuildId, BUILD_ID_SIZE};
 use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache, SymbolCache};
 use super::elf::translate_file_offset;
-use crate::debuginfod::{ArtifactKind, DebuginfodClient};
 use crate::error::Result;
 use crate::model::{ResolvedFrame, SymbolInfo};
 
+use crate::debuginfod::coordinator::FetchCoordinator;
+use crate::debuginfod::ArtifactKind;
+use std::collections::HashMap;
+
 /// Ensures a parsed ELF object is available in the cache for the given build ID.
 ///
-/// Fetches from debuginfod if missing. Returns `true` if the object is
-/// available, `false` if it couldn't be obtained (negative cached).
+/// Fetches from debuginfod if missing. Returns the parsed object if successfully obtained,
+/// or `None` if it could not be retrieved.
 ///
 /// Negative cache policy: 404 and parse errors are negative-cached.
 /// Transient network errors are NOT — allowing retry on the next session.
@@ -33,57 +36,61 @@ pub(crate) async fn ensure_cached(
     build_id: &BuildId,
     cache: &ObjectCache,
     negative: &NegativeCache,
-    client: &dyn DebuginfodClient,
-) -> bool {
-    if cache.contains(build_id) {
-        return true;
+    coordinator: &FetchCoordinator,
+) -> Option<Arc<CachedObject>> {
+    if let Some(obj) = cache.get_object(build_id) {
+        return Some(obj);
     }
 
-    if negative.is_negative(build_id) {
-        return false;
+    if cache.contains(build_id) || negative.is_negative(build_id) {
+        return None;
     }
 
     let hex = build_id::to_hex(build_id);
 
     // Try debuginfo first (has DWARF + symtab), fall back to executable.
-    let elf_bytes = match fetch_elf(client, &hex).await {
+    let elf_bytes = match fetch_elf(coordinator, build_id).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             // Definitive 404 — negative cache.
             debug!(build_id = %hex, "build_id not found in debuginfod, negative caching");
             negative.insert(*build_id);
-            return false;
+            return None;
         }
         Err(e) => {
             // Transient error — do NOT negative cache, allow retry.
             error!(build_id = %hex, error = %e, "debuginfod fetch failed (transient, will retry)");
             counter!(METRIC_DEBUGINFOD_ERRORS).increment(1);
-            return false;
+            return None;
         }
     };
 
     match CachedObject::from_elf_bytes(&elf_bytes, &hex, None) {
         Ok(parsed) => {
-            cache.insert(*build_id, CacheEntry::Parsed(Arc::new(parsed)));
-            true
+            let obj = Arc::new(parsed);
+            cache.insert(*build_id, CacheEntry::Parsed(obj.clone()));
+            Some(obj)
         }
         Err(e) => {
             // Parse failure is definitive — cache as unparseable sentinel.
             error!(build_id = %hex, error = %e, "ELF parse failed, caching as unparseable");
             counter!(METRIC_PARSE_FAILURES).increment(1);
             cache.insert(*build_id, CacheEntry::Unparseable);
-            false
+            None
         }
     }
 }
 
-async fn fetch_elf(client: &dyn DebuginfodClient, build_id_hex: &str) -> Result<Option<Vec<u8>>> {
+async fn fetch_elf(
+    coordinator: &FetchCoordinator,
+    build_id: &BuildId,
+) -> Result<Option<Arc<[u8]>>> {
     // Prefer debuginfo (has DWARF for file+line resolution).
-    if let Some(bytes) = client.fetch(build_id_hex, ArtifactKind::Debuginfo).await? {
+    if let Some(bytes) = coordinator.fetch(build_id, ArtifactKind::Debuginfo).await? {
         return Ok(Some(bytes));
     }
     // Fall back to executable (may have .symtab but no DWARF).
-    client.fetch(build_id_hex, ArtifactKind::Executable).await
+    coordinator.fetch(build_id, ArtifactKind::Executable).await
 }
 
 /// Resolves a single user-space frame (build_id + file_offset) to symbols.
@@ -92,7 +99,7 @@ async fn fetch_elf(client: &dyn DebuginfodClient, build_id_hex: &str) -> Result<
 pub(crate) fn resolve_frame(
     build_id: &[u8; BUILD_ID_SIZE],
     file_offset: u64,
-    cache: &ObjectCache,
+    pinned_user_objects: &HashMap<BuildId, Arc<CachedObject>>,
     symbols: &SymbolCache,
 ) -> Arc<ResolvedFrame> {
     let start_time = Instant::now();
@@ -110,7 +117,7 @@ pub(crate) fn resolve_frame(
 
     let hex = build_id::to_hex(build_id);
 
-    let Some(obj) = cache.get_object(build_id) else {
+    let Some(obj) = pinned_user_objects.get(build_id) else {
         counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "user").increment(1);
         histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
             .record(start_time.elapsed().as_secs_f64());
@@ -124,7 +131,7 @@ pub(crate) fn resolve_frame(
 
     // Time the DWARF walk separately — this is pure CPU cost.
     let dwarf_start = Instant::now();
-    let frame = Arc::new(resolve_from_object(&obj, file_offset, &hex));
+    let frame = Arc::new(resolve_from_object(obj, file_offset, &hex));
     histogram!(METRIC_DWARF_WALK_SECONDS, "space" => "user")
         .record(dwarf_start.elapsed().as_secs_f64());
 

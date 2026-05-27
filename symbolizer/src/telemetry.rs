@@ -78,6 +78,15 @@ pub const METRIC_PREFETCH_SECONDS: &str = "symbolizer_prefetch_seconds";
 /// without this metric.
 pub const METRIC_SPAWN_BLOCKING_WAIT_SECONDS: &str = "symbolizer_spawn_blocking_wait_seconds";
 
+/// Total fetch requests that were coalesced (de-duplicated).
+pub const METRIC_FETCH_COALESCED_TOTAL: &str = "symbolizer_fetch_coalesced_total";
+
+/// Current debuginfod fetch operations executing in parallel.
+pub const METRIC_FETCH_INFLIGHT: &str = "symbolizer_fetch_inflight";
+
+/// Time spent waiting for debuginfod fetches, including coalesced waiters (histogram).
+pub const METRIC_FETCH_WAIT_SECONDS: &str = "symbolizer_fetch_wait_seconds";
+
 /// Registers metric descriptions for the symbolizer. Call exactly once
 /// in `main()` or daemon start before any metric is incremented.
 pub fn describe_all() {
@@ -147,5 +156,17 @@ pub fn describe_all() {
     metrics::describe_histogram!(
         METRIC_SPAWN_BLOCKING_WAIT_SECONDS,
         "Time a session waits for a spawn_blocking slot in tokio's blocking pool"
+    );
+    metrics::describe_counter!(
+        METRIC_FETCH_COALESCED_TOTAL,
+        "Total fetch requests that joined an existing in-flight fetch"
+    );
+    metrics::describe_gauge!(
+        METRIC_FETCH_INFLIGHT,
+        "Current debuginfod fetch operations executing in parallel"
+    );
+    metrics::describe_histogram!(
+        METRIC_FETCH_WAIT_SECONDS,
+        "Time spent waiting for debuginfod fetches, including coalesced waiters"
     );
 }

@@ -19,7 +19,8 @@ use crate::telemetry::{METRIC_DEBUGINFOD_ERRORS, METRIC_PARSE_FAILURES};
 
 use super::build_id;
 use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache};
-use crate::debuginfod::{ArtifactKind, DebuginfodClient};
+use crate::debuginfod::coordinator::FetchCoordinator;
+use crate::debuginfod::ArtifactKind;
 use crate::model::{ResolvedFrame, SymbolInfo};
 
 /// Default static `_text` virtual address for x86_64 vmlinux.
@@ -34,61 +35,55 @@ pub(crate) const DEFAULT_STATIC_TEXT_ADDR: u64 = 0xffff_ffff_8100_0000;
 pub(crate) struct KernelResolver {
     cache: ObjectCache,
     negative: NegativeCache,
-    client: Arc<dyn DebuginfodClient>,
+    coordinator: Arc<FetchCoordinator>,
 }
 
 impl KernelResolver {
     pub(crate) fn new(
         cache: ObjectCache,
         negative: NegativeCache,
-        client: Arc<dyn DebuginfodClient>,
+        coordinator: Arc<FetchCoordinator>,
     ) -> Self {
         Self {
             cache,
             negative,
-            client,
+            coordinator,
         }
     }
 
-    /// Ensures the vmlinux debuginfo is cached for the given kernel build ID.
-    ///
-    /// Returns `true` if the vmlinux is available for symbolization.
-    ///
-    /// Negative cache policy: 404 and parse errors are negative-cached.
-    /// Transient network errors are NOT — allowing retry on the next session.
-    pub(crate) async fn ensure_cached(&self, kernel_build_id: &[u8]) -> bool {
+    pub(crate) async fn ensure_cached(&self, kernel_build_id: &[u8]) -> Option<Arc<CachedObject>> {
         let Some(bid) = build_id::try_from_slice(kernel_build_id) else {
             warn!(
                 len = kernel_build_id.len(),
                 "kernel build_id is not 20 bytes, cannot fetch vmlinux"
             );
-            return false;
+            return None;
         };
 
-        if self.cache.contains(bid) {
-            return true;
+        if let Some(obj) = self.cache.get_object(bid) {
+            return Some(obj);
         }
 
-        if self.negative.is_negative(bid) {
-            return false;
+        if self.cache.contains(bid) || self.negative.is_negative(bid) {
+            return None;
         }
 
         let hex = build_id::to_hex(bid);
 
         // vmlinux is always fetched as debuginfo (it contains DWARF + symtab).
-        let bytes = match self.client.fetch(&hex, ArtifactKind::Debuginfo).await {
+        let bytes = match self.coordinator.fetch(bid, ArtifactKind::Debuginfo).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 // Definitive 404 — negative cache.
                 debug!(build_id = %hex, "vmlinux not found in debuginfod, negative caching");
                 self.negative.insert(*bid);
-                return false;
+                return None;
             }
             Err(e) => {
                 // Transient error — do NOT negative cache, allow retry.
                 error!(build_id = %hex, error = %e, "vmlinux fetch failed (transient, will retry)");
                 counter!(METRIC_DEBUGINFOD_ERRORS).increment(1);
-                return false;
+                return None;
             }
         };
 
@@ -97,16 +92,16 @@ impl KernelResolver {
 
         match CachedObject::from_elf_bytes(&bytes, &hex, static_text_addr) {
             Ok(parsed) => {
-                self.cache
-                    .insert(*bid, CacheEntry::Parsed(Arc::new(parsed)));
-                true
+                let obj = Arc::new(parsed);
+                self.cache.insert(*bid, CacheEntry::Parsed(obj.clone()));
+                Some(obj)
             }
             Err(e) => {
                 // Parse failure is definitive — cache as unparseable sentinel.
                 error!(build_id = %hex, error = %e, "vmlinux parse failed, caching as unparseable");
                 counter!(METRIC_PARSE_FAILURES).increment(1);
                 self.cache.insert(*bid, CacheEntry::Unparseable);
-                false
+                None
             }
         }
     }

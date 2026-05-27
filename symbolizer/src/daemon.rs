@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::info;
 
+use crate::debuginfod::coordinator::FetchCoordinator;
 use crate::debuginfod::DebuginfodClient;
 use crate::resolve::cache::CachePool;
 use crate::resolve::SessionResolver;
@@ -92,11 +93,14 @@ impl SymbolizerDaemon {
         record_cache_capacities(&caches);
         let gauge_caches = caches.clone();
 
-        let resolver = Arc::new(SessionResolver::new(
-            caches,
+        let coordinator = Arc::new(FetchCoordinator::new(
             client,
             config.debuginfod_fetch_concurrency,
+            1024,
+            cancel.clone(),
         ));
+
+        let resolver = Arc::new(SessionResolver::new(caches, coordinator));
 
         info!(
             queue_capacity = config.queue_capacity,

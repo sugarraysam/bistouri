@@ -14,18 +14,14 @@ use crate::error::Result;
 
 /// Races two [`DebuginfodClient`] implementations concurrently.
 ///
-/// Both fetches are dispatched via `tokio::join!` (run to completion).
-/// The first `Ok(Some(bytes))` wins. If both return `Ok(None)`, the
-/// result is `Ok(None)`. If one errors and the other succeeds, the
-/// success wins. If both error, the first error is returned.
+/// Dispatched via `tokio::select!` with a fallback: the first source to complete
+/// is awaited. If it returns a success (`Ok(Some(bytes))`), the other source is cancelled
+/// immediately (dropped), saving memory and bandwidth. If it returns a miss (`Ok(None)`)
+/// or error, we fallback to awaiting the second source.
 ///
-/// # Why `tokio::join!` instead of `tokio::select!`?
-///
-/// `select!` cancels the losing branch, but we need the second
-/// result when the first returns `None` (a definitive miss, not an
-/// error). `join!` runs both to completion, then we pick the winner.
-/// The cost is wasted bandwidth if both hit — acceptable because the
-/// negative cache prevents repeated lookups for the same build ID.
+/// The first success wins. If both return `Ok(None)`, the result is `Ok(None)`.
+/// If one errors and the other succeeds, the success wins. If both error, the first
+/// error that occurred is returned.
 pub struct ConcurrentDebuginfodClient<A, B> {
     /// Typically the private `IndexerDebuginfodClient`.
     source_a: A,
@@ -44,35 +40,42 @@ impl<A: DebuginfodClient, B: DebuginfodClient> DebuginfodClient
     for ConcurrentDebuginfodClient<A, B>
 {
     async fn fetch(&self, build_id_hex: &str, kind: ArtifactKind) -> Result<Option<Vec<u8>>> {
-        let (result_a, result_b) = tokio::join!(
-            self.source_a.fetch(build_id_hex, kind),
-            self.source_b.fetch(build_id_hex, kind),
-        );
+        let mut fut_a = std::pin::pin!(self.source_a.fetch(build_id_hex, kind));
+        let mut fut_b = std::pin::pin!(self.source_b.fetch(build_id_hex, kind));
 
-        // First success with data wins.
-        match (&result_a, &result_b) {
-            (Ok(Some(_)), _) => {
-                debug!(
-                    build_id = build_id_hex,
-                    source = "a",
-                    "concurrent: hit from source A"
-                );
-                return result_a;
-            }
-            (_, Ok(Some(_))) => {
-                debug!(
-                    build_id = build_id_hex,
-                    source = "b",
-                    "concurrent: hit from source B"
-                );
-                return result_b;
-            }
-            _ => {}
+        // Race: first to complete wins, biasing toward source A if both are ready.
+        let (winner, loser, source) = tokio::select! {
+            biased;
+            result_a = &mut fut_a => (result_a, fut_b, "a"),
+            result_b = &mut fut_b => (result_b, fut_a, "b"),
+        };
+
+        // If winner has data, cancel loser (drop) and return.
+        if let Ok(Some(_)) = &winner {
+            debug!(
+                build_id = build_id_hex,
+                source = source,
+                "concurrent: hit from source {source}"
+            );
+            return winner;
+        }
+
+        // Winner was None or Err — await the loser as fallback.
+        let fallback = loser.await;
+        let fallback_source = if source == "a" { "b" } else { "a" };
+
+        if let Ok(Some(_)) = &fallback {
+            debug!(
+                build_id = build_id_hex,
+                source = fallback_source,
+                "concurrent: hit from source {fallback_source}"
+            );
+            return fallback;
         }
 
         // Both missed or errored. Prefer Ok(None) over Err — a definitive
         // miss is more useful than a transient error for negative caching.
-        match (result_a, result_b) {
+        match (&winner, &fallback) {
             (Ok(None), Ok(None)) => {
                 debug!(
                     build_id = build_id_hex,
@@ -93,13 +96,15 @@ impl<A: DebuginfodClient, B: DebuginfodClient> DebuginfodClient
                 );
                 Ok(None)
             }
-            (Err(e), Err(_e2)) => {
-                // Both errored — return the first error.
+            _ => {
+                // Both errored — return the first error (winner).
                 debug!(build_id = build_id_hex, "concurrent: both sources errored");
-                Err(e)
+                if winner.is_err() {
+                    winner
+                } else {
+                    fallback
+                }
             }
-            // Covered by the match arms above.
-            _ => unreachable!(),
         }
     }
 }
@@ -109,6 +114,7 @@ mod tests {
     use super::*;
     use crate::error::SymbolizerError;
     use rstest::rstest;
+    use std::time::Duration;
 
     /// Stub client that returns a configured response.
     struct StubClient {
@@ -210,5 +216,34 @@ mod tests {
         let client = ConcurrentDebuginfodClient::new(StubClient::error(), StubClient::error());
         let result = client.fetch("deadbeef", ArtifactKind::Debuginfo).await;
         assert!(result.is_err(), "both errors should propagate");
+    }
+
+    #[tokio::test]
+    async fn test_fast_miss_fallback() {
+        struct SlowClient {
+            delay: Duration,
+            data: Vec<u8>,
+        }
+        #[async_trait::async_trait]
+        impl DebuginfodClient for SlowClient {
+            async fn fetch(
+                &self,
+                _build_id_hex: &str,
+                _kind: ArtifactKind,
+            ) -> Result<Option<Vec<u8>>> {
+                tokio::time::sleep(self.delay).await;
+                Ok(Some(self.data.clone()))
+            }
+        }
+
+        let a = StubClient::miss();
+        let b = SlowClient {
+            delay: Duration::from_millis(10),
+            data: b"slow-data".to_vec(),
+        };
+
+        let client = ConcurrentDebuginfodClient::new(a, b);
+        let result = client.fetch("deadbeef", ArtifactKind::Debuginfo).await;
+        assert_eq!(result.unwrap().unwrap(), b"slow-data");
     }
 }
