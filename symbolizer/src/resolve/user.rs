@@ -64,7 +64,7 @@ pub(crate) async fn ensure_cached(
         }
     };
 
-    match CachedObject::from_elf_bytes(&elf_bytes, &hex, None) {
+    match CachedObject::from_elf_bytes(&elf_bytes, &hex, None, cache.max_pool_size()) {
         Ok(parsed) => {
             let obj = Arc::new(parsed);
             cache.insert(*build_id, CacheEntry::Parsed(obj.clone()));

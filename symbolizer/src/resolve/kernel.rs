@@ -88,7 +88,12 @@ impl KernelResolver {
         // Read static _text address before the bytes are consumed by DWARF parsing.
         let static_text_addr = read_static_text_addr(&bytes);
 
-        match CachedObject::from_elf_bytes(&bytes, &hex, static_text_addr) {
+        match CachedObject::from_elf_bytes(
+            &bytes,
+            &hex,
+            static_text_addr,
+            self.cache.max_pool_size(),
+        ) {
             Ok(parsed) => {
                 let obj = Arc::new(parsed);
                 self.cache.insert(*bid, CacheEntry::Parsed(obj.clone()));

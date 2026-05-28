@@ -46,20 +46,13 @@ pub(crate) enum CacheEntry {
 
 impl CacheEntry {
     /// Estimated weight in bytes for moka's byte-budget eviction.
-    fn weight_bytes(&self) -> u32 {
+    fn weight_bytes(&self) -> usize {
         match self {
-            CacheEntry::Parsed(obj) => obj.estimated_bytes.try_into().unwrap_or(u32::MAX),
+            CacheEntry::Parsed(obj) => obj.estimated_bytes,
             CacheEntry::Unparseable => 1,
         }
     }
 }
-
-/// Maximum contexts kept in each `CachedObject`'s pool. Beyond this,
-/// returned contexts are dropped instead of pooled. Prevents unbounded
-/// memory growth under high concurrency — without this cap, the pool
-/// grows to `max_concurrent_sessions` per cached object, with each
-/// `addr2line::Context` consuming 5–50 MB of parsed DWARF ASTs.
-const MAX_POOL_SIZE: usize = 4;
 
 /// The estimated fraction of the raw DWARF size that a single `addr2line::Context`
 /// will allocate on the heap for parsed ASTs and interval trees (1/20 = 5%).
@@ -71,11 +64,11 @@ const CONTEXT_HEAP_FRACTION_DIVISOR: usize = 20;
 /// heap allocations (e.g., parsed compilation units) across an expected
 /// number of concurrent threads.
 #[inline]
-fn estimate_context_pool_bytes(dwarf_bytes: usize) -> usize {
+fn estimate_context_pool_bytes(dwarf_bytes: usize, max_pool_size: usize) -> usize {
     let context_stack_bytes = std::mem::size_of::<addr2line::Context<ArcReader>>();
     let context_heap_bytes = dwarf_bytes / CONTEXT_HEAP_FRACTION_DIVISOR;
 
-    (context_stack_bytes + context_heap_bytes) * MAX_POOL_SIZE
+    (context_stack_bytes + context_heap_bytes) * max_pool_size
 }
 
 /// A parsed and cached ELF object, ready for symbolization.
@@ -90,6 +83,8 @@ pub struct CachedObject {
     pub(crate) static_text_addr: Option<u64>,
     /// Approximate heap bytes — used by moka weigher.
     pub(crate) estimated_bytes: usize,
+    /// Capped context pool size.
+    pub(crate) max_pool_size: usize,
 }
 
 impl CachedObject {
@@ -124,6 +119,7 @@ impl CachedObject {
         data: &[u8],
         build_id_hex: &str,
         static_text_addr: Option<u64>,
+        max_pool_size: usize,
     ) -> Result<Self> {
         let object = object::read::File::parse(data).map_err(|e| SymbolizerError::ElfParse {
             build_id: build_id_hex.into(),
@@ -173,7 +169,8 @@ impl CachedObject {
         })?;
 
         let seg_bytes = segments.len() * std::mem::size_of::<LoadSegment>();
-        let estimated_bytes = dwarf_bytes + seg_bytes + estimate_context_pool_bytes(dwarf_bytes);
+        let estimated_bytes =
+            dwarf_bytes + seg_bytes + estimate_context_pool_bytes(dwarf_bytes, max_pool_size);
 
         Ok(Self {
             dwarf,
@@ -181,6 +178,7 @@ impl CachedObject {
             segments,
             static_text_addr,
             estimated_bytes,
+            max_pool_size,
         })
     }
 
@@ -202,7 +200,7 @@ impl CachedObject {
     #[inline]
     fn return_context(&self, ctx: addr2line::Context<ArcReader>) {
         let mut pool = self.pool.lock().unwrap();
-        if pool.len() < MAX_POOL_SIZE {
+        if pool.len() < self.max_pool_size {
             pool.push(ctx);
         }
         // else: ctx is dropped here, reclaiming its heap memory.
@@ -263,18 +261,30 @@ impl CachedObject {
 pub struct ObjectCache {
     objects: MokaCache<BuildId, CacheEntry>,
     max_capacity_bytes: u64,
+    max_pool_size: usize,
 }
 
 impl ObjectCache {
-    pub fn new(max_capacity_bytes: u64) -> Self {
+    pub fn new(max_capacity_bytes: u64, max_pool_size: usize) -> Self {
+        let max_capacity_kb = max_capacity_bytes.div_ceil(1024);
         let builder = MokaCache::builder()
-            .weigher(|_key: &BuildId, value: &CacheEntry| -> u32 { value.weight_bytes() })
-            .max_capacity(max_capacity_bytes);
+            .weigher(|_key: &BuildId, value: &CacheEntry| -> u32 {
+                let bytes = value.weight_bytes();
+                let kb = bytes.div_ceil(1024);
+                kb.try_into().unwrap_or(u32::MAX)
+            })
+            .max_capacity(max_capacity_kb);
 
         Self {
             objects: builder.build(),
             max_capacity_bytes,
+            max_pool_size,
         }
+    }
+
+    #[inline]
+    pub fn max_pool_size(&self) -> usize {
+        self.max_pool_size
     }
 
     #[inline]
@@ -314,7 +324,7 @@ impl ObjectCache {
     /// maintenance that runs during `get()`/`insert()` calls.
     #[inline]
     pub fn weighted_size(&self) -> u64 {
-        self.objects.weighted_size()
+        self.objects.weighted_size() * 1024
     }
 
     /// Maximum capacity in bytes.
@@ -478,6 +488,8 @@ mod tests {
     use rstest::rstest;
     use std::sync::{Arc, Barrier};
 
+    const MAX_POOL_SIZE: usize = 4;
+
     fn dummy_build_id(byte: u8) -> BuildId {
         [byte; BUILD_ID_SIZE]
     }
@@ -499,6 +511,7 @@ mod tests {
             segments: Vec::new(),
             static_text_addr: None,
             estimated_bytes: weight,
+            max_pool_size: 4,
         }
     }
 
@@ -510,7 +523,8 @@ mod tests {
         );
         let elf_bytes = std::fs::read(&fixture_path)
             .unwrap_or_else(|_| panic!("missing fixture: {fixture_path}"));
-        CachedObject::from_elf_bytes(&elf_bytes, "test", None).expect("failed to parse fixture ELF")
+        CachedObject::from_elf_bytes(&elf_bytes, "test", None, 4)
+            .expect("failed to parse fixture ELF")
     }
 
     // ── NegativeCache + ObjectCache entry behavior ─────────────────────
@@ -542,7 +556,7 @@ mod tests {
         #[case] expect_get_object: bool,
         #[case] description: &str,
     ) {
-        let cache = ObjectCache::new(1024 * 1024);
+        let cache = ObjectCache::new(1024 * 1024, 4);
         let bid = dummy_build_id(bid_byte);
 
         if insert_unparseable {
@@ -564,18 +578,20 @@ mod tests {
     // ── CacheEntry::weight_bytes() saturation ─────────────────────────
 
     #[rstest]
-    #[case::exactly_u32_max(u32::MAX as usize, u32::MAX)]
-    #[case::one_over_u32_max(u32::MAX as usize + 1, u32::MAX)]
-    #[case::very_large(usize::MAX, u32::MAX)]
+    #[case::exactly_u32_max_kb((u32::MAX as usize) * 1024, (u32::MAX as u64) * 1024)]
+    #[case::one_over_u32_max_kb((u32::MAX as usize) * 1024 + 1, (u32::MAX as u64) * 1024)]
+    #[case::very_large(usize::MAX, (u32::MAX as u64) * 1024)]
     #[case::zero(0, 0)]
     #[case::normal(1024 * 1024, 1024 * 1024)]
-    fn weight_bytes_saturates_on_overflow(
+    fn l1_weighted_size_saturates_on_overflow(
         #[case] estimated_bytes: usize,
-        #[case] expected_weight: u32,
+        #[case] expected_weight_bytes: u64,
     ) {
-        let obj = Arc::new(make_test_object_with_weight(estimated_bytes));
-        let entry = CacheEntry::Parsed(obj);
-        assert_eq!(entry.weight_bytes(), expected_weight);
+        let cache = ObjectCache::new(u64::MAX, 4);
+        let obj = make_test_object_with_weight(estimated_bytes);
+        cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), expected_weight_bytes);
     }
 
     #[test]
@@ -590,14 +606,14 @@ mod tests {
 
     #[rstest]
     #[case::small_object(1024, 1024, "1 KiB object")]
-    #[case::megabyte_object(1_000_000, 1_000_000, "1 MiB object")]
-    #[case::large_object(50_000_000, 50_000_000, "50 MiB object")]
+    #[case::megabyte_object(1_048_576, 1_048_576, "1 MiB object")]
+    #[case::large_object(52_428_800, 52_428_800, "50 MiB object")]
     fn l1_weighted_size_tracks_inserts(
         #[case] estimated_bytes: usize,
         #[case] expected_weight: u64,
         #[case] description: &str,
     ) {
-        let cache = ObjectCache::new(100_000_000); // 100 MiB budget
+        let cache = ObjectCache::new(104_857_600, 4); // 100 MiB budget
         let obj = make_test_object_with_weight(estimated_bytes);
         cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
         cache.run_pending_tasks();
@@ -610,9 +626,9 @@ mod tests {
     // byte budget — the core invariant for memory-bounded caching.
 
     #[rstest]
-    #[case::three_in_two_budget(3, 1_000_000, 2_000_000, 2, "one evicted")]
-    #[case::five_in_two_budget(5, 1_000_000, 2_000_000, 2, "three evicted")]
-    #[case::exact_fit(2, 500_000, 1_000_000, 2, "exact fit, no eviction")]
+    #[case::three_in_two_budget(3, 1_048_576, 2_097_152, 2, "one evicted")]
+    #[case::five_in_two_budget(5, 1_048_576, 2_097_152, 2, "three evicted")]
+    #[case::exact_fit(2, 524_288, 1_048_576, 2, "exact fit, no eviction")]
     fn l1_eviction_under_pressure(
         #[case] insert_count: usize,
         #[case] weight_per_object: usize,
@@ -620,7 +636,7 @@ mod tests {
         #[case] expected_max_entries: u64,
         #[case] description: &str,
     ) {
-        let cache = ObjectCache::new(budget);
+        let cache = ObjectCache::new(budget, 4);
         for i in 0..insert_count {
             let obj = make_test_object_with_weight(weight_per_object);
             cache.insert(dummy_build_id(i as u8), CacheEntry::Parsed(Arc::new(obj)));
@@ -729,15 +745,15 @@ mod tests {
 
     #[test]
     fn l1_weighted_size_accurate_after_run_pending_tasks() {
-        let cache = ObjectCache::new(100_000_000);
-        let obj = make_test_object_with_weight(1_000_000);
+        let cache = ObjectCache::new(104_857_600, 4);
+        let obj = make_test_object_with_weight(1_048_576);
         cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
 
         // After run_pending_tasks: must be accurate.
         cache.run_pending_tasks();
         assert_eq!(
             cache.weighted_size(),
-            1_000_000,
+            1_048_576,
             "weighted_size must be accurate after run_pending_tasks"
         );
     }
@@ -791,7 +807,7 @@ mod tests {
         let elf_bytes = std::fs::read(&fixture_path)
             .unwrap_or_else(|_| panic!("missing fixture: {fixture_path}"));
 
-        let obj = CachedObject::from_elf_bytes(&elf_bytes, "test", None)
+        let obj = CachedObject::from_elf_bytes(&elf_bytes, "test", None, 4)
             .expect("failed to parse fixture ELF");
 
         assert!(!obj.segments.is_empty(), "expected PT_LOAD segments");
@@ -832,7 +848,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("missing fixture: {fixture_path}"));
 
         let obj = Arc::new(
-            CachedObject::from_elf_bytes(&elf_bytes, "test", None)
+            CachedObject::from_elf_bytes(&elf_bytes, "test", None, 4)
                 .expect("failed to parse fixture ELF"),
         );
 

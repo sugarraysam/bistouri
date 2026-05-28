@@ -36,6 +36,9 @@ fn parse_memory_size(s: &str) -> Result<u64, parse_size::Error> {
     parse_size::parse_size(s)
 }
 
+/// Default context pool size.
+pub const DEFAULT_MAX_POOL_SIZE: usize = 4;
+
 /// Shared CLI arguments for the symbolizer daemon.
 ///
 /// Embed in your binary's `Args` via `#[command(flatten)]`.
@@ -114,6 +117,15 @@ pub struct CommonArgs {
     #[arg(long, default_value_t = 300, env = "SYMBOLIZER_NEGATIVE_TTL_SECS")]
     pub negative_ttl_secs: u64,
 
+    /// Maximum DWARF contexts kept in each cached object's pool.
+    /// Beyond this, returned contexts are dropped instead of pooled.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_POOL_SIZE,
+        env = "SYMBOLIZER_MAX_POOL_SIZE"
+    )]
+    pub max_pool_size: usize,
+
     /// Log level filter (e.g. "info", "bistouri_symbolizer=debug").
     /// Falls back to RUST_LOG env var, then "info".
     #[arg(long, env = "RUST_LOG")]
@@ -167,8 +179,8 @@ impl CommonArgs {
     /// Constructs the [`CachePool`] from the configured byte budgets.
     pub fn build_caches(&self) -> CachePool {
         CachePool {
-            user_objects: ObjectCache::new(self.user_object_budget_bytes),
-            kernel_objects: ObjectCache::new(self.kernel_object_budget_bytes),
+            user_objects: ObjectCache::new(self.user_object_budget_bytes, self.max_pool_size),
+            kernel_objects: ObjectCache::new(self.kernel_object_budget_bytes, self.max_pool_size),
             user_symbols: SymbolCache::new_byte_budget(self.user_symbol_budget_bytes),
             kernel_symbols: SymbolCache::new_byte_budget(self.kernel_symbol_budget_bytes),
             negative: NegativeCache::new(
