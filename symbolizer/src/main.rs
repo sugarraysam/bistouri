@@ -26,9 +26,20 @@ struct Args {
     common: CommonArgs,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let blocking_threads = args.common.blocking_threads();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(blocking_threads)
+        .build()
+        .expect("failed to build tokio runtime");
+
+    runtime.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> anyhow::Result<()> {
     let common = &args.common;
 
     common.init_logging();

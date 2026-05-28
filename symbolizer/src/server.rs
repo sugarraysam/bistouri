@@ -161,6 +161,16 @@ async fn dispatcher_loop<S>(
     let mut tasks = tokio::task::JoinSet::new();
 
     while let Some(payload) = rx.recv().await {
+        // Reap completed task handles to prevent unbounded accumulation.
+        // Without this, the JoinSet retains a completion entry for every
+        // finished task until join_next() is called — which previously
+        // only happened at shutdown.
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(e) = result {
+                error!(error = %e, "session processing task panicked");
+            }
+        }
+
         // Acquire a permit before spawning — blocks the dispatcher when
         // max_concurrent tasks are in flight, applying backpressure.
         let permit = match semaphore.clone().acquire_owned().await {
@@ -180,7 +190,11 @@ async fn dispatcher_loop<S>(
     }
 
     // Channel closed — join all in-flight tasks before exiting.
-    while tasks.join_next().await.is_some() {}
+    while let Some(result) = tasks.join_next().await {
+        if let Err(e) = result {
+            error!(error = %e, "session processing task panicked during shutdown");
+        }
+    }
 
     debug!("processing dispatcher shut down — all tasks joined");
 }

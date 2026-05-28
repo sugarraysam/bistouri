@@ -147,9 +147,23 @@ pub struct CommonArgs {
     /// Should match your Prometheus scrape interval (default: 15s).
     #[arg(long, default_value_t = 15, env = "SYMBOLIZER_GAUGE_INTERVAL_SECS")]
     pub gauge_interval_secs: u64,
+
+    /// Maximum number of tokio blocking threads for CPU-bound DWARF
+    /// resolution. Defaults to `max_concurrent_sessions` so every
+    /// semaphore-permitted resolve task gets a blocking thread without
+    /// queuing. Cap this to bound thread-stack memory (~1 MiB per thread).
+    #[arg(long, env = "SYMBOLIZER_BLOCKING_THREADS")]
+    pub blocking_threads: Option<usize>,
 }
 
 impl CommonArgs {
+    /// Returns the configured blocking thread cap, defaulting to
+    /// `max_concurrent_sessions` to match semaphore capacity.
+    pub fn blocking_threads(&self) -> usize {
+        self.blocking_threads
+            .unwrap_or(self.max_concurrent_sessions)
+    }
+
     /// Constructs the [`CachePool`] from the configured byte budgets.
     pub fn build_caches(&self) -> CachePool {
         CachePool {
