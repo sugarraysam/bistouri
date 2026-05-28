@@ -157,19 +157,22 @@ impl From<TargetConfigSchema> for TargetConfig {
         "self.spec.targets.all(t, size(t.service_id) > 0)"
     ).message("each target must declare a service_id"),
     // Rule 6: service_id must be unique across targets.
-    // Cost: O(targets) = O(64).
+    // No duplicates ⟺ for every pair (i, j) where i < j, ids differ.
+    // Cost: O(targets²) = O(64²) = O(4096).
     validation = Rule::new(concat!(
-        "self.spec.targets.map(t, t.service_id).size() == ",
-        "self.spec.targets.map(t, t.service_id).unique().size()"
+        "self.spec.targets.all(a, ",
+        "self.spec.targets.filter(b, b.service_id == a.service_id).size() == 1)"
     )).message("duplicate service_id across targets — each target must have a unique service_id"),
     // Rule 7: global (comm, resource) uniqueness across all targets.
-    // Flatten all (comm + "/" + resource) pairs and check uniqueness.
-    // Cost: O(targets × resources) = O(64 × 3) = O(192).
+    // For every pair of targets, if the comms match, their resource lists
+    // must not share any resource type. CEL has no `reduce` or `unique`,
+    // so we check pairwise: no two distinct targets share (comm, resource).
+    // Cost: O(targets² × resources²) = O(64² × 3²) = O(36864).
     validation = Rule::new(concat!(
-        "self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource))",
-        ".reduce([], (acc, list) => acc + list).size() == ",
-        "self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource))",
-        ".reduce([], (acc, list) => acc + list).unique().size()"
+        "self.spec.targets.all(a, self.spec.targets.all(b, ",
+        "a.service_id == b.service_id || ",
+        "a.resources.all(ar, b.resources.all(br, ",
+        "a.rule.comm + '/' + ar.resource != b.rule.comm + '/' + br.resource))))"
     )).message("duplicate (comm, resource) pair across targets — each PSI resource may appear at most once per comm"),
 )]
 pub struct BistouriConfigSpec {

@@ -28,7 +28,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let blocking_threads = args.common.blocking_threads();
+    let blocking_threads = args.common.blocking_thread_count();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

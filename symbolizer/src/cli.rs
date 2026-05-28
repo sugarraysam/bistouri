@@ -159,7 +159,7 @@ pub struct CommonArgs {
 impl CommonArgs {
     /// Returns the configured blocking thread cap, defaulting to
     /// `max_concurrent_sessions` to match semaphore capacity.
-    pub fn blocking_threads(&self) -> usize {
+    pub fn blocking_thread_count(&self) -> usize {
         self.blocking_threads
             .unwrap_or(self.max_concurrent_sessions)
     }

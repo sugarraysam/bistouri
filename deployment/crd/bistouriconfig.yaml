@@ -145,11 +145,11 @@
               },
               {
                 "message": "duplicate service_id across targets — each target must have a unique service_id",
-                "rule": "self.spec.targets.map(t, t.service_id).size() == self.spec.targets.map(t, t.service_id).unique().size()"
+                "rule": "self.spec.targets.all(a, self.spec.targets.filter(b, b.service_id == a.service_id).size() == 1)"
               },
               {
                 "message": "duplicate (comm, resource) pair across targets — each PSI resource may appear at most once per comm",
-                "rule": "self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource)).reduce([], (acc, list) => acc + list).size() == self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource)).reduce([], (acc, list) => acc + list).unique().size()"
+                "rule": "self.spec.targets.all(a, self.spec.targets.all(b, a.service_id == b.service_id || a.resources.all(ar, b.resources.all(br, a.rule.comm + '/' + ar.resource != b.rule.comm + '/' + br.resource))))"
               }
             ]
           }
