@@ -22,6 +22,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
+# Ensure the Cargo config file containing compiler flags is copied
+# before cargo chef cook runs, so dependencies are built with correct flags
+COPY .cargo /app/.cargo
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json -p bistouri-agent
 

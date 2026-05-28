@@ -1,3 +1,10 @@
+#[cfg(not(frame_pointers_enabled))]
+compile_error!(
+    "CRITICAL BUILD ERROR: Rust binaries must be compiled with frame pointers enabled!\n\
+     Please ensure that `.cargo/config.toml` exists with `rustflags = [\"-C\", \"force-frame-pointers=yes\"]` \
+     under the [build] section, or RUSTFLAGS is set."
+);
+
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

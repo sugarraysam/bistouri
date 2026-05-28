@@ -1,4 +1,12 @@
+#[cfg(not(frame_pointers_enabled))]
+compile_error!(
+    "CRITICAL BUILD ERROR: Rust binaries must be compiled with frame pointers enabled!\n\
+     Please ensure that `.cargo/config.toml` exists with `rustflags = [\"-C\", \"force-frame-pointers=yes\"]` \
+     under the [build] section, or RUSTFLAGS is set."
+);
+
 mod agent;
+
 mod args;
 mod capture;
 mod daemon;
