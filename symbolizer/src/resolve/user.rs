@@ -11,8 +11,8 @@ use metrics::{counter, histogram};
 use tracing::{debug, error};
 
 use crate::telemetry::{
-    METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_DEBUGINFOD_ERRORS, METRIC_DWARF_WALK_SECONDS,
-    METRIC_LATENCY_SECONDS, METRIC_PARSE_FAILURES,
+    METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_DEBUGINFOD_ERRORS, METRIC_LATENCY_SECONDS,
+    METRIC_PARSE_FAILURES,
 };
 
 use super::build_id::{self, BuildId, BUILD_ID_SIZE};
@@ -123,11 +123,10 @@ pub(crate) fn resolve_frame(
     // but wasn't cached yet). After warmup this counter should be near-zero.
     counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "user").increment(1);
 
-    // Time the DWARF walk separately — this is pure CPU cost.
-    let dwarf_start = Instant::now();
+    // DWARF walk: pure CPU cost. Per-session aggregate timing is recorded
+    // in resolve_session_blocking(); no per-frame histogram here to avoid
+    // inaccurate Summary quantile estimates at high observation rates.
     let frame = Arc::new(resolve_from_object(obj, file_offset, &hex));
-    histogram!(METRIC_DWARF_WALK_SECONDS, "space" => "user")
-        .record(dwarf_start.elapsed().as_secs_f64());
 
     // Populate L2 for future lookups.
     symbols.insert(key, frame.clone());

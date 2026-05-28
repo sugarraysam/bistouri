@@ -193,6 +193,11 @@ fn resolve_session_blocking(
     let runtime_text_addr = kernel_meta.map(|km| km.text_addr).unwrap_or(0);
     let kernel_bid = kernel_meta.and_then(|km| build_id::try_from_slice(&km.build_id));
 
+    // Per-session aggregate DWARF walk timer.
+    // Records ONE observation per session instead of per-frame (which was
+    // producing inaccurate Summary quantile estimates at 300K+ obs/sec).
+    let dwarf_walk_start = Instant::now();
+
     let traces: Vec<ResolvedTrace> = payload
         .traces
         .iter()
@@ -247,6 +252,11 @@ fn resolve_session_blocking(
         .map(|t| t.kernel_frames.len() + t.user_frames.len())
         .sum();
     histogram!(METRIC_FRAMES_PER_SESSION).record(total_frames as f64);
+
+    // Record per-session aggregate DWARF walk time.
+    // This captures the total CPU cost of all addr2line lookups in the session.
+    let dwarf_elapsed = dwarf_walk_start.elapsed().as_secs_f64();
+    histogram!(METRIC_DWARF_WALK_SECONDS, "space" => "aggregate").record(dwarf_elapsed);
 
     // Move metadata out of the payload — no cloning.
     let metadata = payload.metadata.as_ref();
@@ -368,10 +378,7 @@ fn resolve_kernel_frame_blocking(
     }
     counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "kernel").increment(1);
 
-    let dwarf_start = Instant::now();
     let frame = Arc::new(kernel::resolve_kernel_addr(obj, vmlinux_vaddr));
-    histogram!(METRIC_DWARF_WALK_SECONDS, "space" => "kernel")
-        .record(dwarf_start.elapsed().as_secs_f64());
     symbols.insert(key, frame.clone());
     histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
         .record(start_time.elapsed().as_secs_f64());

@@ -8,10 +8,13 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{Interest, Ready};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Fixed PSI time window: all thresholds are expressed as a percentage of this.
 const TIME_WINDOW_MS: f64 = 1_000.0;
+
+/// Registry key identifying a unique PSI watcher: (cgroup_id, resource).
+pub(crate) type PsiRegistryKey = (u64, PsiResource);
 
 /// Result of attempting to register a PSI watcher for a (cgroup, resource) pair.
 pub(crate) enum PsiRegisterResult {
@@ -24,22 +27,34 @@ pub(crate) enum PsiRegisterResult {
 }
 
 /// Owns the set of active PSI watchers, keyed by (cgroup_id, resource).
+///
+/// Event-driven reaping: each watcher holds a clone of `watcher_exit_tx`
+/// and sends its registry key when the AsyncFd loop exits (process died,
+/// cgroup deleted). The `TriggerAgent` selects on `watcher_exit_rx` to
+/// remove dead entries immediately — the gauge is always accurate.
 pub(crate) struct PsiRegistry {
-    watchers: HashMap<(u64, PsiResource), tokio::task::JoinHandle<()>>,
+    watchers: HashMap<PsiRegistryKey, tokio::task::JoinHandle<()>>,
     capture_tx: mpsc::Sender<CaptureRequest>,
     request_cooldown: Duration,
+    /// Watcher exit notification channel — sender cloned into each watcher.
+    watcher_exit_tx: mpsc::UnboundedSender<PsiRegistryKey>,
 }
 
 impl PsiRegistry {
     pub(crate) fn new(
         capture_tx: mpsc::Sender<CaptureRequest>,
         request_cooldown: Duration,
-    ) -> Self {
-        Self {
-            watchers: HashMap::new(),
-            capture_tx,
-            request_cooldown,
-        }
+    ) -> (Self, mpsc::UnboundedReceiver<PsiRegistryKey>) {
+        let (watcher_exit_tx, watcher_exit_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                watchers: HashMap::new(),
+                capture_tx,
+                request_cooldown,
+                watcher_exit_tx,
+            },
+            watcher_exit_rx,
+        )
     }
 
     /// Attempts to register a PSI watcher for the given (cgroup, resource) pair.
@@ -56,10 +71,6 @@ impl PsiRegistry {
         service_id: String,
         labels: HashMap<String, String>,
     ) -> PsiRegisterResult {
-        // Reap dead watchers first so the gauge stays accurate and stale
-        // entries don't block re-registration for recycled cgroup IDs.
-        self.reap_dead_watchers();
-
         let registry_key = (cgroup_id, resource);
 
         if self.watchers.contains_key(&registry_key) {
@@ -73,6 +84,7 @@ impl PsiRegistry {
 
         let watcher = Self::spawn_watcher(
             async_fd,
+            registry_key,
             pid,
             comm,
             resource,
@@ -82,6 +94,7 @@ impl PsiRegistry {
             tenant_id,
             service_id,
             labels,
+            self.watcher_exit_tx.clone(),
         );
         self.watchers.insert(registry_key, watcher);
         metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(self.watchers.len() as f64);
@@ -97,13 +110,16 @@ impl PsiRegistry {
         metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(0.0);
     }
 
-    /// Removes watchers whose async task has completed (cgroup deleted, fd error).
-    /// This prevents stale entries from accumulating and keeps the gauge accurate.
-    fn reap_dead_watchers(&mut self) {
-        let before = self.watchers.len();
-        self.watchers.retain(|_, handle| !handle.is_finished());
-        let reaped = before - self.watchers.len();
-        if reaped > 0 {
+    /// Removes a specific watcher by registry key. Called by the
+    /// `TriggerAgent` when it receives a watcher exit notification.
+    pub(crate) fn remove(&mut self, key: &PsiRegistryKey) {
+        if self.watchers.remove(key).is_some() {
+            debug!(
+                cgroup_id = key.0,
+                resource = ?key.1,
+                remaining = self.watchers.len(),
+                "reaped dead PSI watcher",
+            );
             metrics::gauge!(METRIC_ACTIVE_PSI_WATCHERS).set(self.watchers.len() as f64);
         }
     }
@@ -140,6 +156,7 @@ impl PsiRegistry {
     #[allow(clippy::too_many_arguments)]
     fn spawn_watcher(
         async_fd: AsyncFd<presutaoru::PsiFd>,
+        registry_key: PsiRegistryKey,
         pid: u32,
         comm: String,
         resource: PsiResource,
@@ -149,6 +166,7 @@ impl PsiRegistry {
         tenant_id: String,
         service_id: String,
         labels: HashMap<String, String>,
+        exit_tx: mpsc::UnboundedSender<PsiRegistryKey>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut last_sent: Option<std::time::Instant> = None;
@@ -182,6 +200,16 @@ impl PsiRegistry {
                     last_sent = Some(std::time::Instant::now());
                 }
             }
+            // AsyncFd loop exited — process died or cgroup was deleted.
+            // Notify the registry so it can remove us and update the gauge.
+            debug!(
+                pid = pid,
+                comm = %comm,
+                resource = ?resource,
+                cgroup = %cgroup_path.display(),
+                "PSI watcher exiting — cgroup fd invalid",
+            );
+            let _ = exit_tx.send(registry_key);
         })
     }
 }

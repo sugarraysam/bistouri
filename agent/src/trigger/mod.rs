@@ -19,7 +19,7 @@ use config::TriggerConfig;
 use error::Result;
 use matcher::CommMatcher;
 use proc::ProcWalker;
-use psi::{PsiRegisterResult, PsiRegistry};
+use psi::{PsiRegisterResult, PsiRegistry, PsiRegistryKey};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -146,11 +146,14 @@ impl PreparedTriggerAgent {
             .take()
             .expect("event_rx consumed before start");
 
+        let (psi_registry, watcher_exit_rx) = PsiRegistry::new(capture_tx, request_cooldown);
+
         let mut agent = TriggerAgent {
             config: self.config,
             matcher,
             bpf_trie,
-            psi_registry: PsiRegistry::new(capture_tx, request_cooldown),
+            psi_registry,
+            watcher_exit_rx,
             proc_handle: Some(proc_handle),
             watcher_handle: Some(watcher_handle),
             cancel,
@@ -175,6 +178,9 @@ struct TriggerAgent {
     matcher: CommMatcher,
     bpf_trie: BpfTrie,
     psi_registry: PsiRegistry,
+    /// Receives registry keys from PSI watcher tasks when they exit
+    /// (cgroup deleted, process died). Drives immediate gauge updates.
+    watcher_exit_rx: mpsc::UnboundedReceiver<PsiRegistryKey>,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     cancel: CancellationToken,
@@ -195,6 +201,11 @@ impl TriggerAgent {
                 ctrl = self.control_rx.recv() => match ctrl {
                     Some(TriggerControl::Reload(new_config)) => self.reload(new_config).await,
                     None => break,
+                },
+                // Event-driven PSI watcher reaping: a watcher task exited
+                // (cgroup deleted / process died), remove it immediately.
+                Some(dead_key) = self.watcher_exit_rx.recv() => {
+                    self.psi_registry.remove(&dead_key);
                 },
                 event = self.event_rx.recv() => match event {
                     None => break,

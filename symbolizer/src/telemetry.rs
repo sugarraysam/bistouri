@@ -61,8 +61,9 @@ pub const METRIC_NEGATIVE_CACHE_ENTRIES: &str = "symbolizer_negative_cache_entri
 /// Negative cache maximum capacity (gauge, set once at startup).
 pub const METRIC_NEGATIVE_CACHE_CAPACITY: &str = "symbolizer_negative_cache_capacity";
 
-/// Time spent in the blocking DWARF walk (addr2line), excluding cache hits (histogram).
-/// If this is always near-zero, the symbolizer isn't doing real CPU work.
+/// Per-session aggregate DWARF walk time (addr2line), excluding L2 cache hits (histogram).
+/// Recorded once per session (not per-frame) to avoid Summary quantile estimation
+/// noise at high observation rates. Labels: `space` = "aggregate".
 pub const METRIC_DWARF_WALK_SECONDS: &str = "symbolizer_dwarf_walk_seconds";
 
 /// Number of frames resolved per session (histogram).
@@ -143,7 +144,7 @@ pub fn describe_all() {
     );
     metrics::describe_histogram!(
         METRIC_DWARF_WALK_SECONDS,
-        "Time spent in the blocking DWARF walk (addr2line), excluding cache hits"
+        "Per-session aggregate DWARF walk time (addr2line), excluding L2 cache hits"
     );
     metrics::describe_histogram!(
         METRIC_FRAMES_PER_SESSION,
