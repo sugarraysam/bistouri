@@ -22,7 +22,6 @@ use crate::error::Result;
 use crate::model::{ResolvedFrame, SymbolInfo};
 
 use crate::debuginfod::coordinator::FetchCoordinator;
-use crate::debuginfod::ArtifactKind;
 use std::collections::HashMap;
 
 /// Ensures a parsed ELF object is available in the cache for the given build ID.
@@ -85,12 +84,7 @@ async fn fetch_elf(
     coordinator: &FetchCoordinator,
     build_id: &BuildId,
 ) -> Result<Option<Arc<[u8]>>> {
-    // Prefer debuginfo (has DWARF for file+line resolution).
-    if let Some(bytes) = coordinator.fetch(build_id, ArtifactKind::Debuginfo).await? {
-        return Ok(Some(bytes));
-    }
-    // Fall back to executable (may have .symtab but no DWARF).
-    coordinator.fetch(build_id, ArtifactKind::Executable).await
+    coordinator.fetch(build_id).await
 }
 
 /// Resolves a single user-space frame (build_id + file_offset) to symbols.

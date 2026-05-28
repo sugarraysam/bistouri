@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use tracing::debug;
 
-use super::{ArtifactKind, DebuginfodClient};
+use super::DebuginfodClient;
 use crate::error::Result;
 
 /// Debuginfod client that reads artifacts from a local filesystem cache.
@@ -26,15 +26,15 @@ impl FilesystemDebuginfodClient {
     }
 
     /// Constructs the expected filesystem path for an artifact.
-    fn artifact_path(&self, build_id_hex: &str, kind: ArtifactKind) -> PathBuf {
-        self.cache_path.join(build_id_hex).join(kind.path_segment())
+    fn artifact_path(&self, build_id_hex: &str) -> PathBuf {
+        self.cache_path.join(build_id_hex).join("debuginfo")
     }
 }
 
 #[async_trait::async_trait]
 impl DebuginfodClient for FilesystemDebuginfodClient {
-    async fn fetch(&self, build_id_hex: &str, kind: ArtifactKind) -> Result<Option<Vec<u8>>> {
-        let path = self.artifact_path(build_id_hex, kind);
+    async fn fetch(&self, build_id_hex: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.artifact_path(build_id_hex);
 
         match tokio::fs::read(&path).await {
             Ok(bytes) => {

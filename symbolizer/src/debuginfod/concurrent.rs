@@ -9,7 +9,7 @@
 
 use tracing::debug;
 
-use super::{ArtifactKind, DebuginfodClient};
+use super::DebuginfodClient;
 use crate::error::Result;
 
 /// Races two [`DebuginfodClient`] implementations concurrently.
@@ -39,9 +39,9 @@ impl<A: DebuginfodClient, B: DebuginfodClient> ConcurrentDebuginfodClient<A, B> 
 impl<A: DebuginfodClient, B: DebuginfodClient> DebuginfodClient
     for ConcurrentDebuginfodClient<A, B>
 {
-    async fn fetch(&self, build_id_hex: &str, kind: ArtifactKind) -> Result<Option<Vec<u8>>> {
-        let mut fut_a = std::pin::pin!(self.source_a.fetch(build_id_hex, kind));
-        let mut fut_b = std::pin::pin!(self.source_b.fetch(build_id_hex, kind));
+    async fn fetch(&self, build_id_hex: &str) -> Result<Option<Vec<u8>>> {
+        let mut fut_a = std::pin::pin!(self.source_a.fetch(build_id_hex));
+        let mut fut_b = std::pin::pin!(self.source_b.fetch(build_id_hex));
 
         // Race: first to complete wins, biasing toward source A if both are ready.
         let (winner, loser, source) = tokio::select! {
@@ -144,7 +144,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DebuginfodClient for StubClient {
-        async fn fetch(&self, _build_id_hex: &str, _kind: ArtifactKind) -> Result<Option<Vec<u8>>> {
+        async fn fetch(&self, _build_id_hex: &str) -> Result<Option<Vec<u8>>> {
             match &self.response {
                 Ok(Some(v)) => Ok(Some(v.clone())),
                 Ok(None) => Ok(None),
@@ -202,7 +202,7 @@ mod tests {
         #[case] description: &str,
     ) {
         let client = ConcurrentDebuginfodClient::new(a, b);
-        let result = client.fetch("deadbeef", ArtifactKind::Debuginfo).await;
+        let result = client.fetch("deadbeef").await;
 
         match result {
             Ok(data) => assert_eq!(data, expected, "{description}"),
@@ -214,7 +214,7 @@ mod tests {
     #[tokio::test]
     async fn both_error_returns_err() {
         let client = ConcurrentDebuginfodClient::new(StubClient::error(), StubClient::error());
-        let result = client.fetch("deadbeef", ArtifactKind::Debuginfo).await;
+        let result = client.fetch("deadbeef").await;
         assert!(result.is_err(), "both errors should propagate");
     }
 
@@ -226,11 +226,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl DebuginfodClient for SlowClient {
-            async fn fetch(
-                &self,
-                _build_id_hex: &str,
-                _kind: ArtifactKind,
-            ) -> Result<Option<Vec<u8>>> {
+            async fn fetch(&self, _build_id_hex: &str) -> Result<Option<Vec<u8>>> {
                 tokio::time::sleep(self.delay).await;
                 Ok(Some(self.data.clone()))
             }
@@ -243,7 +239,7 @@ mod tests {
         };
 
         let client = ConcurrentDebuginfodClient::new(a, b);
-        let result = client.fetch("deadbeef", ArtifactKind::Debuginfo).await;
+        let result = client.fetch("deadbeef").await;
         assert_eq!(result.unwrap().unwrap(), b"slow-data");
     }
 }

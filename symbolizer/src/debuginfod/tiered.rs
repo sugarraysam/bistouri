@@ -5,7 +5,7 @@
 
 use tracing::debug;
 
-use super::{ArtifactKind, DebuginfodClient};
+use super::DebuginfodClient;
 use crate::error::Result;
 
 /// Composes two `DebuginfodClient` implementations into a tiered lookup.
@@ -25,8 +25,8 @@ impl<P: DebuginfodClient, F: DebuginfodClient> TieredDebuginfodClient<P, F> {
 
 #[async_trait::async_trait]
 impl<P: DebuginfodClient, F: DebuginfodClient> DebuginfodClient for TieredDebuginfodClient<P, F> {
-    async fn fetch(&self, build_id_hex: &str, kind: ArtifactKind) -> Result<Option<Vec<u8>>> {
-        match self.primary.fetch(build_id_hex, kind).await {
+    async fn fetch(&self, build_id_hex: &str) -> Result<Option<Vec<u8>>> {
+        match self.primary.fetch(build_id_hex).await {
             Ok(Some(bytes)) => return Ok(Some(bytes)),
             Ok(None) => {
                 debug!(
@@ -43,6 +43,6 @@ impl<P: DebuginfodClient, F: DebuginfodClient> DebuginfodClient for TieredDebugi
             }
         }
 
-        self.fallback.fetch(build_id_hex, kind).await
+        self.fallback.fetch(build_id_hex).await
     }
 }

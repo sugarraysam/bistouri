@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use super::{ArtifactKind, DebuginfodClient};
+use super::DebuginfodClient;
 use crate::error::{Result, SymbolizerError};
 use crate::resolve::build_id::{self, BuildId};
 
@@ -22,7 +22,6 @@ pub type FetchResult = Result<Option<Arc<[u8]>>>;
 /// Request sent to the coordinator actor.
 struct FetchRequest {
     build_id: BuildId,
-    kind: ArtifactKind,
     reply: oneshot::Sender<FetchResult>,
 }
 
@@ -45,12 +44,11 @@ impl FetchCoordinator {
         Self { tx }
     }
 
-    /// Fetches an artifact, coalescing duplicate requests for the same BuildId and ArtifactKind.
-    pub async fn fetch(&self, build_id: &BuildId, kind: ArtifactKind) -> FetchResult {
+    /// Fetches an artifact, coalescing duplicate requests for the same BuildId.
+    pub async fn fetch(&self, build_id: &BuildId) -> FetchResult {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request = FetchRequest {
             build_id: *build_id,
-            kind,
             reply: reply_tx,
         };
 
@@ -77,8 +75,7 @@ async fn coordinator_loop(
     semaphore: Arc<Semaphore>,
     cancel_token: CancellationToken,
 ) {
-    let mut in_flight: HashMap<(BuildId, ArtifactKind), Vec<oneshot::Sender<FetchResult>>> =
-        HashMap::new();
+    let mut in_flight: HashMap<BuildId, Vec<oneshot::Sender<FetchResult>>> = HashMap::new();
     let mut fetch_tasks = JoinSet::new();
 
     loop {
@@ -88,21 +85,20 @@ async fn coordinator_loop(
                 break;
             }
             Some(req) = rx.recv() => {
-                let key = (req.build_id, req.kind);
+                let key = req.build_id;
                 let waiters = in_flight.entry(key).or_default();
                 waiters.push(req.reply);
                 if waiters.len() == 1 {
                     let client_clone = client.clone();
                     let sem_clone = semaphore.clone();
                     let build_id_hex = build_id::to_hex(&req.build_id);
-                    let kind = req.kind;
                     let build_id = req.build_id;
 
                     fetch_tasks.spawn(async move {
                         let _permit = match sem_clone.acquire_owned().await {
                             Ok(permit) => permit,
                             Err(_) => {
-                                return (build_id, kind, Err(SymbolizerError::DebuginfodServerError {
+                                return (build_id, Err(SymbolizerError::DebuginfodServerError {
                                     build_id: build_id_hex,
                                     reason: "semaphore closed".into(),
                                 }), std::time::Duration::ZERO);
@@ -111,7 +107,7 @@ async fn coordinator_loop(
 
                         metrics::gauge!(crate::telemetry::METRIC_FETCH_INFLIGHT).increment(1.0);
                         let start = Instant::now();
-                        let result = client_clone.fetch(&build_id_hex, kind).await;
+                        let result = client_clone.fetch(&build_id_hex).await;
                         metrics::gauge!(crate::telemetry::METRIC_FETCH_INFLIGHT).decrement(1.0);
                         let duration = start.elapsed();
 
@@ -121,7 +117,7 @@ async fn coordinator_loop(
                             Err(e) => Err(e),
                         };
 
-                        (build_id, kind, mapped, duration)
+                        (build_id, mapped, duration)
                     });
                 } else {
                     metrics::counter!(crate::telemetry::METRIC_FETCH_COALESCED_TOTAL).increment(1);
@@ -129,8 +125,8 @@ async fn coordinator_loop(
             }
             Some(task_result) = fetch_tasks.join_next() => {
                 match task_result {
-                    Ok((build_id, kind, fetch_result, duration)) => {
-                        let key = (build_id, kind);
+                    Ok((build_id, fetch_result, duration)) => {
+                        let key = build_id;
                         if let Some(waiters) = in_flight.remove(&key) {
                             for tx in waiters {
                                 let res = fetch_result.clone();
@@ -168,7 +164,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DebuginfodClient for MockClient {
-        async fn fetch(&self, _build_id_hex: &str, _kind: ArtifactKind) -> Result<Option<Vec<u8>>> {
+        async fn fetch(&self, _build_id_hex: &str) -> Result<Option<Vec<u8>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.delay > Duration::ZERO {
                 sleep(self.delay).await;
@@ -198,9 +194,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let coordinator = FetchCoordinator::new(client, 4, 16, cancel);
 
-        let res = coordinator
-            .fetch(&dummy_bid(1), ArtifactKind::Debuginfo)
-            .await;
+        let res = coordinator.fetch(&dummy_bid(1)).await;
         assert_eq!(res.unwrap().unwrap().as_ref(), &[1, 2, 3]);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -221,7 +215,7 @@ mod tests {
 
         for _ in 0..5 {
             let coord = coordinator.clone();
-            tasks.spawn(async move { coord.fetch(&bid, ArtifactKind::Debuginfo).await });
+            tasks.spawn(async move { coord.fetch(&bid).await });
         }
 
         while let Some(res) = tasks.join_next().await {
@@ -247,11 +241,7 @@ mod tests {
         let mut tasks = JoinSet::new();
         for i in 0..5 {
             let coord = coordinator.clone();
-            tasks.spawn(async move {
-                coord
-                    .fetch(&dummy_bid(i as u8), ArtifactKind::Debuginfo)
-                    .await
-            });
+            tasks.spawn(async move { coord.fetch(&dummy_bid(i as u8)).await });
         }
 
         while let Some(res) = tasks.join_next().await {
@@ -275,9 +265,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let coordinator = FetchCoordinator::new(client, 4, 16, cancel);
 
-        let res = coordinator
-            .fetch(&dummy_bid(1), ArtifactKind::Debuginfo)
-            .await;
+        let res = coordinator.fetch(&dummy_bid(1)).await;
         assert!(res.is_err());
         assert!(matches!(
             res.unwrap_err(),
@@ -299,11 +287,11 @@ mod tests {
         let mut tasks = JoinSet::new();
         tasks.spawn({
             let coord = coordinator.clone();
-            async move { coord.fetch(&dummy_bid(1), ArtifactKind::Debuginfo).await }
+            async move { coord.fetch(&dummy_bid(1)).await }
         });
         tasks.spawn({
             let coord = coordinator.clone();
-            async move { coord.fetch(&dummy_bid(2), ArtifactKind::Debuginfo).await }
+            async move { coord.fetch(&dummy_bid(2)).await }
         });
 
         while let Some(res) = tasks.join_next().await {

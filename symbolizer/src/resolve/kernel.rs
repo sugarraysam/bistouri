@@ -20,7 +20,6 @@ use crate::telemetry::{METRIC_DEBUGINFOD_ERRORS, METRIC_PARSE_FAILURES};
 use super::build_id;
 use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache};
 use crate::debuginfod::coordinator::FetchCoordinator;
-use crate::debuginfod::ArtifactKind;
 use crate::model::{ResolvedFrame, SymbolInfo};
 
 /// Default static `_text` virtual address for x86_64 vmlinux.
@@ -70,8 +69,7 @@ impl KernelResolver {
 
         let hex = build_id::to_hex(bid);
 
-        // vmlinux is always fetched as debuginfo (it contains DWARF + symtab).
-        let bytes = match self.coordinator.fetch(bid, ArtifactKind::Debuginfo).await {
+        let bytes = match self.coordinator.fetch(bid).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 // Definitive 404 — negative cache.

@@ -3,7 +3,7 @@
 use reqwest::Client;
 use tracing::debug;
 
-use super::{ArtifactKind, DebuginfodClient};
+use super::DebuginfodClient;
 use crate::error::{Result, SymbolizerError};
 
 /// Timeout for individual debuginfod HTTP requests.
@@ -30,13 +30,8 @@ impl HttpDebuginfodClient {
 
 #[async_trait::async_trait]
 impl DebuginfodClient for HttpDebuginfodClient {
-    async fn fetch(&self, build_id_hex: &str, kind: ArtifactKind) -> Result<Option<Vec<u8>>> {
-        let url = format!(
-            "{}/buildid/{}/{}",
-            self.base_url,
-            build_id_hex,
-            kind.path_segment()
-        );
+    async fn fetch(&self, build_id_hex: &str) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/buildid/{}/debuginfo", self.base_url, build_id_hex);
 
         debug!(url = %url, "fetching from debuginfod");
 
