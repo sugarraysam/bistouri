@@ -1,47 +1,10 @@
-use crate::trigger::error::{Result, TriggerError};
+use crate::trigger::error::Result;
 use serde::Deserialize;
-use std::collections::HashSet;
 use tracing::warn;
 
 // Types are defined once in bistouri-api and shared with the crd-gen binary in api/.
 // Re-export here so the rest of the agent continues to import from this module.
 pub(crate) use bistouri_api::config::{MatchRule, PsiResource, ResourceConfig, TargetConfig};
-
-/// Maximum length for `service_id` — aligns with K8s/DNS naming conventions.
-const SERVICE_ID_MAX_LEN: usize = 32;
-
-/// Validates that `service_id` matches `^[a-z][a-z0-9_-]*$` and is 1–32 chars.
-fn validate_service_id(id: &str) -> Result<()> {
-    if id.is_empty() {
-        return Err(TriggerError::InvalidServiceId {
-            service_id: id.into(),
-            reason: "must not be empty",
-        });
-    }
-    if id.len() > SERVICE_ID_MAX_LEN {
-        return Err(TriggerError::InvalidServiceId {
-            service_id: id.into(),
-            reason: "must be at most 32 characters",
-        });
-    }
-    let mut chars = id.chars();
-    let first = chars.next().unwrap(); // safe: checked non-empty above
-    if !first.is_ascii_lowercase() {
-        return Err(TriggerError::InvalidServiceId {
-            service_id: id.into(),
-            reason: "must start with a lowercase letter [a-z]",
-        });
-    }
-    for ch in chars {
-        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
-            return Err(TriggerError::InvalidServiceId {
-                service_id: id.into(),
-                reason: "must contain only lowercase letters, digits, underscores, and hyphens [a-z0-9_-]",
-            });
-        }
-    }
-    Ok(())
-}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TriggerConfig {
@@ -63,9 +26,10 @@ impl TriggerConfig {
     /// Loads and validates config from a YAML file. This performs synchronous
     /// file I/O and should be called from `spawn_blocking`.
     pub(crate) fn load_from_file(path: &str) -> Result<Self> {
-        let contents = std::fs::read_to_string(path).map_err(TriggerError::ConfigIo)?;
-        let raw: TriggerConfig =
-            serde_yml::from_str(&contents).map_err(TriggerError::ConfigParse)?;
+        let contents =
+            std::fs::read_to_string(path).map_err(crate::trigger::error::TriggerError::ConfigIo)?;
+        let raw: TriggerConfig = serde_yml::from_str(&contents)
+            .map_err(crate::trigger::error::TriggerError::ConfigParse)?;
         Self::try_new(raw.targets)
     }
 
@@ -101,54 +65,11 @@ impl TriggerConfig {
         }
     }
 
+    /// Delegates to the shared validator in `bistouri_api::validate`.
+    /// The `From<ConfigValidationError>` impl on `TriggerError` handles
+    /// the error type conversion.
     fn validate(&self) -> Result<()> {
-        if self.targets.is_empty() {
-            return Err(TriggerError::EmptyTargets);
-        }
-
-        // Global duplicate detection: (comm, resource) must be unique across
-        // all targets. Duplicate pairs would produce conflicting PSI watchers
-        // for the same cgroup — the second would be silently dropped.
-        let mut seen_pairs: HashSet<(&str, PsiResource)> = HashSet::new();
-        let mut seen_service_ids: HashSet<&str> = HashSet::new();
-
-        for target in &self.targets {
-            let comm = target.rule.comm();
-
-            if comm.len() > 15 {
-                return Err(TriggerError::CommTooLong { comm: comm.into() });
-            }
-
-            // service_id validation: ^[a-z][a-z0-9_]*$, 1–63 chars, unique.
-            validate_service_id(&target.service_id)?;
-            if !seen_service_ids.insert(&target.service_id) {
-                return Err(TriggerError::DuplicateServiceId {
-                    service_id: target.service_id.clone(),
-                });
-            }
-
-            if target.resources.is_empty() {
-                return Err(TriggerError::EmptyResources {
-                    rule_id: target.rule_id,
-                });
-            }
-
-            for res_cfg in &target.resources {
-                if res_cfg.threshold <= 0.0 || res_cfg.threshold >= 100.0 {
-                    return Err(TriggerError::InvalidThreshold {
-                        threshold: res_cfg.threshold,
-                        comm: comm.into(),
-                    });
-                }
-
-                if !seen_pairs.insert((comm, res_cfg.resource)) {
-                    return Err(TriggerError::DuplicateCommResource {
-                        comm: comm.into(),
-                        resource: res_cfg.resource,
-                    });
-                }
-            }
-        }
+        bistouri_api::validate::validate_targets(&self.targets)?;
         Ok(())
     }
 
@@ -200,6 +121,8 @@ impl TriggerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trigger::error::TriggerError;
+    use bistouri_api::validate::ConfigValidationError;
     use rstest::rstest;
 
     fn parse_yaml(yaml: &str) -> std::result::Result<TriggerConfig, TriggerError> {
@@ -319,7 +242,7 @@ targets:
         if should_fail {
             assert!(matches!(
                 result.unwrap_err(),
-                TriggerError::InvalidThreshold { .. }
+                TriggerError::ConfigValidation(ConfigValidationError::InvalidThreshold { .. })
             ));
         }
     }
@@ -349,7 +272,7 @@ targets:
         if should_fail {
             assert!(matches!(
                 result.unwrap_err(),
-                TriggerError::CommTooLong { .. }
+                TriggerError::ConfigValidation(ConfigValidationError::CommTooLong { .. })
             ));
         }
     }
@@ -392,7 +315,7 @@ targets:
         if should_fail {
             assert!(matches!(
                 result.unwrap_err(),
-                TriggerError::InvalidServiceId { .. }
+                TriggerError::ConfigValidation(ConfigValidationError::InvalidServiceId { .. })
             ));
         }
     }
@@ -422,7 +345,7 @@ targets:
         let result = TriggerConfig::try_new(targets);
         assert!(matches!(
             result.unwrap_err(),
-            TriggerError::DuplicateServiceId { .. }
+            TriggerError::ConfigValidation(ConfigValidationError::DuplicateServiceId { .. })
         ));
     }
 
@@ -434,13 +357,23 @@ targets:
     fn empty_targets_fails() {
         let yaml = "targets: []\n";
         let result = parse_yaml(yaml);
-        assert!(matches!(result, Err(TriggerError::EmptyTargets)));
+        assert!(matches!(
+            result,
+            Err(TriggerError::ConfigValidation(
+                ConfigValidationError::EmptyTargets
+            ))
+        ));
     }
 
     #[test]
     fn empty_resources_fails() {
         let result = TriggerConfig::try_new(vec![exact_target("node", vec![])]);
-        assert!(matches!(result, Err(TriggerError::EmptyResources { .. })));
+        assert!(matches!(
+            result,
+            Err(TriggerError::ConfigValidation(
+                ConfigValidationError::EmptyResources { .. }
+            ))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -511,7 +444,7 @@ targets:
         if should_fail {
             assert!(matches!(
                 result.unwrap_err(),
-                TriggerError::DuplicateCommResource { .. }
+                TriggerError::ConfigValidation(ConfigValidationError::DuplicateCommResource { .. })
             ));
         }
     }

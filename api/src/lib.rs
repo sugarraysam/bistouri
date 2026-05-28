@@ -1,4 +1,5 @@
 pub mod config;
+pub mod validate;
 
 #[cfg(feature = "kube")]
 pub mod cr;

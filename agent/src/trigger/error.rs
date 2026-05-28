@@ -1,9 +1,12 @@
-use crate::trigger::config::PsiResource;
+use bistouri_api::validate::ConfigValidationError;
 use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub(crate) enum TriggerError {
+    #[error(transparent)]
+    ConfigValidation(#[from] ConfigValidationError),
+
     #[error("Failed to build PSI file descriptor for cgroup {path:?}: {source}")]
     PsiFdBuild {
         path: PathBuf,
@@ -13,30 +16,6 @@ pub(crate) enum TriggerError {
 
     #[error("Failed to register PSI fd with async reactor: {0}")]
     AsyncFd(#[source] std::io::Error),
-
-    #[error("At least one target rule is required")]
-    EmptyTargets,
-
-    #[error("Target rule {rule_id} has no resources defined")]
-    EmptyResources { rule_id: u32 },
-
-    #[error("Duplicate (comm, resource) pair: comm '{comm}', resource {resource:?}")]
-    DuplicateCommResource { comm: String, resource: PsiResource },
-
-    #[error("Comm string '{comm}' exceeds 15 characters kernel limit")]
-    CommTooLong { comm: String },
-
-    #[error("Threshold {threshold} for comm '{comm}' must be in the range (0, 100) exclusive")]
-    InvalidThreshold { threshold: f64, comm: String },
-
-    #[error("Invalid service_id '{service_id}': {reason}")]
-    InvalidServiceId {
-        service_id: String,
-        reason: &'static str,
-    },
-
-    #[error("Duplicate service_id '{service_id}' across targets")]
-    DuplicateServiceId { service_id: String },
 
     #[error("Failed to parse config: {0}")]
     ConfigParse(#[source] serde_yml::Error),

@@ -94,6 +94,9 @@
                         },
                         "service_id": {
                           "description": "Logical service identity. Required for multi-tenant routing.",
+                          "maxLength": 32,
+                          "minLength": 1,
+                          "pattern": "^[a-z][a-z0-9_-]*$",
                           "type": "string"
                         }
                       },
@@ -139,6 +142,14 @@
               {
                 "message": "each target must declare a service_id",
                 "rule": "self.spec.targets.all(t, size(t.service_id) > 0)"
+              },
+              {
+                "message": "duplicate service_id across targets — each target must have a unique service_id",
+                "rule": "self.spec.targets.map(t, t.service_id).size() == self.spec.targets.map(t, t.service_id).unique().size()"
+              },
+              {
+                "message": "duplicate (comm, resource) pair across targets — each PSI resource may appear at most once per comm",
+                "rule": "self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource)).reduce([], (acc, list) => acc + list).size() == self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource)).reduce([], (acc, list) => acc + list).unique().size()"
               }
             ]
           }

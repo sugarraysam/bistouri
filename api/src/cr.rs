@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::{MatchRule, ResourceConfig, TargetConfig};
+use crate::config::{MatchRule, ResourceConfig, TargetConfig, COMM_MAX_LEN};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use schemars::Schema;
@@ -61,7 +61,7 @@ fn match_rule_schema(_gen: &mut schemars::generate::SchemaGenerator) -> Schema {
             "comm": {
                 "type": "string",
                 // maxLength bounds CEL string-comparison cost.
-                "maxLength": 15,
+                "maxLength": COMM_MAX_LEN,
                 "description": "Process comm string. Max 15 bytes (kernel TASK_COMM_LEN - 1)."
             }
         },
@@ -85,6 +85,7 @@ pub struct TargetConfigSchema {
     #[schemars(schema_with = "match_rule_schema")]
     pub rule: MatchRule,
     /// Logical service identity. Required for multi-tenant routing.
+    #[schemars(length(min = 1, max = 32), regex(pattern = r"^[a-z][a-z0-9_-]*$"))]
     pub service_id: String,
     /// PSI resources to watch for this target. At most 3 (Memory, Cpu, Io).
     #[schemars(length(max = 3))]
@@ -124,9 +125,9 @@ impl From<TargetConfigSchema> for TargetConfig {
     shortname = "bc",
     doc = "Bistouri trigger configuration — PSI threshold rules per process comm.",
     // ── CEL validation rules ────────────────────────────────────────────────
-    // Fast-fail admission checks. The agent performs the full validation in
-    // TriggerConfig::validate() on every load. CEL rules are intentionally a
-    // subset to stay within the cost budget.
+    // Mirror of `bistouri_api::validate::validate_targets()`. The
+    // `test_every_validation_error_has_cel_rule` test enforces that
+    // every ConfigValidationError variant has a corresponding CEL rule.
     //
     // Rule 1: at least one target.
     validation = Rule::new("size(self.spec.targets) > 0")
@@ -142,7 +143,7 @@ impl From<TargetConfigSchema> for TargetConfig {
     ).message("each target must declare at least one resource"),
     // Rule 4: no duplicate resource types within the same target.
     // Uses a fixed 3-element literal to enumerate resources without an O(n²)
-    // cross-product. Cross-target dedup is enforced by TriggerConfig::validate().
+    // cross-product.
     // Cost: O(targets × 3 × resources) = O(64 × 3 × 3) = O(576).
     validation = Rule::new(concat!(
         "self.spec.targets.all(t,",
@@ -151,14 +152,75 @@ impl From<TargetConfigSchema> for TargetConfig {
         "  )",
         ")"
     )).message("duplicate resource type within a single target — each PSI resource may appear at most once per target"),
-    // Rule 5: each target must declare a service_id.
+    // Rule 5: each target must declare a non-empty service_id.
     validation = Rule::new(
         "self.spec.targets.all(t, size(t.service_id) > 0)"
     ).message("each target must declare a service_id"),
+    // Rule 6: service_id must be unique across targets.
+    // Cost: O(targets) = O(64).
+    validation = Rule::new(concat!(
+        "self.spec.targets.map(t, t.service_id).size() == ",
+        "self.spec.targets.map(t, t.service_id).unique().size()"
+    )).message("duplicate service_id across targets — each target must have a unique service_id"),
+    // Rule 7: global (comm, resource) uniqueness across all targets.
+    // Flatten all (comm + "/" + resource) pairs and check uniqueness.
+    // Cost: O(targets × resources) = O(64 × 3) = O(192).
+    validation = Rule::new(concat!(
+        "self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource))",
+        ".reduce([], (acc, list) => acc + list).size() == ",
+        "self.spec.targets.map(t, t.resources.map(r, t.rule.comm + '/' + r.resource))",
+        ".reduce([], (acc, list) => acc + list).unique().size()"
+    )).message("duplicate (comm, resource) pair across targets — each PSI resource may appear at most once per comm"),
 )]
 pub struct BistouriConfigSpec {
     /// Process targets to watch. At least one required.
     // maxItems gives the CEL estimator a concrete bound for nested iterations.
     #[schemars(length(max = 64))]
     pub targets: Vec<TargetConfigSchema>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests — enforce CRD ↔ Rust validation sync
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kube::core::CustomResourceExt;
+
+    /// Golden-file test: the committed CRD YAML must match what the Rust
+    /// types generate. Fails if someone changes the Rust types, CEL rules,
+    /// or OpenAPI annotations without running `make generate-crd`.
+    #[test]
+    fn test_crd_yaml_in_sync() {
+        let generated = BistouriConfig::crd();
+        let generated_json: serde_json::Value =
+            serde_json::to_value(&generated).expect("CRD serialization failed");
+
+        // Resolve path relative to the crate root (api/).
+        let committed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../deployment/crd/bistouriconfig.yaml");
+        let committed_bytes = std::fs::read_to_string(&committed_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read committed CRD at {}: {e}\n\
+                 Run `make generate-crd` in public/bistouri/ to create it.",
+                committed_path.display()
+            )
+        });
+        let committed_json: serde_json::Value = serde_json::from_str(&committed_bytes)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to parse committed CRD as JSON: {e}\n\
+                     The file may be corrupt. Run `make generate-crd` to regenerate."
+                )
+            });
+
+        assert_eq!(
+            generated_json, committed_json,
+            "\n\nCRD YAML is stale!\n\
+             The committed deployment/crd/bistouriconfig.yaml does not match\n\
+             the output of BistouriConfig::crd().\n\n\
+             Run `make generate-crd` in public/bistouri/ to update it.\n"
+        );
+    }
 }

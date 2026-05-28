@@ -23,6 +23,31 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 
+// ---------------------------------------------------------------------------
+// Validation constants — single source of truth for Rust + CRD CEL rules
+// ---------------------------------------------------------------------------
+
+/// Maximum length for `service_id` — aligns with K8s/DNS naming conventions.
+pub const SERVICE_ID_MAX_LEN: usize = 32;
+
+/// Regex pattern for valid `service_id` values.
+pub const SERVICE_ID_PATTERN: &str = r"^[a-z][a-z0-9_-]*$";
+
+/// Maximum length for process `comm` strings (kernel `TASK_COMM_LEN - 1`).
+pub const COMM_MAX_LEN: usize = 15;
+
+/// PSI threshold exclusive lower bound.
+pub const THRESHOLD_EXCLUSIVE_MIN: f64 = 0.0;
+
+/// PSI threshold exclusive upper bound.
+pub const THRESHOLD_EXCLUSIVE_MAX: f64 = 100.0;
+
+/// Maximum number of target entries in a config.
+pub const MAX_TARGETS: usize = 64;
+
+/// Maximum number of PSI resources per target (Memory, Cpu, Io).
+pub const MAX_RESOURCES_PER_TARGET: usize = 3;
+
 /// Which PSI resource to watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
