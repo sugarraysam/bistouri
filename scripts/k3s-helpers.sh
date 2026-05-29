@@ -37,7 +37,7 @@ e2e_error() { echo -e "${RED}[${E2E_LOG_PREFIX}]${NC} $*" >&2; }
 nuke_k3s() {
     e2e_info "Nuking k3s state..."
 
-    sudo k3s crictl rm -a 2>/dev/null || true
+    sudo k3s crictl rm -fa 2>/dev/null || true
     sudo k3s crictl rmi --prune 2>/dev/null || true
 
     if systemctl is-active --quiet k3s 2>/dev/null; then
@@ -49,11 +49,9 @@ nuke_k3s() {
     sudo pkill -9 "k3s" 2>/dev/null || true
 
     # (1) Wipe the ENTIRE k3s state directory (not just the DB)
-    # (2) Wipe the containerd snapshots (This fixes your 52GB jemalloc bloat!)
-    # (3) Wipe the CNI configuration (CRITICAL for fixing CIDRAssignmentFailed)
-    # (4) Clear out lingering kubelet pod state
+    # (2) Wipe the CNI configuration (CRITICAL for fixing CIDRAssignmentFailed)
+    # (3) Clear out lingering kubelet pod state
     sudo rm -rf /var/lib/rancher/k3s || true
-    sudo rm -rf /var/lib/containerd || true
     sudo rm -rf /etc/cni/net.d || true
     sudo rm -rf /var/lib/kubelet/pods 2>/dev/null || true
 
