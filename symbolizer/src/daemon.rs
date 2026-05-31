@@ -195,31 +195,49 @@ async fn cache_gauge_reporter(caches: CachePool, interval: Duration, cancel: Can
                 caches.user_symbols.run_pending_tasks();
                 caches.kernel_symbols.run_pending_tasks();
 
-                // L1 object caches: moka weighted_size() returns actual bytes.
+                // Snapshot all cache stats once per tick.
+                let l1_user_bytes = caches.user_objects.weighted_size();
+                let l1_user_entries = caches.user_objects.entry_count();
+                let l1_kernel_bytes = caches.kernel_objects.weighted_size();
+                let l1_kernel_entries = caches.kernel_objects.entry_count();
+                let l2_user_bytes = caches.user_symbols.weighted_byte_usage();
+                let l2_user_entries = caches.user_symbols.entry_count();
+                let l2_kernel_bytes = caches.kernel_symbols.weighted_byte_usage();
+                let l2_kernel_entries = caches.kernel_symbols.entry_count();
+                let negative_entries = caches.negative.entry_count();
+
+                // Record Prometheus gauges from the snapshot.
                 gauge!(METRIC_CACHE_USAGE_BYTES, "tier" => "l1", "space" => "user")
-                    .set(caches.user_objects.weighted_size() as f64);
+                    .set(l1_user_bytes as f64);
                 gauge!(METRIC_CACHE_USAGE_BYTES, "tier" => "l1", "space" => "kernel")
-                    .set(caches.kernel_objects.weighted_size() as f64);
-
-                // L2 symbol caches: estimated byte usage.
+                    .set(l1_kernel_bytes as f64);
                 gauge!(METRIC_CACHE_USAGE_BYTES, "tier" => "l2", "space" => "user")
-                    .set(caches.user_symbols.weighted_byte_usage() as f64);
+                    .set(l2_user_bytes as f64);
                 gauge!(METRIC_CACHE_USAGE_BYTES, "tier" => "l2", "space" => "kernel")
-                    .set(caches.kernel_symbols.weighted_byte_usage() as f64);
-
-                // Negative cache entry count.
-                gauge!(METRIC_NEGATIVE_CACHE_ENTRIES)
-                    .set(caches.negative.entry_count() as f64);
-
-                // Entry counts per tier/space.
+                    .set(l2_kernel_bytes as f64);
+                gauge!(METRIC_NEGATIVE_CACHE_ENTRIES).set(negative_entries as f64);
                 gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l1", "space" => "user")
-                    .set(caches.user_objects.entry_count() as f64);
+                    .set(l1_user_entries as f64);
                 gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l1", "space" => "kernel")
-                    .set(caches.kernel_objects.entry_count() as f64);
+                    .set(l1_kernel_entries as f64);
                 gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l2", "space" => "user")
-                    .set(caches.user_symbols.entry_count() as f64);
+                    .set(l2_user_entries as f64);
                 gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l2", "space" => "kernel")
-                    .set(caches.kernel_symbols.entry_count() as f64);
+                    .set(l2_kernel_entries as f64);
+
+                // Periodic operational heartbeat — visible at info level in
+                // kubectl logs. Emits once per gauge_interval (default 15s),
+                // NOT per session.
+                info!(
+                    l1_user_mib = format!("{:.1}", l1_user_bytes as f64 / (1024.0 * 1024.0)),
+                    l1_user_entries,
+                    l1_kernel_mib = format!("{:.1}", l1_kernel_bytes as f64 / (1024.0 * 1024.0)),
+                    l1_kernel_entries,
+                    l2_user_mib = format!("{:.1}", l2_user_bytes as f64 / (1024.0 * 1024.0)),
+                    l2_kernel_mib = format!("{:.1}", l2_kernel_bytes as f64 / (1024.0 * 1024.0)),
+                    negative_entries,
+                    "cache status"
+                );
             }
         }
     }

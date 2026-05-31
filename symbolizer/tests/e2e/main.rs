@@ -333,12 +333,12 @@ async fn symbolizer_e2e() {
         "expected >0 user object cache misses"
     );
 
-    // We should also see latency histograms
-    let latency_total =
-        scrape.counter("symbolizer_latency_seconds_count", Some(("phase", "total")));
+    // We should also see latency histograms — DWARF walk time is recorded
+    // once per resolved session, so `_count` should be >0 after phases 1–3.
+    let dwarf_walk_count = scrape.counter("symbolizer_dwarf_walk_seconds_count", None);
     assert!(
-        latency_total > 0.0,
-        "expected >0 latency metrics for total phase"
+        dwarf_walk_count > 0.0,
+        "expected >0 DWARF walk latency observations"
     );
 
     info!("✅ Phase 4 passed: Prometheus metrics validated");

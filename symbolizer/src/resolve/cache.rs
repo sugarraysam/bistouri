@@ -17,7 +17,7 @@ use std::time::Duration;
 use moka::future::Cache as MokaFutureCache;
 use moka::sync::Cache as MokaSyncCache;
 use tokio::sync::Semaphore;
-use tracing::{debug, error};
+use tracing::{error, info, warn};
 
 use super::build_id::{self, BuildId};
 use super::elf::{extract_load_segments, LoadSegment};
@@ -389,6 +389,31 @@ impl ObjectCache {
 
                 match result {
                     Ok(Some(bytes)) => {
+                        let fetch_bytes = bytes.len();
+                        let fetch_mib = fetch_bytes as f64 / (1024.0 * 1024.0);
+
+                        // Per-build-ID log: bounded by NUM_BUILD_IDS, not sessions/sec.
+                        info!(
+                            build_id = %hex,
+                            fetch_bytes,
+                            fetch_mib = format!("{fetch_mib:.1}"),
+                            "debuginfod fetch complete, parsing ELF"
+                        );
+
+                        // Early warning for oversized objects that risk OOM during parse.
+                        // from_elf_bytes holds raw bytes + parsed DWARF simultaneously,
+                        // roughly doubling transient memory for the duration of the parse.
+                        const FETCH_WARN_THRESHOLD: usize = 50 * 1024 * 1024; // 50 MiB
+                        if fetch_bytes > FETCH_WARN_THRESHOLD {
+                            warn!(
+                                build_id = %hex,
+                                fetch_mib = format!("{fetch_mib:.1}"),
+                                "oversized debuginfod response — transient memory \
+                                 during parse will be ~{:.0} MiB",
+                                fetch_mib * 2.0
+                            );
+                        }
+
                         let static_text_addr = static_text_extractor.and_then(|f| f(&bytes));
 
                         match CachedObject::from_elf_bytes(
@@ -398,7 +423,13 @@ impl ObjectCache {
                             max_pool_size,
                         ) {
                             Ok(parsed) => {
-                                debug!(build_id = %hex, "ELF parsed and cached");
+                                info!(
+                                    build_id = %hex,
+                                    estimated_bytes = parsed.estimated_bytes,
+                                    estimated_mib = format!("{:.1}",
+                                        parsed.estimated_bytes as f64 / (1024.0 * 1024.0)),
+                                    "ELF parsed and cached"
+                                );
                                 Some(CacheEntry::Parsed(Arc::new(parsed)))
                             }
                             Err(e) => {
@@ -411,7 +442,7 @@ impl ObjectCache {
                     }
                     Ok(None) => {
                         // Definitive 404 — negative cache to avoid re-fetch.
-                        debug!(build_id = %hex,
+                        info!(build_id = %hex,
                             "build_id not found in debuginfod, negative caching");
                         negative.insert(bid);
                         None
