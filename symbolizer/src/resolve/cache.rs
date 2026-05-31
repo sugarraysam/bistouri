@@ -565,9 +565,14 @@ pub const BYTES_PER_L2_ENTRY: u64 = 256;
 ///
 /// Sized by byte budget, internally divided by [`BYTES_PER_L2_ENTRY`] to
 /// compute the entry count. `Clone` is cheap (moka is internally `Arc`-wrapped).
+///
+/// When the budget is too small to hold even a single entry (< [`BYTES_PER_L2_ENTRY`]),
+/// the inner moka cache is not created at all — `get()` returns `None` and
+/// `insert()` is a no-op. This avoids futile crossbeam channel ops and
+/// immediate evictions that waste CPU under stress-test configurations.
 #[derive(Clone)]
 pub struct SymbolCache {
-    entries: MokaSyncCache<SymbolKey, Arc<ResolvedFrame>>,
+    entries: Option<MokaSyncCache<SymbolKey, Arc<ResolvedFrame>>>,
     budget_bytes: u64,
 }
 
@@ -576,22 +581,30 @@ impl SymbolCache {
     ///
     /// Uses moka's byte-weighted eviction (matching L1 `ObjectCache`)
     /// with a fixed per-entry weight of [`BYTES_PER_L2_ENTRY`].
+    ///
+    /// If the budget is smaller than one entry, no moka cache is
+    /// allocated — all operations become no-ops.
     pub fn new_byte_budget(budget_bytes: u64, eviction_space: &'static str) -> Self {
-        let builder = MokaSyncCache::builder()
-            .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
-                BYTES_PER_L2_ENTRY as u32
-            })
-            .max_capacity(budget_bytes)
-            .eviction_listener(move |_key, _value, _cause| {
-                metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL,
-                    "tier" => "l2",
-                    "space" => eviction_space,
-                )
-                .increment(1);
-            });
+        let entries = if budget_bytes >= BYTES_PER_L2_ENTRY {
+            let builder = MokaSyncCache::builder()
+                .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
+                    BYTES_PER_L2_ENTRY as u32
+                })
+                .max_capacity(budget_bytes)
+                .eviction_listener(move |_key, _value, _cause| {
+                    metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL,
+                        "tier" => "l2",
+                        "space" => eviction_space,
+                    )
+                    .increment(1);
+                });
+            Some(builder.build())
+        } else {
+            None
+        };
 
         Self {
-            entries: builder.build(),
+            entries,
             budget_bytes,
         }
     }
@@ -602,30 +615,41 @@ impl SymbolCache {
     /// eviction across all caches.
     pub fn new(capacity: u64) -> Self {
         let budget_bytes = capacity * BYTES_PER_L2_ENTRY;
+        let entries = if budget_bytes >= BYTES_PER_L2_ENTRY {
+            Some(
+                MokaSyncCache::builder()
+                    .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
+                        BYTES_PER_L2_ENTRY as u32
+                    })
+                    .max_capacity(budget_bytes)
+                    .build(),
+            )
+        } else {
+            None
+        };
+
         Self {
-            entries: MokaSyncCache::builder()
-                .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
-                    BYTES_PER_L2_ENTRY as u32
-                })
-                .max_capacity(budget_bytes)
-                .build(),
+            entries,
             budget_bytes,
         }
     }
 
     #[inline]
     pub(crate) fn get(&self, key: &SymbolKey) -> Option<Arc<ResolvedFrame>> {
-        self.entries.get(key)
+        self.entries.as_ref()?.get(key)
     }
 
+    #[inline]
     pub(crate) fn insert(&self, key: SymbolKey, frame: Arc<ResolvedFrame>) {
-        self.entries.insert(key, frame);
+        if let Some(entries) = &self.entries {
+            entries.insert(key, frame);
+        }
     }
 
     /// Current number of entries in the cache.
     #[inline]
     pub fn entry_count(&self) -> u64 {
-        self.entries.entry_count()
+        self.entries.as_ref().map_or(0, |e| e.entry_count())
     }
 
     /// Current byte usage as tracked by moka's byte-weighted eviction.
@@ -634,7 +658,7 @@ impl SymbolCache {
     /// accurate values.
     #[inline]
     pub fn weighted_byte_usage(&self) -> u64 {
-        self.entries.weighted_size()
+        self.entries.as_ref().map_or(0, |e| e.weighted_size())
     }
 
     /// Byte budget this cache was created with.
@@ -647,7 +671,9 @@ impl SymbolCache {
     ///
     /// See [`ObjectCache::run_pending_tasks()`] for rationale.
     pub fn run_pending_tasks(&self) {
-        self.entries.run_pending_tasks();
+        if let Some(entries) = &self.entries {
+            entries.run_pending_tasks();
+        }
     }
 }
 

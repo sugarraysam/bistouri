@@ -18,6 +18,43 @@ use std::time::Instant;
 use metrics::{counter, histogram};
 use tracing::{debug, error, info};
 
+/// Per-session accumulator for frame-level cache metrics.
+///
+/// Batches hit/miss counter increments so the `metrics` registry lookup
+/// happens once per session (in [`flush`]) instead of per frame.
+/// This eliminates the `register_counter → get_or_create_counter` overhead
+/// that was consuming ~23% of CPU on the hot DWARF resolution path.
+#[derive(Default)]
+pub(crate) struct FrameStats {
+    l1_hits: u64,
+    l1_misses: u64,
+    l2_hits: u64,
+    l2_misses: u64,
+}
+
+impl FrameStats {
+    /// Flushes accumulated counters to the metrics registry in one batch.
+    #[inline]
+    fn flush(&self, space: &'static str) {
+        if self.l1_hits > 0 {
+            counter!(METRIC_CACHE_HITS, "kind" => "object", "space" => space)
+                .increment(self.l1_hits);
+        }
+        if self.l1_misses > 0 {
+            counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => space)
+                .increment(self.l1_misses);
+        }
+        if self.l2_hits > 0 {
+            counter!(METRIC_CACHE_HITS, "kind" => "symbol", "space" => space)
+                .increment(self.l2_hits);
+        }
+        if self.l2_misses > 0 {
+            counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => space)
+                .increment(self.l2_misses);
+        }
+    }
+}
+
 use crate::telemetry::{
     METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_DWARF_WALK_SECONDS, METRIC_FRAMES_PER_SESSION,
     METRIC_PREFETCH_SECONDS, METRIC_SPAWN_BLOCKING_WAIT_SECONDS,
@@ -189,6 +226,10 @@ fn resolve_session_blocking(
     // producing inaccurate Summary quantile estimates at 300K+ obs/sec).
     let dwarf_walk_start = Instant::now();
 
+    // Batch per-frame cache metrics — flushed once at session end.
+    let mut user_stats = FrameStats::default();
+    let mut kernel_stats = FrameStats::default();
+
     let traces: Vec<ResolvedTrace> = payload
         .traces
         .iter()
@@ -206,6 +247,7 @@ fn resolve_session_blocking(
                                 kernel_bid,
                                 &pinned_kernel_object,
                                 &caches.kernel_symbols,
+                                &mut kernel_stats,
                             )
                         })
                         .collect()
@@ -222,6 +264,7 @@ fn resolve_session_blocking(
                                 &payload.mappings,
                                 &pinned_user_objects,
                                 &caches.user_symbols,
+                                &mut user_stats,
                             )
                         })
                         .collect()
@@ -248,6 +291,10 @@ fn resolve_session_blocking(
     // This captures the total CPU cost of all addr2line lookups in the session.
     let dwarf_elapsed = dwarf_walk_start.elapsed().as_secs_f64();
     histogram!(METRIC_DWARF_WALK_SECONDS).record(dwarf_elapsed);
+
+    // Flush batched cache metrics — one registry lookup per counter, not per frame.
+    user_stats.flush("user");
+    kernel_stats.flush("kernel");
 
     // Move metadata out of the payload — no cloning.
     let metadata = payload.metadata.as_ref();
@@ -334,17 +381,18 @@ fn resolve_kernel_frame_blocking(
     kernel_bid: Option<&BuildId>,
     pinned_kernel_object: &Option<Arc<CachedObject>>,
     symbols: &SymbolCache,
+    stats: &mut FrameStats,
 ) -> Arc<ResolvedFrame> {
     let Some(bid) = kernel_bid else {
-        counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "kernel").increment(1);
+        stats.l1_misses += 1;
         return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
     };
 
     let Some(obj) = pinned_kernel_object else {
-        counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "kernel").increment(1);
+        stats.l1_misses += 1;
         return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
     };
-    counter!(METRIC_CACHE_HITS, "kind" => "object", "space" => "kernel").increment(1);
+    stats.l1_hits += 1;
 
     let static_text = obj
         .static_text_addr
@@ -356,10 +404,10 @@ fn resolve_kernel_frame_blocking(
     // L2 symbol cache hit — zero-copy Arc return.
     let key = (*bid, vmlinux_vaddr);
     if let Some(cached) = symbols.get(&key) {
-        counter!(METRIC_CACHE_HITS, "kind" => "symbol", "space" => "kernel").increment(1);
+        stats.l2_hits += 1;
         return cached;
     }
-    counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "kernel").increment(1);
+    stats.l2_misses += 1;
 
     let frame = Arc::new(kernel::resolve_kernel_addr(obj, vmlinux_vaddr));
     symbols.insert(key, frame.clone());
@@ -372,6 +420,7 @@ fn resolve_user_frame(
     mappings: &[proto::Mapping],
     pinned_user_objects: &HashMap<BuildId, Arc<CachedObject>>,
     symbols: &SymbolCache,
+    stats: &mut FrameStats,
 ) -> Arc<ResolvedFrame> {
     match frame.frame.as_ref() {
         Some(proto::user_frame::Frame::Resolved(resolved)) => {
@@ -384,6 +433,7 @@ fn resolve_user_frame(
                             resolved.file_offset,
                             pinned_user_objects,
                             symbols,
+                            stats,
                         )
                     } else {
                         Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()))
