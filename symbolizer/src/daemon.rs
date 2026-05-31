@@ -13,15 +13,13 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::info;
 
-use crate::debuginfod::coordinator::FetchCoordinator;
-use crate::debuginfod::DebuginfodClient;
 use crate::resolve::cache::CachePool;
 use crate::resolve::SessionResolver;
 use crate::server::{ProcessingWorker, SymbolizerService};
 use crate::sink::SessionSink;
 use crate::telemetry::{
-    METRIC_CACHE_CAPACITY_BYTES, METRIC_CACHE_USAGE_BYTES, METRIC_NEGATIVE_CACHE_CAPACITY,
-    METRIC_NEGATIVE_CACHE_ENTRIES,
+    METRIC_CACHE_CAPACITY_BYTES, METRIC_CACHE_ENTRY_COUNT, METRIC_CACHE_USAGE_BYTES,
+    METRIC_NEGATIVE_CACHE_CAPACITY, METRIC_NEGATIVE_CACHE_ENTRIES,
 };
 
 /// Default processing queue capacity.
@@ -79,7 +77,6 @@ impl SymbolizerDaemon {
     /// stop the server gracefully.
     pub async fn start<S>(
         config: DaemonConfig,
-        client: Arc<dyn DebuginfodClient>,
         sink: Arc<S>,
         caches: CachePool,
     ) -> anyhow::Result<Self>
@@ -93,14 +90,7 @@ impl SymbolizerDaemon {
         record_cache_capacities(&caches);
         let gauge_caches = caches.clone();
 
-        let coordinator = Arc::new(FetchCoordinator::new(
-            client,
-            config.debuginfod_fetch_concurrency,
-            1024,
-            cancel.clone(),
-        ));
-
-        let resolver = Arc::new(SessionResolver::new(caches, coordinator));
+        let resolver = Arc::new(SessionResolver::new(caches));
 
         info!(
             queue_capacity = config.queue_capacity,
@@ -183,6 +173,11 @@ fn record_cache_capacities(caches: &CachePool) {
 }
 
 /// Periodically records cache usage gauges.
+///
+/// `future::Cache::run_pending_tasks()` is async — it performs moka's
+/// deferred maintenance without blocking the tokio event loop.
+/// `sync::Cache::run_pending_tasks()` (L2 symbol caches) is synchronous
+/// but completes in microseconds and doesn't warrant `spawn_blocking`.
 async fn cache_gauge_reporter(caches: CachePool, interval: Duration, cancel: CancellationToken) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -195,9 +190,8 @@ async fn cache_gauge_reporter(caches: CachePool, interval: Duration, cancel: Can
                 // Force moka's deferred maintenance before reading gauges.
                 // Without this, weighted_size() can return stale values (even 0)
                 // because moka batches bookkeeping into async maintenance tasks.
-                // Cost: O(pending_ops), typically microseconds per cache.
-                caches.user_objects.run_pending_tasks();
-                caches.kernel_objects.run_pending_tasks();
+                caches.user_objects.run_pending_tasks().await;
+                caches.kernel_objects.run_pending_tasks().await;
                 caches.user_symbols.run_pending_tasks();
                 caches.kernel_symbols.run_pending_tasks();
 
@@ -216,6 +210,16 @@ async fn cache_gauge_reporter(caches: CachePool, interval: Duration, cancel: Can
                 // Negative cache entry count.
                 gauge!(METRIC_NEGATIVE_CACHE_ENTRIES)
                     .set(caches.negative.entry_count() as f64);
+
+                // Entry counts per tier/space.
+                gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l1", "space" => "user")
+                    .set(caches.user_objects.entry_count() as f64);
+                gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l1", "space" => "kernel")
+                    .set(caches.kernel_objects.entry_count() as f64);
+                gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l2", "space" => "user")
+                    .set(caches.user_symbols.entry_count() as f64);
+                gauge!(METRIC_CACHE_ENTRY_COUNT, "tier" => "l2", "space" => "kernel")
+                    .set(caches.kernel_symbols.entry_count() as f64);
             }
         }
     }

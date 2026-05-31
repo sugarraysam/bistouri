@@ -61,6 +61,14 @@ pub const METRIC_NEGATIVE_CACHE_ENTRIES: &str = "symbolizer_negative_cache_entri
 /// Negative cache maximum capacity (gauge, set once at startup).
 pub const METRIC_NEGATIVE_CACHE_CAPACITY: &str = "symbolizer_negative_cache_capacity";
 
+/// Cache evictions (counter, incremented by moka eviction listener).
+/// Labels: `tier` = "l1" | "l2" | "negative", `space` = "user" | "kernel".
+pub const METRIC_CACHE_EVICTIONS_TOTAL: &str = "symbolizer_cache_evictions_total";
+
+/// Current entry count per cache tier (gauge).
+/// Labels: `tier` = "l1" | "l2", `space` = "user" | "kernel".
+pub const METRIC_CACHE_ENTRY_COUNT: &str = "symbolizer_cache_entry_count";
+
 /// Per-session aggregate DWARF walk time (addr2line), excluding L2 cache hits (histogram).
 /// Recorded once per session (not per-frame) to avoid Summary quantile estimation
 /// noise at high observation rates. Labels: `space` = "aggregate".
@@ -79,14 +87,8 @@ pub const METRIC_PREFETCH_SECONDS: &str = "symbolizer_prefetch_seconds";
 /// without this metric.
 pub const METRIC_SPAWN_BLOCKING_WAIT_SECONDS: &str = "symbolizer_spawn_blocking_wait_seconds";
 
-/// Total fetch requests that were coalesced (de-duplicated).
-pub const METRIC_FETCH_COALESCED_TOTAL: &str = "symbolizer_fetch_coalesced_total";
-
 /// Current debuginfod fetch operations executing in parallel.
 pub const METRIC_FETCH_INFLIGHT: &str = "symbolizer_fetch_inflight";
-
-/// Time spent waiting for debuginfod fetches, including coalesced waiters (histogram).
-pub const METRIC_FETCH_WAIT_SECONDS: &str = "symbolizer_fetch_wait_seconds";
 
 /// Registers metric descriptions for the symbolizer. Call exactly once
 /// in `main()` or daemon start before any metric is incremented.
@@ -158,16 +160,16 @@ pub fn describe_all() {
         METRIC_SPAWN_BLOCKING_WAIT_SECONDS,
         "Time a session waits for a spawn_blocking slot in tokio's blocking pool"
     );
-    metrics::describe_counter!(
-        METRIC_FETCH_COALESCED_TOTAL,
-        "Total fetch requests that joined an existing in-flight fetch"
-    );
     metrics::describe_gauge!(
         METRIC_FETCH_INFLIGHT,
         "Current debuginfod fetch operations executing in parallel"
     );
-    metrics::describe_histogram!(
-        METRIC_FETCH_WAIT_SECONDS,
-        "Time spent waiting for debuginfod fetches, including coalesced waiters"
+    metrics::describe_counter!(
+        METRIC_CACHE_EVICTIONS_TOTAL,
+        "Cache evictions per tier, incremented by moka eviction listeners"
+    );
+    metrics::describe_gauge!(
+        METRIC_CACHE_ENTRY_COUNT,
+        "Current entry count per cache tier"
     );
 }

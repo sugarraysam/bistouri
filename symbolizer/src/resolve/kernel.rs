@@ -12,14 +12,8 @@
 
 use std::sync::Arc;
 
-use metrics::counter;
-use tracing::{debug, error, warn};
-
-use crate::telemetry::{METRIC_DEBUGINFOD_ERRORS, METRIC_PARSE_FAILURES};
-
 use super::build_id;
-use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache};
-use crate::debuginfod::coordinator::FetchCoordinator;
+use super::cache::{CachedObject, ObjectCache};
 use crate::model::{ResolvedFrame, SymbolInfo};
 
 /// Default static `_text` virtual address for x86_64 vmlinux.
@@ -33,80 +27,20 @@ pub(crate) const DEFAULT_STATIC_TEXT_ADDR: u64 = 0xffff_ffff_8100_0000;
 /// so cloning is a pointer bump).
 pub(crate) struct KernelResolver {
     cache: ObjectCache,
-    negative: NegativeCache,
-    coordinator: Arc<FetchCoordinator>,
 }
 
 impl KernelResolver {
-    pub(crate) fn new(
-        cache: ObjectCache,
-        negative: NegativeCache,
-        coordinator: Arc<FetchCoordinator>,
-    ) -> Self {
-        Self {
-            cache,
-            negative,
-            coordinator,
-        }
+    pub(crate) fn new(cache: ObjectCache) -> Self {
+        Self { cache }
     }
 
+    /// Ensures a parsed vmlinux object is cached for the given kernel build ID.
+    ///
+    /// Delegates to `ObjectCache::get_or_fetch` which handles fetch coalescing,
+    /// concurrency bounding, negative caching, and parse-failure sentinels.
     pub(crate) async fn ensure_cached(&self, kernel_build_id: &[u8]) -> Option<Arc<CachedObject>> {
-        let Some(bid) = build_id::try_from_slice(kernel_build_id) else {
-            warn!(
-                len = kernel_build_id.len(),
-                "kernel build_id is not 20 bytes, cannot fetch vmlinux"
-            );
-            return None;
-        };
-
-        if let Some(obj) = self.cache.get_object(bid) {
-            return Some(obj);
-        }
-
-        if self.cache.contains(bid) || self.negative.is_negative(bid) {
-            return None;
-        }
-
-        let hex = build_id::to_hex(bid);
-
-        let bytes = match self.coordinator.fetch(bid).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                // Definitive 404 — negative cache.
-                debug!(build_id = %hex, "vmlinux not found in debuginfod, negative caching");
-                self.negative.insert(*bid);
-                return None;
-            }
-            Err(e) => {
-                // Transient error — do NOT negative cache, allow retry.
-                error!(build_id = %hex, error = %e, "vmlinux fetch failed (transient, will retry)");
-                counter!(METRIC_DEBUGINFOD_ERRORS).increment(1);
-                return None;
-            }
-        };
-
-        // Read static _text address before the bytes are consumed by DWARF parsing.
-        let static_text_addr = read_static_text_addr(&bytes);
-
-        match CachedObject::from_elf_bytes(
-            &bytes,
-            &hex,
-            static_text_addr,
-            self.cache.max_pool_size(),
-        ) {
-            Ok(parsed) => {
-                let obj = Arc::new(parsed);
-                self.cache.insert(*bid, CacheEntry::Parsed(obj.clone()));
-                Some(obj)
-            }
-            Err(e) => {
-                // Parse failure is definitive — cache as unparseable sentinel.
-                error!(build_id = %hex, error = %e, "vmlinux parse failed, caching as unparseable");
-                counter!(METRIC_PARSE_FAILURES).increment(1);
-                self.cache.insert(*bid, CacheEntry::Unparseable);
-                None
-            }
-        }
+        let bid = build_id::try_from_slice(kernel_build_id)?;
+        self.cache.get_or_fetch(bid).await
     }
 }
 
@@ -114,7 +48,7 @@ impl KernelResolver {
 ///
 /// This is the link-time address of `_text`, NOT the KASLR-randomized runtime
 /// address. Typical value: `0xffffffff81000000` on x86_64.
-fn read_static_text_addr(data: &[u8]) -> Option<u64> {
+pub(crate) fn read_static_text_addr(data: &[u8]) -> Option<u64> {
     use object::{Object, ObjectSymbol};
 
     let object = object::read::File::parse(data).ok()?;

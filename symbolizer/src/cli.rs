@@ -19,13 +19,20 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use crate::daemon::{
     DaemonConfig, DEFAULT_DEBUGINFOD_FETCH_CONCURRENCY, DEFAULT_MAX_CONCURRENT_SESSIONS,
     DEFAULT_QUEUE_CAPACITY,
 };
-use crate::resolve::cache::{CachePool, NegativeCache, ObjectCache, SymbolCache};
+use crate::debuginfod::DebuginfodClient;
+use crate::resolve::cache::{
+    CachePool, NegativeCache, ObjectCache, ObjectCacheConfig, SymbolCache,
+};
+use crate::resolve::kernel::read_static_text_addr;
 
 /// Thin wrapper around [`parse_size::parse_size`] for clap `value_parser` compatibility.
 ///
@@ -147,7 +154,8 @@ pub struct CommonArgs {
     )]
     pub max_concurrent_sessions: usize,
 
-    /// Maximum number of global concurrent debuginfod fetches (managed by the fetch coordinator).
+    /// Maximum number of global concurrent debuginfod fetches.
+    /// Bounds total in-flight HTTP requests to debuginfod across all sessions.
     #[arg(
         long,
         default_value_t = DEFAULT_DEBUGINFOD_FETCH_CONCURRENCY,
@@ -177,16 +185,42 @@ impl CommonArgs {
     }
 
     /// Constructs the [`CachePool`] from the configured byte budgets.
-    pub fn build_caches(&self) -> CachePool {
+    ///
+    /// Each `ObjectCache` is a self-populating loading cache that
+    /// uses moka's `optionally_get_with` for fetch coalescing and the
+    /// shared `semaphore` for global fetch concurrency bounding.
+    pub fn build_caches(&self, client: Arc<dyn DebuginfodClient>) -> CachePool {
+        let semaphore = Arc::new(Semaphore::new(self.debuginfod_fetch_concurrency));
+        let negative = NegativeCache::new(
+            self.negative_cache_entries,
+            Duration::from_secs(self.negative_ttl_secs),
+            "negative",
+        );
+
         CachePool {
-            user_objects: ObjectCache::new(self.user_object_budget_bytes, self.max_pool_size),
-            kernel_objects: ObjectCache::new(self.kernel_object_budget_bytes, self.max_pool_size),
-            user_symbols: SymbolCache::new_byte_budget(self.user_symbol_budget_bytes),
-            kernel_symbols: SymbolCache::new_byte_budget(self.kernel_symbol_budget_bytes),
-            negative: NegativeCache::new(
-                self.negative_cache_entries,
-                Duration::from_secs(self.negative_ttl_secs),
-            ),
+            user_objects: ObjectCache::new(ObjectCacheConfig {
+                max_capacity_bytes: self.user_object_budget_bytes,
+                max_pool_size: self.max_pool_size,
+                client: client.clone(),
+                semaphore: semaphore.clone(),
+                negative: negative.clone(),
+                static_text_extractor: None, // user-space: no vmlinux _text extraction
+                eviction_tier: "l1",
+                eviction_space: "user",
+            }),
+            kernel_objects: ObjectCache::new(ObjectCacheConfig {
+                max_capacity_bytes: self.kernel_object_budget_bytes,
+                max_pool_size: self.max_pool_size,
+                client,
+                semaphore,
+                negative: negative.clone(),
+                static_text_extractor: Some(read_static_text_addr),
+                eviction_tier: "l1",
+                eviction_space: "kernel",
+            }),
+            user_symbols: SymbolCache::new_byte_budget(self.user_symbol_budget_bytes, "user"),
+            kernel_symbols: SymbolCache::new_byte_budget(self.kernel_symbol_budget_bytes, "kernel"),
+            negative,
         }
     }
 

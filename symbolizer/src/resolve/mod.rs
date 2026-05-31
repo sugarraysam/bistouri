@@ -26,7 +26,6 @@ use crate::telemetry::{
 use self::build_id::{BuildId, BUILD_ID_SIZE};
 use self::cache::{CachePool, CachedObject, SymbolCache};
 use self::kernel::KernelResolver;
-use crate::debuginfod::coordinator::FetchCoordinator;
 use crate::model::{
     CaptureSourceInfo, ResolvedFrame, ResolvedSession, ResolvedTrace, SymbolInfo, RESOURCE_CPU,
     RESOURCE_IO, RESOURCE_MEMORY, RESOURCE_UNKNOWN,
@@ -35,27 +34,19 @@ use bistouri_api::v1 as proto;
 
 /// Orchestrates the full symbolization pipeline for a `SessionPayload`.
 ///
-/// Generic over the debuginfod client type for static dispatch.
 /// Caches are split into kernel and user-space pools so vmlinux objects
-/// (200+ MB) are never evicted by user-space churn.
+/// (200+ MB) are never evicted by user-space churn. Fetch coalescing
+/// and concurrency bounding are handled by `ObjectCache` internally
+/// via moka's `optionally_get_with` and a shared `Semaphore`.
 pub struct SessionResolver {
     caches: CachePool,
-    coordinator: Arc<FetchCoordinator>,
     kernel: KernelResolver,
 }
 
 impl SessionResolver {
-    pub fn new(caches: CachePool, coordinator: Arc<FetchCoordinator>) -> Self {
-        let kernel = KernelResolver::new(
-            caches.kernel_objects.clone(),
-            caches.negative.clone(),
-            coordinator.clone(),
-        );
-        Self {
-            caches,
-            coordinator,
-            kernel,
-        }
+    pub fn new(caches: CachePool) -> Self {
+        let kernel = KernelResolver::new(caches.kernel_objects.clone());
+        Self { caches, kernel }
     }
 
     /// Resolves all frames in a `SessionPayload`.
@@ -136,7 +127,9 @@ impl SessionResolver {
 
     /// Ensures all unique user-space build IDs are cached.
     ///
-    /// Fetches are deduplicated and concurrency-bounded globally by the FetchCoordinator.
+    /// Fetch coalescing is handled by `ObjectCache::get_or_fetch` (moka's
+    /// `optionally_get_with`). The JoinSet drives parallelism across
+    /// different build IDs.
     async fn prefetch_user_build_ids(
         &self,
         payload: &proto::SessionPayload,
@@ -153,10 +146,8 @@ impl SessionResolver {
         let mut set = tokio::task::JoinSet::new();
         for &bid in &unique_ids {
             let cache = self.caches.user_objects.clone();
-            let negative = self.caches.negative.clone();
-            let coordinator = self.coordinator.clone();
             set.spawn(async move {
-                let obj = user::ensure_cached(&bid, &cache, &negative, coordinator.as_ref()).await;
+                let obj = cache.get_or_fetch(&bid).await;
                 (bid, obj)
             });
         }

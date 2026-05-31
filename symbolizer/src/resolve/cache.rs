@@ -2,9 +2,10 @@
 //!
 //! Three cache tiers, all built on [`moka`]'s lock-free concurrent cache:
 //!
-//! - **Object cache (L1)**: `BuildId → CachedObject` — byte-weighted LRU,
-//!   split into kernel/user pools. DWARF walks are concurrent via a
-//!   `Context` pool inside each `CachedObject`.
+//! - **Object cache (L1)**: `BuildId → CacheEntry` — byte-weighted LRU,
+//!   split into kernel/user pools. Uses `moka::future::Cache` with
+//!   built-in fetch coalescing via `optionally_get_with`. DWARF walks
+//!   are concurrent via a `Context` pool inside each `CachedObject`.
 //! - **Negative cache**: TTL-based cache for 404'd build IDs.
 //! - **Symbol cache (L2)**: `(BuildId, address) → Arc<ResolvedFrame>` —
 //!   byte-weighted with [`BYTES_PER_L2_ENTRY`] per slot for zero-copy hits.
@@ -13,12 +14,20 @@ use object::{Object, ObjectSection};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moka::sync::Cache as MokaCache;
+use moka::future::Cache as MokaFutureCache;
+use moka::sync::Cache as MokaSyncCache;
+use tokio::sync::Semaphore;
+use tracing::{debug, error};
 
-use super::build_id::BuildId;
+use super::build_id::{self, BuildId};
 use super::elf::{extract_load_segments, LoadSegment};
+use crate::debuginfod::DebuginfodClient;
 use crate::error::{Result, SymbolizerError};
 use crate::model::{ResolvedFrame, SymbolInfo};
+use crate::telemetry::{
+    METRIC_CACHE_EVICTIONS_TOTAL, METRIC_DEBUGINFOD_ERRORS, METRIC_FETCH_INFLIGHT,
+    METRIC_PARSE_FAILURES,
+};
 
 /// Groups all cache handles for the symbolization pipeline.
 ///
@@ -254,31 +263,173 @@ impl CachedObject {
     }
 }
 
+/// Optional callback for extracting the static `_text` address from
+/// raw ELF bytes before DWARF parsing.
+///
+/// Kernel vmlinux **debuginfo** files still contain the ELF symbol table
+/// (`SHT_SYMTAB`), so `_text` is available even though `.text` content
+/// is stripped. This is a `fn` pointer (not a closure) so `ObjectCache`
+/// stays `Clone`.
+pub type StaticTextExtractor = fn(&[u8]) -> Option<u64>;
+
+/// Configuration for constructing an [`ObjectCache`].
+pub struct ObjectCacheConfig {
+    /// Byte budget for moka's weighted LRU eviction.
+    pub max_capacity_bytes: u64,
+    /// Maximum DWARF context pool size per cached object.
+    pub max_pool_size: usize,
+    /// Debuginfod client for HTTP-fetching ELF bytes on cache miss.
+    pub client: Arc<dyn DebuginfodClient>,
+    /// Global concurrency limiter for debuginfod fetches.
+    pub semaphore: Arc<Semaphore>,
+    /// TTL-based negative cache for 404'd build IDs.
+    pub negative: NegativeCache,
+    /// Optional fn for extracting kernel vmlinux `_text` address
+    /// from debuginfo ELF bytes. `None` for user-space caches.
+    pub static_text_extractor: Option<StaticTextExtractor>,
+    /// Prometheus label for the `tier` dimension (e.g. `"l1"`).
+    pub eviction_tier: &'static str,
+    /// Prometheus label for the `space` dimension (e.g. `"user"`).
+    pub eviction_space: &'static str,
+}
+
 /// Byte-weighted LRU cache for parsed ELF objects.
+///
+/// Uses `moka::future::Cache` for async fetch coalescing via
+/// `optionally_get_with` — concurrent requests for the same build ID
+/// share a single HTTP fetch + ELF parse, replacing the custom
+/// `FetchCoordinator` actor.
 ///
 /// `Clone` is cheap (moka is internally `Arc`-wrapped).
 #[derive(Clone)]
 pub struct ObjectCache {
-    objects: MokaCache<BuildId, CacheEntry>,
+    objects: MokaFutureCache<BuildId, CacheEntry>,
+    negative: NegativeCache,
+    client: Arc<dyn DebuginfodClient>,
+    semaphore: Arc<Semaphore>,
     max_capacity_bytes: u64,
     max_pool_size: usize,
+    /// Extracts static `_text` vaddr from kernel debuginfo ELF bytes.
+    /// `None` for user-space caches where vmlinux addresses are irrelevant.
+    static_text_extractor: Option<StaticTextExtractor>,
 }
 
 impl ObjectCache {
-    pub fn new(max_capacity_bytes: u64, max_pool_size: usize) -> Self {
-        let max_capacity_kb = max_capacity_bytes.div_ceil(1024);
-        let builder = MokaCache::builder()
+    /// Creates a new object cache from the given configuration.
+    pub fn new(config: ObjectCacheConfig) -> Self {
+        let max_capacity_kb = config.max_capacity_bytes.div_ceil(1024);
+        let eviction_tier = config.eviction_tier;
+        let eviction_space = config.eviction_space;
+
+        let builder = MokaFutureCache::builder()
             .weigher(|_key: &BuildId, value: &CacheEntry| -> u32 {
                 let bytes = value.weight_bytes();
                 let kb = bytes.div_ceil(1024);
                 kb.try_into().unwrap_or(u32::MAX)
             })
-            .max_capacity(max_capacity_kb);
+            .max_capacity(max_capacity_kb)
+            .eviction_listener(move |_key, _value, _cause| {
+                metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL,
+                    "tier" => eviction_tier,
+                    "space" => eviction_space,
+                )
+                .increment(1);
+            });
 
         Self {
             objects: builder.build(),
-            max_capacity_bytes,
-            max_pool_size,
+            negative: config.negative,
+            client: config.client,
+            semaphore: config.semaphore,
+            max_capacity_bytes: config.max_capacity_bytes,
+            max_pool_size: config.max_pool_size,
+            static_text_extractor: config.static_text_extractor,
+        }
+    }
+
+    /// Fetches or returns a cached parsed ELF object for the given build ID.
+    ///
+    /// Uses moka's `optionally_get_with` for built-in per-key coalescing —
+    /// concurrent requests for the same build ID share a single in-flight
+    /// fetch + parse, eliminating the need for a custom coordinator actor.
+    ///
+    /// Returns `None` for 404s (negative-cached), transient errors (not
+    /// cached, retryable), and unparseable ELFs (cached as sentinel).
+    pub async fn get_or_fetch(&self, build_id: &BuildId) -> Option<Arc<CachedObject>> {
+        // Fast path: skip moka init entirely for known-bad build IDs.
+        if self.negative.is_negative(build_id) {
+            return None;
+        }
+
+        let bid = *build_id;
+        let client = self.client.clone();
+        let negative = self.negative.clone();
+        let semaphore = self.semaphore.clone();
+        let max_pool_size = self.max_pool_size;
+        // `StaticTextExtractor` is `fn(…)` — a function pointer, which is `Copy`.
+        // We copy it into the async closure so the closure owns its environment.
+        let static_text_extractor = self.static_text_extractor;
+
+        // optionally_get_with: returns cached value on hit, calls init on
+        // miss with per-key coalescing (concurrent callers for same key
+        // share the same Future). None from init = not cached by moka.
+        let entry = self
+            .objects
+            .optionally_get_with(bid, async move {
+                // Acquire global fetch concurrency permit.
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => return None, // semaphore closed during shutdown
+                };
+
+                metrics::gauge!(METRIC_FETCH_INFLIGHT).increment(1.0);
+                let hex = build_id::to_hex(&bid);
+                let result = client.fetch(&hex).await;
+                metrics::gauge!(METRIC_FETCH_INFLIGHT).decrement(1.0);
+
+                match result {
+                    Ok(Some(bytes)) => {
+                        let static_text_addr = static_text_extractor.and_then(|f| f(&bytes));
+
+                        match CachedObject::from_elf_bytes(
+                            &bytes,
+                            &hex,
+                            static_text_addr,
+                            max_pool_size,
+                        ) {
+                            Ok(parsed) => {
+                                debug!(build_id = %hex, "ELF parsed and cached");
+                                Some(CacheEntry::Parsed(Arc::new(parsed)))
+                            }
+                            Err(e) => {
+                                error!(build_id = %hex, error = %e,
+                                    "ELF parse failed, caching as unparseable");
+                                metrics::counter!(METRIC_PARSE_FAILURES).increment(1);
+                                Some(CacheEntry::Unparseable)
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Definitive 404 — negative cache to avoid re-fetch.
+                        debug!(build_id = %hex,
+                            "build_id not found in debuginfod, negative caching");
+                        negative.insert(bid);
+                        None
+                    }
+                    Err(e) => {
+                        // Transient error — do NOT cache, allow retry next session.
+                        error!(build_id = %hex, error = %e,
+                            "debuginfod fetch failed (transient, will retry)");
+                        metrics::counter!(METRIC_DEBUGINFOD_ERRORS).increment(1);
+                        None
+                    }
+                }
+            })
+            .await?;
+
+        match entry {
+            CacheEntry::Parsed(obj) => Some(obj),
+            CacheEntry::Unparseable => None,
         }
     }
 
@@ -287,25 +438,30 @@ impl ObjectCache {
         self.max_pool_size
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn contains(&self, build_id: &BuildId) -> bool {
         self.objects.contains_key(build_id)
     }
 
-    pub(crate) fn insert(&self, build_id: BuildId, entry: CacheEntry) {
-        self.objects.insert(build_id, entry);
+    /// Inserts a cache entry. This is an async operation on `future::Cache`.
+    #[allow(dead_code)]
+    pub(crate) async fn insert(&self, build_id: BuildId, entry: CacheEntry) {
+        self.objects.insert(build_id, entry).await;
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_unparseable(&self, build_id: &BuildId) -> bool {
+    #[allow(dead_code)]
+    pub(crate) async fn is_unparseable(&self, build_id: &BuildId) -> bool {
         self.objects
             .get(build_id)
+            .await
             .is_some_and(|e| matches!(&e, CacheEntry::Unparseable))
     }
 
+    #[allow(dead_code)]
     #[inline]
-    pub(crate) fn get_object(&self, build_id: &BuildId) -> Option<Arc<CachedObject>> {
-        match self.objects.get(build_id)? {
+    pub(crate) async fn get_object(&self, build_id: &BuildId) -> Option<Arc<CachedObject>> {
+        match self.objects.get(build_id).await? {
             CacheEntry::Parsed(obj) => Some(obj),
             CacheEntry::Unparseable => None,
         }
@@ -339,8 +495,8 @@ impl ObjectCache {
     /// flushes all pending operations so that `weighted_size()` and
     /// `entry_count()` return accurate values. Cost is O(pending_ops),
     /// typically microseconds.
-    pub fn run_pending_tasks(&self) {
-        self.objects.run_pending_tasks();
+    pub async fn run_pending_tasks(&self) {
+        self.objects.run_pending_tasks().await;
     }
 }
 
@@ -349,16 +505,23 @@ impl ObjectCache {
 /// `Clone` is cheap (moka is internally `Arc`-wrapped).
 #[derive(Clone)]
 pub struct NegativeCache {
-    entries: MokaCache<BuildId, ()>,
+    entries: MokaSyncCache<BuildId, ()>,
     max_capacity: u64,
 }
 
 impl NegativeCache {
-    pub fn new(capacity: u64, ttl: Duration) -> Self {
+    pub fn new(capacity: u64, ttl: Duration, eviction_tier: &'static str) -> Self {
         Self {
-            entries: MokaCache::builder()
+            entries: MokaSyncCache::builder()
                 .max_capacity(capacity)
                 .time_to_live(ttl)
+                .eviction_listener(move |_key, _value, _cause| {
+                    metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL,
+                        "tier" => eviction_tier,
+                        "space" => "shared",
+                    )
+                    .increment(1);
+                })
                 .build(),
             max_capacity: capacity,
         }
@@ -404,7 +567,7 @@ pub const BYTES_PER_L2_ENTRY: u64 = 256;
 /// compute the entry count. `Clone` is cheap (moka is internally `Arc`-wrapped).
 #[derive(Clone)]
 pub struct SymbolCache {
-    entries: MokaCache<SymbolKey, Arc<ResolvedFrame>>,
+    entries: MokaSyncCache<SymbolKey, Arc<ResolvedFrame>>,
     budget_bytes: u64,
 }
 
@@ -413,12 +576,19 @@ impl SymbolCache {
     ///
     /// Uses moka's byte-weighted eviction (matching L1 `ObjectCache`)
     /// with a fixed per-entry weight of [`BYTES_PER_L2_ENTRY`].
-    pub fn new_byte_budget(budget_bytes: u64) -> Self {
-        let builder = MokaCache::builder()
+    pub fn new_byte_budget(budget_bytes: u64, eviction_space: &'static str) -> Self {
+        let builder = MokaSyncCache::builder()
             .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
                 BYTES_PER_L2_ENTRY as u32
             })
-            .max_capacity(budget_bytes);
+            .max_capacity(budget_bytes)
+            .eviction_listener(move |_key, _value, _cause| {
+                metrics::counter!(METRIC_CACHE_EVICTIONS_TOTAL,
+                    "tier" => "l2",
+                    "space" => eviction_space,
+                )
+                .increment(1);
+            });
 
         Self {
             entries: builder.build(),
@@ -433,7 +603,7 @@ impl SymbolCache {
     pub fn new(capacity: u64) -> Self {
         let budget_bytes = capacity * BYTES_PER_L2_ENTRY;
         Self {
-            entries: MokaCache::builder()
+            entries: MokaSyncCache::builder()
                 .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
                     BYTES_PER_L2_ENTRY as u32
                 })
@@ -527,6 +697,31 @@ mod tests {
             .expect("failed to parse fixture ELF")
     }
 
+    /// Builds a test-only ObjectCache without a real client/semaphore.
+    fn make_test_object_cache(budget: u64) -> ObjectCache {
+        use crate::error::Result;
+
+        struct NoopClient;
+        #[async_trait::async_trait]
+        impl DebuginfodClient for NoopClient {
+            async fn fetch(&self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+        }
+
+        let negative = NegativeCache::new(16, Duration::from_secs(300), "negative");
+        ObjectCache::new(ObjectCacheConfig {
+            max_capacity_bytes: budget,
+            max_pool_size: 4,
+            client: Arc::new(NoopClient),
+            semaphore: Arc::new(Semaphore::new(4)),
+            negative,
+            static_text_extractor: None,
+            eviction_tier: "l1",
+            eviction_space: "test",
+        })
+    }
+
     // ── NegativeCache + ObjectCache entry behavior ─────────────────────
 
     #[rstest]
@@ -537,7 +732,7 @@ mod tests {
         #[case] should_insert: bool,
         #[case] description: &str,
     ) {
-        let cache = NegativeCache::new(16, Duration::from_secs(300));
+        let cache = NegativeCache::new(16, Duration::from_secs(300), "negative");
         let bid = dummy_build_id(bid_byte);
 
         if should_insert {
@@ -549,29 +744,30 @@ mod tests {
     #[rstest]
     #[case::missing_key(0xFF, false, false, false, "missing key: no entry")]
     #[case::unparseable(0xBB, true, true, false, "unparseable: contains=true, object=none")]
-    fn object_cache_entry_states(
+    #[tokio::test]
+    async fn object_cache_entry_states(
         #[case] bid_byte: u8,
         #[case] insert_unparseable: bool,
         #[case] expect_contains: bool,
         #[case] expect_get_object: bool,
         #[case] description: &str,
     ) {
-        let cache = ObjectCache::new(1024 * 1024, 4);
+        let cache = make_test_object_cache(1024 * 1024);
         let bid = dummy_build_id(bid_byte);
 
         if insert_unparseable {
-            cache.insert(bid, CacheEntry::Unparseable);
+            cache.insert(bid, CacheEntry::Unparseable).await;
         }
 
         assert_eq!(cache.contains(&bid), expect_contains, "{description}");
         assert_eq!(
-            cache.get_object(&bid).is_some(),
+            cache.get_object(&bid).await.is_some(),
             expect_get_object,
             "{description}"
         );
 
         if insert_unparseable {
-            assert!(cache.is_unparseable(&bid), "{description}");
+            assert!(cache.is_unparseable(&bid).await, "{description}");
         }
     }
 
@@ -583,14 +779,17 @@ mod tests {
     #[case::very_large(usize::MAX, (u32::MAX as u64) * 1024)]
     #[case::zero(0, 0)]
     #[case::normal(1024 * 1024, 1024 * 1024)]
-    fn l1_weighted_size_saturates_on_overflow(
+    #[tokio::test]
+    async fn l1_weighted_size_saturates_on_overflow(
         #[case] estimated_bytes: usize,
         #[case] expected_weight_bytes: u64,
     ) {
-        let cache = ObjectCache::new(u64::MAX, 4);
+        let cache = make_test_object_cache(u64::MAX);
         let obj = make_test_object_with_weight(estimated_bytes);
-        cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
-        cache.run_pending_tasks();
+        cache
+            .insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)))
+            .await;
+        cache.run_pending_tasks().await;
         assert_eq!(cache.weighted_size(), expected_weight_bytes);
     }
 
@@ -608,15 +807,18 @@ mod tests {
     #[case::small_object(1024, 1024, "1 KiB object")]
     #[case::megabyte_object(1_048_576, 1_048_576, "1 MiB object")]
     #[case::large_object(52_428_800, 52_428_800, "50 MiB object")]
-    fn l1_weighted_size_tracks_inserts(
+    #[tokio::test]
+    async fn l1_weighted_size_tracks_inserts(
         #[case] estimated_bytes: usize,
         #[case] expected_weight: u64,
         #[case] description: &str,
     ) {
-        let cache = ObjectCache::new(104_857_600, 4); // 100 MiB budget
+        let cache = make_test_object_cache(104_857_600); // 100 MiB budget
         let obj = make_test_object_with_weight(estimated_bytes);
-        cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
-        cache.run_pending_tasks();
+        cache
+            .insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)))
+            .await;
+        cache.run_pending_tasks().await;
         assert_eq!(cache.weighted_size(), expected_weight, "{description}");
     }
 
@@ -629,19 +831,22 @@ mod tests {
     #[case::three_in_two_budget(3, 1_048_576, 2_097_152, 2, "one evicted")]
     #[case::five_in_two_budget(5, 1_048_576, 2_097_152, 2, "three evicted")]
     #[case::exact_fit(2, 524_288, 1_048_576, 2, "exact fit, no eviction")]
-    fn l1_eviction_under_pressure(
+    #[tokio::test]
+    async fn l1_eviction_under_pressure(
         #[case] insert_count: usize,
         #[case] weight_per_object: usize,
         #[case] budget: u64,
         #[case] expected_max_entries: u64,
         #[case] description: &str,
     ) {
-        let cache = ObjectCache::new(budget, 4);
+        let cache = make_test_object_cache(budget);
         for i in 0..insert_count {
             let obj = make_test_object_with_weight(weight_per_object);
-            cache.insert(dummy_build_id(i as u8), CacheEntry::Parsed(Arc::new(obj)));
+            cache
+                .insert(dummy_build_id(i as u8), CacheEntry::Parsed(Arc::new(obj)))
+                .await;
         }
-        cache.run_pending_tasks();
+        cache.run_pending_tasks().await;
         assert!(
             cache.entry_count() <= expected_max_entries,
             "{description}: entry_count={}, expected <={}",
@@ -670,7 +875,7 @@ mod tests {
         #[case] expected_bytes: u64,
         #[case] description: &str,
     ) {
-        let cache = SymbolCache::new_byte_budget(1_000_000);
+        let cache = SymbolCache::new_byte_budget(1_000_000, "test");
         let frame = Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
         for i in 0..insert_count {
             cache.insert((dummy_build_id(0x01), i), frame.clone());
@@ -691,7 +896,7 @@ mod tests {
         #[case] description: &str,
     ) {
         let budget = budget_entries * BYTES_PER_L2_ENTRY;
-        let cache = SymbolCache::new_byte_budget(budget);
+        let cache = SymbolCache::new_byte_budget(budget, "test");
         let frame = Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
         for i in 0..insert_count {
             cache.insert((dummy_build_id(0x01), i), frame.clone());
@@ -743,14 +948,16 @@ mod tests {
     //
     // Validates that weighted_size() is accurate AFTER run_pending_tasks.
 
-    #[test]
-    fn l1_weighted_size_accurate_after_run_pending_tasks() {
-        let cache = ObjectCache::new(104_857_600, 4);
+    #[tokio::test]
+    async fn l1_weighted_size_accurate_after_run_pending_tasks() {
+        let cache = make_test_object_cache(104_857_600);
         let obj = make_test_object_with_weight(1_048_576);
-        cache.insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)));
+        cache
+            .insert(dummy_build_id(0x01), CacheEntry::Parsed(Arc::new(obj)))
+            .await;
 
         // After run_pending_tasks: must be accurate.
-        cache.run_pending_tasks();
+        cache.run_pending_tasks().await;
         assert_eq!(
             cache.weighted_size(),
             1_048_576,
@@ -760,7 +967,7 @@ mod tests {
 
     #[test]
     fn l2_weighted_size_accurate_after_run_pending_tasks() {
-        let cache = SymbolCache::new_byte_budget(1_000_000);
+        let cache = SymbolCache::new_byte_budget(1_000_000, "test");
         let frame = Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
         cache.insert((dummy_build_id(0x01), 0x1000), frame);
 

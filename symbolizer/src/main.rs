@@ -65,19 +65,21 @@ async fn async_main(args: Args) -> anyhow::Result<()> {
         "starting bistouri-symbolizer"
     );
 
-    let caches = common.build_caches();
+    // Build the debuginfod client.
+    let http_client = HttpDebuginfodClient::new(common.debuginfod_url.clone())
+        .map_err(|e| anyhow::anyhow!("failed to create debuginfod client: {e:#}"))?;
+    let client = common.build_client(http_client);
+
+    // Client must be created before caches — ObjectCache is a loading cache
+    // that holds a reference to the debuginfod client.
+    let caches = common.build_caches(client);
     let config = common.build_daemon_config()?;
 
     // Log-only sink — for production storage, build a custom binary
     // with your own SessionSink implementation.
     let sink = Arc::new(LogSink);
 
-    // Build the debuginfod client.
-    let http_client = HttpDebuginfodClient::new(common.debuginfod_url.clone())
-        .map_err(|e| anyhow::anyhow!("failed to create debuginfod client: {e:#}"))?;
-    let client = common.build_client(http_client);
-
-    let daemon = SymbolizerDaemon::start(config, client, sink, caches).await?;
+    let daemon = SymbolizerDaemon::start(config, sink, caches).await?;
 
     tokio::signal::ctrl_c().await?;
     info!("received Ctrl-C, shutting down");

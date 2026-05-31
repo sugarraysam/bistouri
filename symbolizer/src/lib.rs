@@ -23,7 +23,7 @@
 //! }
 //!
 //! // Wire it in — the symbolizer library handles everything:
-//! let daemon = SymbolizerDaemon::start(config, client, Arc::new(ClickHouseSink { }), caches).await?;
+//! let daemon = SymbolizerDaemon::start(config, Arc::new(ClickHouseSink { }), caches).await?;
 //! tokio::signal::ctrl_c().await?;
 //! daemon.shutdown().await;
 //! ```

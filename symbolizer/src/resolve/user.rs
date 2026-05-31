@@ -1,91 +1,23 @@
 //! User-space frame resolution.
 //!
-//! Pipeline: build_id → debuginfod fetch → ELF parse → PT_LOAD match →
-//! vaddr → addr2line DWARF lookup → SymbolInfo.
+//! Pipeline: build_id → ObjectCache::get_or_fetch (moka-coalesced) →
+//! PT_LOAD match → vaddr → addr2line DWARF lookup → SymbolInfo.
 
 use std::sync::Arc;
 
 use std::time::Instant;
 
 use metrics::{counter, histogram};
-use tracing::{debug, error};
+use tracing::debug;
 
-use crate::telemetry::{
-    METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_DEBUGINFOD_ERRORS, METRIC_LATENCY_SECONDS,
-    METRIC_PARSE_FAILURES,
-};
+use crate::telemetry::{METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_LATENCY_SECONDS};
 
 use super::build_id::{self, BuildId, BUILD_ID_SIZE};
-use super::cache::{CacheEntry, CachedObject, NegativeCache, ObjectCache, SymbolCache};
+use super::cache::{CachedObject, SymbolCache};
 use super::elf::translate_file_offset;
-use crate::error::Result;
 use crate::model::{ResolvedFrame, SymbolInfo};
 
-use crate::debuginfod::coordinator::FetchCoordinator;
 use std::collections::HashMap;
-
-/// Ensures a parsed ELF object is available in the cache for the given build ID.
-///
-/// Fetches from debuginfod if missing. Returns the parsed object if successfully obtained,
-/// or `None` if it could not be retrieved.
-///
-/// Negative cache policy: 404 and parse errors are negative-cached.
-/// Transient network errors are NOT — allowing retry on the next session.
-pub(crate) async fn ensure_cached(
-    build_id: &BuildId,
-    cache: &ObjectCache,
-    negative: &NegativeCache,
-    coordinator: &FetchCoordinator,
-) -> Option<Arc<CachedObject>> {
-    if let Some(obj) = cache.get_object(build_id) {
-        return Some(obj);
-    }
-
-    if cache.contains(build_id) || negative.is_negative(build_id) {
-        return None;
-    }
-
-    let hex = build_id::to_hex(build_id);
-
-    // Try debuginfo first (has DWARF + symtab), fall back to executable.
-    let elf_bytes = match fetch_elf(coordinator, build_id).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            // Definitive 404 — negative cache.
-            debug!(build_id = %hex, "build_id not found in debuginfod, negative caching");
-            negative.insert(*build_id);
-            return None;
-        }
-        Err(e) => {
-            // Transient error — do NOT negative cache, allow retry.
-            error!(build_id = %hex, error = %e, "debuginfod fetch failed (transient, will retry)");
-            counter!(METRIC_DEBUGINFOD_ERRORS).increment(1);
-            return None;
-        }
-    };
-
-    match CachedObject::from_elf_bytes(&elf_bytes, &hex, None, cache.max_pool_size()) {
-        Ok(parsed) => {
-            let obj = Arc::new(parsed);
-            cache.insert(*build_id, CacheEntry::Parsed(obj.clone()));
-            Some(obj)
-        }
-        Err(e) => {
-            // Parse failure is definitive — cache as unparseable sentinel.
-            error!(build_id = %hex, error = %e, "ELF parse failed, caching as unparseable");
-            counter!(METRIC_PARSE_FAILURES).increment(1);
-            cache.insert(*build_id, CacheEntry::Unparseable);
-            None
-        }
-    }
-}
-
-async fn fetch_elf(
-    coordinator: &FetchCoordinator,
-    build_id: &BuildId,
-) -> Result<Option<Arc<[u8]>>> {
-    coordinator.fetch(build_id).await
-}
 
 /// Resolves a single user-space frame (build_id + file_offset) to symbols.
 ///

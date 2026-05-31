@@ -5,7 +5,6 @@
 //! - `GET /buildid/<hex_build_id>/debuginfo`  → DWARF debuginfo
 
 pub mod concurrent;
-pub mod coordinator;
 pub mod filesystem;
 pub mod http;
 pub mod tiered;
