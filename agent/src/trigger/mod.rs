@@ -19,7 +19,7 @@ use config::TriggerConfig;
 use error::Result;
 use matcher::CommMatcher;
 use proc::ProcWalker;
-use psi::{PsiRegisterResult, PsiRegistry, PsiRegistryKey};
+use psi::{PsiRegisterResult, PsiRegistry, WatcherKey};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -148,6 +148,9 @@ impl PreparedTriggerAgent {
 
         let (psi_registry, watcher_exit_rx) = PsiRegistry::new(capture_tx, request_cooldown);
 
+        let sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+            .expect("failed to register SIGUSR1 handler");
+
         let mut agent = TriggerAgent {
             config: self.config,
             matcher,
@@ -163,6 +166,7 @@ impl PreparedTriggerAgent {
             control_rx,
             tenant_id: self.tenant_id,
             agent_labels: self.agent_labels,
+            sigusr1,
         };
 
         let task_handle = tokio::spawn(async move {
@@ -180,7 +184,7 @@ struct TriggerAgent {
     psi_registry: PsiRegistry,
     /// Receives registry keys from PSI watcher tasks when they exit
     /// (cgroup deleted, process died). Drives immediate gauge updates.
-    watcher_exit_rx: mpsc::UnboundedReceiver<PsiRegistryKey>,
+    watcher_exit_rx: mpsc::UnboundedReceiver<WatcherKey>,
     proc_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     cancel: CancellationToken,
@@ -190,6 +194,8 @@ struct TriggerAgent {
     control_rx: mpsc::Receiver<TriggerControl>,
     tenant_id: String,
     agent_labels: HashMap<String, String>,
+    /// SIGUSR1 listener for PSI watcher diagnostic dump.
+    sigusr1: tokio::signal::unix::Signal,
 }
 
 impl TriggerAgent {
@@ -206,6 +212,10 @@ impl TriggerAgent {
                 // (cgroup deleted / process died), remove it immediately.
                 Some(dead_key) = self.watcher_exit_rx.recv() => {
                     self.psi_registry.remove(&dead_key);
+                },
+                // SIGUSR1: dump all active PSI watchers for diagnostics.
+                _ = self.sigusr1.recv() => {
+                    self.psi_registry.dump();
                 },
                 event = self.event_rx.recv() => match event {
                     None => break,

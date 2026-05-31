@@ -20,7 +20,7 @@ use tracing::{debug, error, info};
 
 use crate::telemetry::{
     METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_DWARF_WALK_SECONDS, METRIC_FRAMES_PER_SESSION,
-    METRIC_LATENCY_SECONDS, METRIC_PREFETCH_SECONDS, METRIC_SPAWN_BLOCKING_WAIT_SECONDS,
+    METRIC_PREFETCH_SECONDS, METRIC_SPAWN_BLOCKING_WAIT_SECONDS,
 };
 
 use self::build_id::{BuildId, BUILD_ID_SIZE};
@@ -247,7 +247,7 @@ fn resolve_session_blocking(
     // Record per-session aggregate DWARF walk time.
     // This captures the total CPU cost of all addr2line lookups in the session.
     let dwarf_elapsed = dwarf_walk_start.elapsed().as_secs_f64();
-    histogram!(METRIC_DWARF_WALK_SECONDS, "space" => "aggregate").record(dwarf_elapsed);
+    histogram!(METRIC_DWARF_WALK_SECONDS).record(dwarf_elapsed);
 
     // Move metadata out of the payload — no cloning.
     let metadata = payload.metadata.as_ref();
@@ -335,19 +335,13 @@ fn resolve_kernel_frame_blocking(
     pinned_kernel_object: &Option<Arc<CachedObject>>,
     symbols: &SymbolCache,
 ) -> Arc<ResolvedFrame> {
-    let start_time = Instant::now();
-
     let Some(bid) = kernel_bid else {
         counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "kernel").increment(1);
-        histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
-            .record(start_time.elapsed().as_secs_f64());
         return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
     };
 
     let Some(obj) = pinned_kernel_object else {
         counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "kernel").increment(1);
-        histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
-            .record(start_time.elapsed().as_secs_f64());
         return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
     };
     counter!(METRIC_CACHE_HITS, "kind" => "object", "space" => "kernel").increment(1);
@@ -363,16 +357,12 @@ fn resolve_kernel_frame_blocking(
     let key = (*bid, vmlinux_vaddr);
     if let Some(cached) = symbols.get(&key) {
         counter!(METRIC_CACHE_HITS, "kind" => "symbol", "space" => "kernel").increment(1);
-        histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
-            .record(start_time.elapsed().as_secs_f64());
         return cached;
     }
     counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "kernel").increment(1);
 
     let frame = Arc::new(kernel::resolve_kernel_addr(obj, vmlinux_vaddr));
     symbols.insert(key, frame.clone());
-    histogram!(METRIC_LATENCY_SECONDS, "phase" => "kernel")
-        .record(start_time.elapsed().as_secs_f64());
     frame
 }
 

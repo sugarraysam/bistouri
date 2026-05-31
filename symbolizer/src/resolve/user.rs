@@ -5,12 +5,10 @@
 
 use std::sync::Arc;
 
-use std::time::Instant;
-
-use metrics::{counter, histogram};
+use metrics::counter;
 use tracing::debug;
 
-use crate::telemetry::{METRIC_CACHE_HITS, METRIC_CACHE_MISSES, METRIC_LATENCY_SECONDS};
+use crate::telemetry::{METRIC_CACHE_HITS, METRIC_CACHE_MISSES};
 
 use super::build_id::{self, BuildId, BUILD_ID_SIZE};
 use super::cache::{CachedObject, SymbolCache};
@@ -28,14 +26,11 @@ pub(crate) fn resolve_frame(
     pinned_user_objects: &HashMap<BuildId, Arc<CachedObject>>,
     symbols: &SymbolCache,
 ) -> Arc<ResolvedFrame> {
-    let start_time = Instant::now();
     let key = (*build_id, file_offset);
 
     // L2 symbol cache hit — zero-copy Arc return.
     if let Some(cached) = symbols.get(&key) {
         counter!(METRIC_CACHE_HITS, "kind" => "symbol", "space" => "user").increment(1);
-        histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
-            .record(start_time.elapsed().as_secs_f64());
         return cached;
     }
     // Don't count L2 miss yet — it's only a real miss if L1 has the
@@ -45,8 +40,6 @@ pub(crate) fn resolve_frame(
 
     let Some(obj) = pinned_user_objects.get(build_id) else {
         counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "user").increment(1);
-        histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
-            .record(start_time.elapsed().as_secs_f64());
         return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
     };
     counter!(METRIC_CACHE_HITS, "kind" => "object", "space" => "user").increment(1);
@@ -62,8 +55,6 @@ pub(crate) fn resolve_frame(
 
     // Populate L2 for future lookups.
     symbols.insert(key, frame.clone());
-    histogram!(METRIC_LATENCY_SECONDS, "phase" => "user")
-        .record(start_time.elapsed().as_secs_f64());
     frame
 }
 

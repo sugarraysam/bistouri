@@ -12,10 +12,6 @@ pub const METRIC_CACHE_HITS: &str = "symbolizer_cache_hits";
 /// Labels: `kind` = "object" | "symbol", `space` = "user" | "kernel".
 pub const METRIC_CACHE_MISSES: &str = "symbolizer_cache_misses";
 
-/// Symbolization latency in seconds (histogram).
-/// Labels: `phase` = "total" | "user" | "kernel".
-pub const METRIC_LATENCY_SECONDS: &str = "symbolizer_latency_seconds";
-
 /// Total resolution requests.
 pub const METRIC_RESOLUTIONS_TOTAL: &str = "symbolizer_resolutions_total";
 
@@ -69,9 +65,9 @@ pub const METRIC_CACHE_EVICTIONS_TOTAL: &str = "symbolizer_cache_evictions_total
 /// Labels: `tier` = "l1" | "l2", `space` = "user" | "kernel".
 pub const METRIC_CACHE_ENTRY_COUNT: &str = "symbolizer_cache_entry_count";
 
-/// Per-session aggregate DWARF walk time (addr2line), excluding L2 cache hits (histogram).
+/// Per-session aggregate DWARF walk time (addr2line), excluding L2 cache hits.
 /// Recorded once per session (not per-frame) to avoid Summary quantile estimation
-/// noise at high observation rates. Labels: `space` = "aggregate".
+/// noise at high observation rates.
 pub const METRIC_DWARF_WALK_SECONDS: &str = "symbolizer_dwarf_walk_seconds";
 
 /// Number of frames resolved per session (histogram).
@@ -95,10 +91,7 @@ pub const METRIC_FETCH_INFLIGHT: &str = "symbolizer_fetch_inflight";
 pub fn describe_all() {
     metrics::describe_counter!(METRIC_CACHE_HITS, "Cache hits for objects and symbols");
     metrics::describe_counter!(METRIC_CACHE_MISSES, "Cache misses for objects and symbols");
-    metrics::describe_histogram!(
-        METRIC_LATENCY_SECONDS,
-        "Symbolization latency in seconds (total, user, kernel)"
-    );
+
     metrics::describe_counter!(
         METRIC_RESOLUTIONS_TOTAL,
         "Total resolution requests processed"

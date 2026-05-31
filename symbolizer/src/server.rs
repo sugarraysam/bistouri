@@ -13,16 +13,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, gauge};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
 use crate::telemetry::{
-    METRIC_INFLIGHT_SESSIONS, METRIC_LATENCY_SECONDS, METRIC_RESOLUTIONS_ERROR,
-    METRIC_RESOLUTIONS_SUCCESS, METRIC_RESOLUTIONS_TOTAL, METRIC_RX_QUEUE_DEPTH,
-    METRIC_SESSIONS_DROPPED, METRIC_SESSIONS_ENQUEUED,
+    METRIC_INFLIGHT_SESSIONS, METRIC_RESOLUTIONS_ERROR, METRIC_RESOLUTIONS_SUCCESS,
+    METRIC_RESOLUTIONS_TOTAL, METRIC_RX_QUEUE_DEPTH, METRIC_SESSIONS_DROPPED,
+    METRIC_SESSIONS_ENQUEUED,
 };
 
 use crate::resolve::SessionResolver;
@@ -230,8 +230,6 @@ async fn process_session<S>(
         return;
     }
 
-    histogram!(METRIC_LATENCY_SECONDS, "phase" => "total")
-        .record(start_time.elapsed().as_secs_f64());
     counter!(METRIC_RESOLUTIONS_SUCCESS).increment(1);
 
     debug!(
