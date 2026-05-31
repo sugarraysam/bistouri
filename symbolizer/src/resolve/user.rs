@@ -36,8 +36,6 @@ pub(crate) fn resolve_frame(
     // Don't count L2 miss yet — it's only a real miss if L1 has the
     // object (otherwise L2 can never contain this entry).
 
-    let hex = build_id::to_hex(build_id);
-
     let Some(obj) = pinned_user_objects.get(build_id) else {
         counter!(METRIC_CACHE_MISSES, "kind" => "object", "space" => "user").increment(1);
         return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
@@ -47,6 +45,9 @@ pub(crate) fn resolve_frame(
     // L1 hit but L2 missed — THIS is a real L2 miss (the entry is resolvable
     // but wasn't cached yet). After warmup this counter should be near-zero.
     counter!(METRIC_CACHE_MISSES, "kind" => "symbol", "space" => "user").increment(1);
+
+    // to_hex is deferred past L2/L1 checks — only needed for DWARF walks.
+    let hex = build_id::to_hex(build_id);
 
     // DWARF walk: pure CPU cost. Per-session aggregate timing is recorded
     // in resolve_session_blocking(); no per-frame histogram here to avoid
@@ -61,25 +62,14 @@ pub(crate) fn resolve_frame(
 /// Performs the actual symbolization against a cached ELF object.
 fn resolve_from_object(obj: &CachedObject, file_offset: u64, build_id_hex: &str) -> ResolvedFrame {
     // file_offset → vaddr via PT_LOAD segment matching.
+    // Success path is deliberately silent — it runs for every frame and the
+    // previous debug!() with format!("0x{v:x}") was a major source of
+    // per-frame allocations + tracing subscriber contention.
     let vaddr = match translate_file_offset(&obj.segments, file_offset, build_id_hex) {
-        Ok(v) => {
-            debug!(
-                build_id = build_id_hex,
-                file_offset = file_offset,
-                vaddr = format!("0x{v:x}"),
-                segments = obj.segments.len(),
-                "file_offset → vaddr translation succeeded"
-            );
-            v
-        }
+        Ok(v) => v,
         Err(e) => {
-            debug!(
-                build_id = build_id_hex,
-                file_offset = file_offset,
-                segments = obj.segments.len(),
-                error = %e,
-                "file_offset → vaddr translation failed"
-            );
+            // Only log failures — they are rare and diagnostically important.
+            debug!(build_id = build_id_hex, file_offset, error = %e, "vaddr translation failed");
             return ResolvedFrame::Symbolized(SymbolInfo::unknown());
         }
     };

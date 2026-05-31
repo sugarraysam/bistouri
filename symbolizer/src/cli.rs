@@ -240,10 +240,19 @@ impl CommonArgs {
     /// Resolution: `--log-level` flag > `RUST_LOG` env > `"info"`.
     pub fn init_logging(&self) {
         let filter = self.log_level.as_deref().unwrap_or("info").to_string();
+        // Use a non-blocking writer to avoid stdout mutex contention on the
+        // hot DWARF resolution path. Without this, all spawn_blocking threads
+        // serialize on Stdout::lock() for every tracing event — the dominant
+        // CPU bottleneck under L2 cache pressure.
+        let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
             .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
+            .with_writer(non_blocking)
             .init();
+        // Leak the guard so it lives for the process lifetime.
+        // The OS flushes stdout on process exit.
+        std::mem::forget(guard);
     }
 
     /// Starts the Prometheus metrics exporter on `0.0.0.0:{metrics_port}`.

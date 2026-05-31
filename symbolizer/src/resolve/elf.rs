@@ -57,7 +57,6 @@ impl LoadSegment {
 /// `p_filesz == 0` (BSS-only) since they have no file data to match.
 pub(crate) fn extract_load_segments<'data>(object: &object::read::File<'data>) -> Vec<LoadSegment> {
     use object::ObjectSegment;
-    use tracing::debug;
 
     let segments: Vec<LoadSegment> = object
         .segments()
@@ -74,16 +73,7 @@ pub(crate) fn extract_load_segments<'data>(object: &object::read::File<'data>) -
         })
         .collect();
 
-    debug!(count = segments.len(), "extracted load segments");
-    for (i, s) in segments.iter().enumerate() {
-        debug!(
-            idx = i,
-            p_offset = format!("0x{:x}", s.p_offset),
-            p_vaddr = format!("0x{:x}", s.p_vaddr),
-            p_filesz = format!("0x{:x}", s.p_filesz),
-            "  segment"
-        );
-    }
+    tracing::debug!(count = segments.len(), "extracted load segments");
 
     segments
 }
