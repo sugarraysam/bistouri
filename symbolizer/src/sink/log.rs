@@ -1,11 +1,11 @@
 //! Log-based sink for development and debugging.
 //!
-//! Logs each resolved session's traces at INFO level with function names,
+//! Logs each resolved session's traces at DEBUG level with function names,
 //! sample counts, and source locations.
 
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::debug;
 
 use super::{SessionSink, SinkError};
 use crate::model::{ResolvedFrame, ResolvedSession, SymbolInfo};
@@ -17,7 +17,7 @@ pub struct LogSink;
 #[async_trait::async_trait]
 impl SessionSink for LogSink {
     async fn store(&self, session: ResolvedSession) -> std::result::Result<(), SinkError> {
-        info!(
+        debug!(
             session_id = %session.session_id,
             tenant_id = %session.tenant_id,
             service_id = %session.service_id,
@@ -29,7 +29,7 @@ impl SessionSink for LogSink {
 
         for (i, trace) in session.traces.iter().enumerate() {
             let samples = trace.on_cpu_count + trace.off_cpu_count;
-            info!(
+            debug!(
                 trace = i,
                 on_cpu = trace.on_cpu_count,
                 off_cpu = trace.off_cpu_count,
@@ -38,14 +38,14 @@ impl SessionSink for LogSink {
             );
 
             if !trace.kernel_frames.is_empty() {
-                info!("  kernel stack:");
+                debug!("  kernel stack:");
                 for frame in &trace.kernel_frames {
                     log_frame(frame, "    ");
                 }
             }
 
             if !trace.user_frames.is_empty() {
-                info!("  user stack:");
+                debug!("  user stack:");
                 for frame in &trace.user_frames {
                     log_frame(frame, "    ");
                 }
@@ -75,13 +75,13 @@ fn log_frame(frame: &Arc<ResolvedFrame>, indent: &str) {
 fn log_symbol(sym: &SymbolInfo, prefix: &str) {
     match (&sym.file, sym.line) {
         (Some(file), Some(line)) => {
-            info!("{prefix}{} at {file}:{line}", sym.function);
+            debug!("{prefix}{} at {file}:{line}", sym.function);
         }
         (Some(file), None) => {
-            info!("{prefix}{} at {file}", sym.function);
+            debug!("{prefix}{} at {file}", sym.function);
         }
         _ => {
-            info!("{prefix}{}", sym.function);
+            debug!("{prefix}{}", sym.function);
         }
     }
 }

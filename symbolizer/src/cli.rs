@@ -244,7 +244,15 @@ impl CommonArgs {
         // hot DWARF resolution path. Without this, all spawn_blocking threads
         // serialize on Stdout::lock() for every tracing event — the dominant
         // CPU bottleneck under L2 cache pressure.
-        let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
+        //
+        // CRITICAL: use lossy mode (bounded channel). The default unbounded
+        // channel accumulates log messages via crossbeam mmap'd segments
+        // faster than stdout can drain under stress — growing anonymous
+        // memory to 4+ GiB and triggering OOMKill. Lossy mode drops excess
+        // log messages instead of queuing them.
+        let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .lossy(true)
+            .finish(std::io::stdout());
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
             .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())

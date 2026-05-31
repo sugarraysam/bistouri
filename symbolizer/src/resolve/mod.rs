@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use metrics::{counter, histogram};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// Per-session accumulator for frame-level cache metrics.
 ///
@@ -349,7 +349,7 @@ fn resolve_session_blocking(
     // Extract labels from metadata.
     let labels = metadata.map(|m| m.labels.clone()).unwrap_or_default();
 
-    info!(
+    debug!(
         session_id = %payload.session_id,
         comm = %comm,
         tenant_id = %payload.tenant_id,
