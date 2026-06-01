@@ -164,9 +164,15 @@ impl SessionResolver {
 
     /// Ensures all unique user-space build IDs are cached.
     ///
-    /// Fetch coalescing is handled by `ObjectCache::get_or_fetch` (moka's
-    /// `optionally_get_with`). The JoinSet drives parallelism across
-    /// different build IDs.
+    /// **Fast-path optimization**: probes the L1 object cache before spawning
+    /// a JoinSet task. In steady state the vast majority of build IDs are
+    /// already cached — resolving them inline avoids the per-task overhead
+    /// of `RawTask::new`, `OwnedTasks::bind` (parking_lot mutex), and
+    /// scheduler notification that was consuming 34% of profiled CPU.
+    ///
+    /// Only genuine cache misses (requiring an HTTP fetch from debuginfod)
+    /// are spawned as JoinSet tasks for parallel I/O. Fetch coalescing is
+    /// still handled by `ObjectCache::get_or_fetch` (moka `optionally_get_with`).
     async fn prefetch_user_build_ids(
         &self,
         payload: &proto::SessionPayload,
@@ -180,8 +186,27 @@ impl SessionResolver {
             .filter(|bid| seen.insert(*bid))
             .collect();
 
+        let mut pinned = HashMap::with_capacity(unique_ids.len());
         let mut set = tokio::task::JoinSet::new();
+
         for &bid in &unique_ids {
+            // Fast path: already in L1 object cache — resolve inline.
+            // `contains()` is a synchronous probe (no task spawn, no mutex).
+            // TOCTOU gap is benign: if the entry is evicted between `contains()`
+            // and `get_or_fetch()`, moka handles the miss via coalesced fetch.
+            if self.caches.user_objects.contains(&bid) {
+                if let Some(obj) = self.caches.user_objects.get_or_fetch(&bid).await {
+                    pinned.insert(bid, obj);
+                }
+                continue;
+            }
+
+            // Negative-cached (404) — skip entirely, no task needed.
+            if self.caches.negative.is_negative(&bid) {
+                continue;
+            }
+
+            // True cache miss — spawn for parallel HTTP fetch.
             let cache = self.caches.user_objects.clone();
             set.spawn(async move {
                 let obj = cache.get_or_fetch(&bid).await;
@@ -189,7 +214,6 @@ impl SessionResolver {
             });
         }
 
-        let mut pinned = HashMap::with_capacity(unique_ids.len());
         while let Some(res) = set.join_next().await {
             if let Ok((bid, Some(obj))) = res {
                 pinned.insert(bid, obj);
@@ -199,6 +223,7 @@ impl SessionResolver {
         debug!(
             unique_build_ids = unique_ids.len(),
             pinned_objects = pinned.len(),
+            spawned_fetches = set.len(),
             session_id = %payload.session_id,
             "user build IDs prefetched"
         );
@@ -229,6 +254,20 @@ fn resolve_session_blocking(
     // Batch per-frame cache metrics — flushed once at session end.
     let mut user_stats = FrameStats::default();
     let mut kernel_stats = FrameStats::default();
+
+    // Pre-build mapping_index → (build_id, cached_object) lookup table.
+    // Converts per-frame O(hash) HashMap probe + try_from length check
+    // into O(1) Vec index. Many frames share the same mapping, so the
+    // HashMap lookup was redundant work — this was 10% of profiled CPU.
+    let mapping_lookup: Vec<Option<(&[u8; BUILD_ID_SIZE], &Arc<CachedObject>)>> = payload
+        .mappings
+        .iter()
+        .map(|m| {
+            let bid = <&[u8; BUILD_ID_SIZE]>::try_from(m.build_id.as_slice()).ok()?;
+            let obj = pinned_user_objects.get(bid)?;
+            Some((bid, obj))
+        })
+        .collect();
 
     let traces: Vec<ResolvedTrace> = payload
         .traces
@@ -261,8 +300,7 @@ fn resolve_session_blocking(
                         .map(|uf| {
                             resolve_user_frame(
                                 uf,
-                                &payload.mappings,
-                                &pinned_user_objects,
+                                &mapping_lookup,
                                 &caches.user_symbols,
                                 &mut user_stats,
                             )
@@ -415,31 +453,30 @@ fn resolve_kernel_frame_blocking(
 }
 
 /// Resolves a single user-space frame from its proto representation.
+///
+/// Uses the pre-built `mapping_lookup` table for O(1) mapping resolution
+/// instead of per-frame HashMap probes.
 fn resolve_user_frame(
     frame: &proto::UserFrame,
-    mappings: &[proto::Mapping],
-    pinned_user_objects: &HashMap<BuildId, Arc<CachedObject>>,
+    mapping_lookup: &[Option<(&[u8; BUILD_ID_SIZE], &Arc<CachedObject>)>],
     symbols: &SymbolCache,
     stats: &mut FrameStats,
 ) -> Arc<ResolvedFrame> {
     match frame.frame.as_ref() {
         Some(proto::user_frame::Frame::Resolved(resolved)) => {
-            let mapping = mappings.get(resolved.mapping_index as usize);
-            match mapping {
-                Some(m) => {
-                    if let Ok(build_id) = <&[u8; BUILD_ID_SIZE]>::try_from(m.build_id.as_slice()) {
-                        user::resolve_frame(
-                            build_id,
-                            resolved.file_offset,
-                            pinned_user_objects,
-                            symbols,
-                            stats,
-                        )
-                    } else {
-                        Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()))
-                    }
+            match mapping_lookup
+                .get(resolved.mapping_index as usize)
+                .copied()
+                .flatten()
+            {
+                Some((build_id, obj)) => {
+                    stats.l1_hits += 1;
+                    user::resolve_frame(build_id, resolved.file_offset, obj, symbols, stats)
                 }
-                None => Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown())),
+                None => {
+                    stats.l1_misses += 1;
+                    Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()))
+                }
             }
         }
         Some(proto::user_frame::Frame::Placeholder(ph)) => Arc::new(ResolvedFrame::Symbolized(

@@ -37,26 +37,26 @@ e2e_error() { echo -e "${RED}[${E2E_LOG_PREFIX}]${NC} $*" >&2; }
 nuke_k3s() {
     e2e_info "Nuking k3s state..."
 
-    sudo k3s crictl rm -fa 2>&1 >/dev/null || true
-    sudo k3s crictl rmi --prune 2>&1 >/dev/null || true
+    sudo k3s crictl rm -fa >/dev/null 2>&1 || true
+    sudo k3s crictl rmi --prune >/dev/null 2>&1 || true
 
     if systemctl is-active --quiet k3s 2>/dev/null; then
         sudo systemctl stop k3s
     fi
 
     # Kill all lingering processes, containers, and clear iptables
-    sudo k3s-killall.sh 2>/dev/null || true
-    sudo pkill -9 "k3s" 2>/dev/null || true
+    sudo k3s-killall.sh >/dev/null 2>&1 || true
+    sudo pkill -9 "k3s" >/dev/null 2>&1 || true
 
     # (1) Wipe the ENTIRE k3s state directory (not just the DB)
     # (2) Wipe the CNI configuration (CRITICAL for fixing CIDRAssignmentFailed)
     # (3) Clear out lingering kubelet pod state
-    sudo rm -rf /var/lib/rancher/k3s || true
-    sudo rm -rf /etc/cni/net.d || true
-    sudo rm -rf /var/lib/kubelet/pods 2>/dev/null || true
+    sudo rm -rf /var/lib/rancher/k3s >/dev/null 2>&1 || true
+    sudo rm -rf /etc/cni/net.d >/dev/null 2>&1 || true
+    sudo rm -rf /var/lib/kubelet/pods >/dev/null 2>&1 || true
 
     # fix tty
-    stty sane 2>/dev/null || true
+    stty sane >/dev/null 2>&1 || true
 }
 
 # Start a fresh k3s cluster from scratch and wait for readiness.

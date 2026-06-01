@@ -7,15 +7,17 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use super::build_id::{self, BuildId, BUILD_ID_SIZE};
+use super::build_id::{self, BUILD_ID_SIZE};
 use super::cache::{CachedObject, SymbolCache};
 use super::FrameStats;
 use crate::model::{ResolvedFrame, SymbolInfo};
 
 use super::elf::translate_file_offset;
-use std::collections::HashMap;
 
 /// Resolves a single user-space frame (build_id + file_offset) to symbols.
+///
+/// The `CachedObject` is provided directly by the caller via the pre-built
+/// mapping-index lookup table — no per-frame HashMap probe needed.
 ///
 /// Must be called from a `spawn_blocking` context (addr2line is CPU-bound).
 /// Cache hit/miss counts are accumulated in `stats` and flushed once per
@@ -23,7 +25,7 @@ use std::collections::HashMap;
 pub(crate) fn resolve_frame(
     build_id: &[u8; BUILD_ID_SIZE],
     file_offset: u64,
-    pinned_user_objects: &HashMap<BuildId, Arc<CachedObject>>,
+    obj: &CachedObject,
     symbols: &SymbolCache,
     stats: &mut FrameStats,
 ) -> Arc<ResolvedFrame> {
@@ -34,20 +36,9 @@ pub(crate) fn resolve_frame(
         stats.l2_hits += 1;
         return cached;
     }
-    // Don't count L2 miss yet — it's only a real miss if L1 has the
-    // object (otherwise L2 can never contain this entry).
-
-    let Some(obj) = pinned_user_objects.get(build_id) else {
-        stats.l1_misses += 1;
-        return Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
-    };
-    stats.l1_hits += 1;
-
-    // L1 hit but L2 missed — THIS is a real L2 miss (the entry is resolvable
-    // but wasn't cached yet). After warmup this counter should be near-zero.
     stats.l2_misses += 1;
 
-    // to_hex is deferred past L2/L1 checks — only needed for DWARF walks.
+    // to_hex is deferred past L2 check — only needed for DWARF walks.
     let hex = build_id::to_hex(build_id);
 
     // DWARF walk: pure CPU cost. Per-session aggregate timing is recorded
