@@ -33,9 +33,9 @@ pub mod daemon;
 pub mod debuginfod;
 pub mod model;
 pub mod resolve;
-pub mod server;
+pub(crate) mod server;
 pub mod sink;
 
 pub mod error;
-pub mod log_agg;
+pub(crate) mod log_agg;
 pub mod telemetry;

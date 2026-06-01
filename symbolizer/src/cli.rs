@@ -4,6 +4,8 @@
 //! `Args` struct. This is the single source of truth for all symbolizer
 //! daemon configuration — no duplication, no skew.
 //!
+//! Also exports [`clap_styles`] and [`parse_memory_size`] for use by
+//! downstream binaries that need consistent CLI styling and size parsing.
 //! ```ignore
 //! use bistouri_symbolizer::cli::CommonArgs;
 //!
@@ -20,6 +22,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use clap::builder::styling::{AnsiColor, Color, Style, Styles};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -39,8 +43,40 @@ use crate::resolve::kernel::read_static_text_addr;
 /// `parse_size::parse_size` is generic over `impl AsRef<str>`, producing a
 /// monomorphized function that doesn't satisfy clap's `for<'a> Fn(&'a str)`
 /// higher-ranked lifetime bound. This concrete wrapper fixes the lifetime.
-fn parse_memory_size(s: &str) -> Result<u64, parse_size::Error> {
+pub fn parse_memory_size(s: &str) -> Result<u64, parse_size::Error> {
     parse_size::parse_size(s)
+}
+
+/// Consistent CLI color scheme shared by all symbolizer binaries.
+pub fn clap_styles() -> Styles {
+    Styles::styled()
+        .header(
+            Style::new()
+                .bold()
+                .fg_color(Some(Color::Ansi(AnsiColor::Yellow))),
+        )
+        .usage(
+            Style::new()
+                .bold()
+                .fg_color(Some(Color::Ansi(AnsiColor::Green))),
+        )
+        .literal(Style::new().fg_color(Some(Color::Ansi(AnsiColor::Cyan))))
+        .placeholder(Style::new().fg_color(Some(Color::Ansi(AnsiColor::Blue))))
+        .error(
+            Style::new()
+                .bold()
+                .fg_color(Some(Color::Ansi(AnsiColor::Red))),
+        )
+        .valid(
+            Style::new()
+                .bold()
+                .fg_color(Some(Color::Ansi(AnsiColor::Green))),
+        )
+        .invalid(
+            Style::new()
+                .bold()
+                .fg_color(Some(Color::Ansi(AnsiColor::Yellow))),
+        )
 }
 
 /// Default context pool size.

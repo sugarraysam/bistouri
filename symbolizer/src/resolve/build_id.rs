@@ -24,8 +24,8 @@ pub(crate) fn try_from_slice(bytes: &[u8]) -> Option<&BuildId> {
 pub(crate) fn to_hex(build_id: &BuildId) -> String {
     let mut buf = vec![0u8; BUILD_ID_SIZE * 2];
     faster_hex::hex_encode(build_id, &mut buf).expect("buffer is correctly sized");
-    // SAFETY: hex_encode produces valid ASCII which is valid UTF-8.
-    unsafe { String::from_utf8_unchecked(buf) }
+    // hex_encode produces valid ASCII which is valid UTF-8.
+    String::from_utf8(buf).expect("hex output is valid UTF-8")
 }
 
 #[cfg(test)]

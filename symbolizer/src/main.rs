@@ -14,7 +14,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::info;
 
-use bistouri_symbolizer::cli::CommonArgs;
+use bistouri_symbolizer::cli::{clap_styles, CommonArgs};
 use bistouri_symbolizer::daemon::SymbolizerDaemon;
 use bistouri_symbolizer::debuginfod::http::HttpDebuginfodClient;
 use bistouri_symbolizer::sink::log::LogSink;
@@ -27,7 +27,12 @@ use bistouri_symbolizer::sink::log::LogSink;
 /// binary that imports `bistouri-symbolizer` as a library and implements
 /// `SessionSink`. See the crate-level docs for an example.
 #[derive(Parser, Debug)]
-#[command(name = "bistouri-symbolizer", version)]
+#[command(
+    name = "bistouri-symbolizer",
+    version,
+    color = clap::ColorChoice::Always,
+    styles = clap_styles()
+)]
 struct Args {
     #[command(flatten)]
     common: CommonArgs,

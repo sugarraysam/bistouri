@@ -4,7 +4,7 @@
 //! 1. **Fetch phase (async)**: ensure all required ELF objects are cached.
 //! 2. **Resolve phase (blocking)**: symbolize frames in `spawn_blocking`.
 
-pub mod build_id;
+pub(crate) mod build_id;
 pub mod cache;
 pub mod elf;
 pub(crate) mod kernel;
@@ -117,12 +117,6 @@ impl SessionResolver {
         // Pre-extract metadata before moving the payload into spawn_blocking.
         let session_id = payload.session_id.clone();
         let total_samples = payload.total_samples;
-        let _comm = payload
-            .metadata
-            .as_ref()
-            .and_then(|m| m.labels.get("comm"))
-            .cloned()
-            .unwrap_or_else(|| "<unknown>".into());
 
         // Phase 2: Symbolize in blocking context. Payload is moved, not cloned.
         // moka caches are Clone (internally Arc-wrapped) — cheap to move.

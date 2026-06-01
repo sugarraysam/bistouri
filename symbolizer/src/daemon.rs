@@ -227,14 +227,16 @@ async fn cache_gauge_reporter(caches: CachePool, interval: Duration, cancel: Can
 
                 // Periodic operational heartbeat — visible at info level in
                 // kubectl logs. Emits once per gauge_interval (default 15s),
-                // NOT per session.
+                // NOT per session. MiB values are emitted as raw f64 fields
+                // to avoid per-tick format!() String allocations.
+                let mib = 1024.0 * 1024.0;
                 info!(
-                    l1_user_mib = format!("{:.1}", l1_user_bytes as f64 / (1024.0 * 1024.0)),
+                    l1_user_mib = l1_user_bytes as f64 / mib,
                     l1_user_entries,
-                    l1_kernel_mib = format!("{:.1}", l1_kernel_bytes as f64 / (1024.0 * 1024.0)),
+                    l1_kernel_mib = l1_kernel_bytes as f64 / mib,
                     l1_kernel_entries,
-                    l2_user_mib = format!("{:.1}", l2_user_bytes as f64 / (1024.0 * 1024.0)),
-                    l2_kernel_mib = format!("{:.1}", l2_kernel_bytes as f64 / (1024.0 * 1024.0)),
+                    l2_user_mib = l2_user_bytes as f64 / mib,
+                    l2_kernel_mib = l2_kernel_bytes as f64 / mib,
                     negative_entries,
                     "cache status"
                 );

@@ -201,7 +201,10 @@ impl CachedObject {
     /// Borrows a `Context` from the pool, or creates a new one if empty.
     #[inline]
     fn borrow_context(&self) -> addr2line::Context<ArcReader> {
-        if let Some(ctx) = self.pool.lock().unwrap().pop() {
+        // Recover from poisoning — the Vec<Context> is still valid even if
+        // a previous thread panicked while holding the lock (e.g. during
+        // Vec::pop/push which cannot leave the Vec in a broken state).
+        if let Some(ctx) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return ctx;
         }
         addr2line::Context::from_arc_dwarf(self.dwarf.clone())
@@ -210,12 +213,12 @@ impl CachedObject {
 
     /// Returns a `Context` to the pool for reuse.
     ///
-    /// If the pool is already at [`MAX_POOL_SIZE`], the context is dropped
-    /// instead of pooled. This bounds memory at `MAX_POOL_SIZE × context_bytes`
+    /// If the pool is already at `max_pool_size`, the context is dropped
+    /// instead of pooled. This bounds memory at `max_pool_size × context_bytes`
     /// per cached object — matching the weigher's estimate.
     #[inline]
     fn return_context(&self, ctx: addr2line::Context<ArcReader>) {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < self.max_pool_size {
             pool.push(ctx);
         }
@@ -483,33 +486,9 @@ impl ObjectCache {
         self.max_pool_size
     }
 
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn contains(&self, build_id: &BuildId) -> bool {
         self.objects.contains_key(build_id)
-    }
-
-    /// Inserts a cache entry. This is an async operation on `future::Cache`.
-    #[allow(dead_code)]
-    pub(crate) async fn insert(&self, build_id: BuildId, entry: CacheEntry) {
-        self.objects.insert(build_id, entry).await;
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn is_unparseable(&self, build_id: &BuildId) -> bool {
-        self.objects
-            .get(build_id)
-            .await
-            .is_some_and(|e| matches!(&e, CacheEntry::Unparseable))
-    }
-
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) async fn get_object(&self, build_id: &BuildId) -> Option<Arc<CachedObject>> {
-        match self.objects.get(build_id).await? {
-            CacheEntry::Parsed(obj) => Some(obj),
-            CacheEntry::Unparseable => None,
-        }
     }
 
     /// Current number of entries in the cache.
@@ -654,31 +633,6 @@ impl SymbolCache {
         }
     }
 
-    /// Creates a new symbol cache with the given entry capacity.
-    ///
-    /// Converts to byte budget internally for consistent byte-weighted
-    /// eviction across all caches.
-    pub fn new(capacity: u64) -> Self {
-        let budget_bytes = capacity * BYTES_PER_L2_ENTRY;
-        let entries = if budget_bytes >= BYTES_PER_L2_ENTRY {
-            Some(
-                MokaSyncCache::builder()
-                    .weigher(|_key: &SymbolKey, _value: &Arc<ResolvedFrame>| -> u32 {
-                        BYTES_PER_L2_ENTRY as u32
-                    })
-                    .max_capacity(budget_bytes)
-                    .build(),
-            )
-        } else {
-            None
-        };
-
-        Self {
-            entries,
-            budget_bytes,
-        }
-    }
-
     #[inline]
     pub(crate) fn get(&self, key: &SymbolKey) -> Option<Arc<ResolvedFrame>> {
         self.entries.as_ref()?.get(key)
@@ -791,6 +745,31 @@ mod tests {
             eviction_tier: "l1",
             eviction_space: "test",
         })
+    }
+
+    // ── Test-only ObjectCache helpers ──────────────────────────────────
+    //
+    // These were moved out of production code since they're only needed
+    // by tests. Direct field access in the test module avoids #[allow(dead_code)].
+
+    impl ObjectCache {
+        async fn insert(&self, build_id: BuildId, entry: CacheEntry) {
+            self.objects.insert(build_id, entry).await;
+        }
+
+        async fn is_unparseable(&self, build_id: &BuildId) -> bool {
+            self.objects
+                .get(build_id)
+                .await
+                .is_some_and(|e| matches!(&e, CacheEntry::Unparseable))
+        }
+
+        async fn get_object(&self, build_id: &BuildId) -> Option<Arc<CachedObject>> {
+            match self.objects.get(build_id).await? {
+                CacheEntry::Parsed(obj) => Some(obj),
+                CacheEntry::Unparseable => None,
+            }
+        }
     }
 
     // ── NegativeCache + ObjectCache entry behavior ─────────────────────
@@ -1063,7 +1042,7 @@ mod tests {
         #[case] lookup_key: (u8, u64),
         #[case] expect_hit: bool,
     ) {
-        let cache = SymbolCache::new(capacity);
+        let cache = SymbolCache::new_byte_budget(capacity * BYTES_PER_L2_ENTRY, "test");
         let frame = Arc::new(ResolvedFrame::Symbolized(SymbolInfo::unknown()));
 
         for &(bid_byte, offset) in keys_to_insert {
