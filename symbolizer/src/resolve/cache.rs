@@ -17,7 +17,9 @@ use std::time::Duration;
 use moka::future::Cache as MokaFutureCache;
 use moka::sync::Cache as MokaSyncCache;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+use crate::log_agg::LogAggregator;
 
 use super::build_id::{self, BuildId};
 use super::elf::{extract_load_segments, LoadSegment};
@@ -28,6 +30,11 @@ use crate::telemetry::{
     METRIC_CACHE_EVICTIONS_TOTAL, METRIC_DEBUGINFOD_ERRORS, METRIC_FETCH_INFLIGHT,
     METRIC_PARSE_FAILURES,
 };
+
+/// Aggregates per-build-ID "fetched and cached" logs into periodic summaries.
+static FETCH_AGGREGATOR: LogAggregator = LogAggregator::new(Duration::from_secs(5));
+/// Aggregates per-build-ID "negative cached" logs into periodic summaries.
+static NEGATIVE_AGGREGATOR: LogAggregator = LogAggregator::new(Duration::from_secs(5));
 
 /// Groups all cache handles for the symbolization pipeline.
 ///
@@ -392,8 +399,8 @@ impl ObjectCache {
                         let fetch_bytes = bytes.len();
                         let fetch_mib = fetch_bytes as f64 / (1024.0 * 1024.0);
 
-                        // Per-build-ID log: bounded by NUM_BUILD_IDS, not sessions/sec.
-                        info!(
+                        // Per-build-ID log at debug level for troubleshooting.
+                        debug!(
                             build_id = %hex,
                             fetch_bytes,
                             fetch_mib = format!("{fetch_mib:.1}"),
@@ -423,13 +430,15 @@ impl ObjectCache {
                             max_pool_size,
                         ) {
                             Ok(parsed) => {
-                                info!(
-                                    build_id = %hex,
-                                    estimated_bytes = parsed.estimated_bytes,
-                                    estimated_mib = format!("{:.1}",
-                                        parsed.estimated_bytes as f64 / (1024.0 * 1024.0)),
-                                    "ELF parsed and cached"
-                                );
+                                let cached_bytes = parsed.estimated_bytes as u64;
+                                if let Some(e) = FETCH_AGGREGATOR.record(cached_bytes) {
+                                    info!(
+                                        fetched_and_cached = e.count,
+                                        total_cached_bytes = e.total,
+                                        elapsed_ms = e.elapsed_ms,
+                                        "debuginfod: fetched and cached build IDs"
+                                    );
+                                }
                                 Some(CacheEntry::Parsed(Arc::new(parsed)))
                             }
                             Err(e) => {
@@ -442,9 +451,14 @@ impl ObjectCache {
                     }
                     Ok(None) => {
                         // Definitive 404 — negative cache to avoid re-fetch.
-                        info!(build_id = %hex,
-                            "build_id not found in debuginfod, negative caching");
                         negative.insert(bid);
+                        if let Some(e) = NEGATIVE_AGGREGATOR.record(1) {
+                            info!(
+                                negative_cached = e.count,
+                                elapsed_ms = e.elapsed_ms,
+                                "debuginfod: build IDs not found, negative cached"
+                            );
+                        }
                         None
                     }
                     Err(e) => {

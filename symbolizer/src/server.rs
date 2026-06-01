@@ -11,13 +11,18 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use metrics::{counter, gauge};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
+
+use crate::log_agg::LogAggregator;
+
+/// Aggregates "queue full" drop warnings into periodic summaries.
+static DROP_AGGREGATOR: LogAggregator = LogAggregator::new(Duration::from_secs(3));
 
 use crate::telemetry::{
     METRIC_INFLIGHT_SESSIONS, METRIC_RESOLUTIONS_ERROR, METRIC_RESOLUTIONS_SUCCESS,
@@ -82,13 +87,17 @@ impl CaptureService for SymbolizerService {
                 Ok(Response::new(()))
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    pid = pid,
-                    traces = trace_count,
-                    "processing queue full — dropping session"
-                );
                 counter!(METRIC_SESSIONS_DROPPED).increment(1);
-                gauge!(METRIC_RX_QUEUE_DEPTH).set(self.queue_max_capacity as f64);
+
+                if let Some(e) = DROP_AGGREGATOR.record(1) {
+                    warn!(
+                        dropped = e.count,
+                        elapsed_ms = e.elapsed_ms,
+                        queue_capacity = self.queue_max_capacity,
+                        "processing queue full — dropped sessions since last report"
+                    );
+                }
+
                 Err(Status::resource_exhausted(
                     "symbolizer processing queue full",
                 ))

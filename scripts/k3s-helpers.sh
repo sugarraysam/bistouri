@@ -37,8 +37,8 @@ e2e_error() { echo -e "${RED}[${E2E_LOG_PREFIX}]${NC} $*" >&2; }
 nuke_k3s() {
     e2e_info "Nuking k3s state..."
 
-    sudo k3s crictl rm -fa 2>/dev/null || true
-    sudo k3s crictl rmi --prune 2>/dev/null || true
+    sudo k3s crictl rm -fa 2>&1 >/dev/null || true
+    sudo k3s crictl rmi --prune 2>&1 >/dev/null || true
 
     if systemctl is-active --quiet k3s 2>/dev/null; then
         sudo systemctl stop k3s

@@ -13,6 +13,14 @@ use tracing::{debug, error, info};
 /// Fixed PSI time window: all thresholds are expressed as a percentage of this.
 const TIME_WINDOW_MS: f64 = 1_000.0;
 
+/// How often each PSI watcher verifies the watched PID is still alive.
+///
+/// When Kubernetes OOM-kills a container, the cgroup persists (k8s manages
+/// it at pod level) so the PSI fd remains valid and AsyncFd::ready() never
+/// errors. Without this liveness probe, dead watchers accumulate forever
+/// and the gauge is permanently inflated.
+const PSI_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Registry key identifying a unique PSI watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct WatcherKey {
@@ -205,47 +213,86 @@ impl PsiRegistry {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut last_sent: Option<std::time::Instant> = None;
-            while let Ok(mut guard) = async_fd.ready(Interest::PRIORITY).await {
-                guard.clear_ready_matching(Ready::PRIORITY);
-                if last_sent.is_some_and(|t| t.elapsed() < request_cooldown) {
-                    continue;
-                }
-                info!(
-                    pid = pid, comm = %comm, resource = ?resource,
-                    cgroup = %cgroup_path.display(),
-                    "PSI threshold exceeded, requesting capture",
-                );
-                let req = CaptureRequest {
-                    pid,
-                    comm: comm.clone(),
-                    source: CaptureSource::Psi(resource),
-                    tenant_id: tenant_id.clone(),
-                    service_id: service_id.clone(),
-                    labels: labels.clone(),
-                };
-                if capture_tx.try_send(req).is_err() {
-                    error!("capture request channel full, PSI event dropped");
-                    metrics::counter!(
-                        METRIC_CAPTURE_CHANNEL_FULL,
-                        "resource" => resource.to_string(),
-                        "comm" => comm.clone(),
-                    )
-                    .increment(1);
-                } else {
-                    last_sent = Some(std::time::Instant::now());
+            let mut liveness = tokio::time::interval(PSI_LIVENESS_CHECK_INTERVAL);
+            liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    result = async_fd.ready(Interest::PRIORITY) => {
+                        match result {
+                            Ok(mut guard) => {
+                                guard.clear_ready_matching(Ready::PRIORITY);
+                                if last_sent.is_some_and(|t| t.elapsed() < request_cooldown) {
+                                    continue;
+                                }
+                                info!(
+                                    pid = pid, comm = %comm, resource = ?resource,
+                                    cgroup = %cgroup_path.display(),
+                                    "PSI threshold exceeded, requesting capture",
+                                );
+                                let req = CaptureRequest {
+                                    pid,
+                                    comm: comm.clone(),
+                                    source: CaptureSource::Psi(resource),
+                                    tenant_id: tenant_id.clone(),
+                                    service_id: service_id.clone(),
+                                    labels: labels.clone(),
+                                };
+                                if capture_tx.try_send(req).is_err() {
+                                    error!("capture request channel full, PSI event dropped");
+                                    metrics::counter!(
+                                        METRIC_CAPTURE_CHANNEL_FULL,
+                                        "resource" => resource.to_string(),
+                                        "comm" => comm.clone(),
+                                    )
+                                    .increment(1);
+                                } else {
+                                    last_sent = Some(std::time::Instant::now());
+                                }
+                            }
+                            Err(_) => break, // fd invalid, cgroup deleted
+                        }
+                    }
+                    _ = liveness.tick() => {
+                        if !is_pid_alive(pid, &comm) {
+                            info!(
+                                pid = pid, comm = %comm, resource = ?resource,
+                                cgroup = %cgroup_path.display(),
+                                "watched process died or was recycled, reaping PSI watcher",
+                            );
+                            break;
+                        }
+                    }
                 }
             }
-            // AsyncFd loop exited — process died or cgroup was deleted.
-            // Notify the registry so it can remove us and update the gauge.
-            debug!(
+
+            // Watcher loop exited — notify registry for cleanup.
+            info!(
                 pid = pid,
                 comm = %comm,
                 resource = ?resource,
                 cgroup = %cgroup_path.display(),
-                "PSI watcher exiting — cgroup fd invalid",
+                "PSI watcher exiting",
             );
             let _ = exit_tx.send(key);
         })
+    }
+}
+
+/// Checks if a process is still alive and matches the expected comm name.
+///
+/// Uses `/proc/{pid}/comm` — a procfs virtual file that returns instantly
+/// (kernel-serviced, no disk I/O). Safe to call from async context without
+/// `spawn_blocking`.
+///
+/// Returns `false` if the PID doesn't exist (process died) or if the comm
+/// doesn't match (PID was recycled for a different process).
+fn is_pid_alive(pid: u32, expected_comm: &str) -> bool {
+    let path = format!("/proc/{pid}/comm");
+    match std::fs::read_to_string(&path) {
+        Ok(actual) => actual.trim() == expected_comm,
+        Err(_) => false,
     }
 }
 
@@ -427,5 +474,32 @@ mod tests {
 
         // Dump on empty registry after shutdown is safe.
         registry.dump();
+    }
+
+    // -----------------------------------------------------------------------
+    // is_pid_alive — PID liveness + comm matching
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::current_process_is_alive(std::process::id(), "is_pid_alive", true)]
+    #[case::nonexistent_pid(u32::MAX, "ghost", false)]
+    fn is_pid_alive_cases(#[case] pid: u32, #[case] _description: &str, #[case] expected: bool) {
+        // For the current process case, read the actual comm name.
+        if pid == std::process::id() {
+            let actual_comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim()
+                .to_string();
+            assert_eq!(super::is_pid_alive(pid, &actual_comm), expected);
+        } else {
+            assert_eq!(super::is_pid_alive(pid, "ghost"), expected);
+        }
+    }
+
+    #[test]
+    fn is_pid_alive_comm_mismatch_returns_false() {
+        // Our own PID exists, but with a wrong comm name → should return false.
+        let pid = std::process::id();
+        assert!(!super::is_pid_alive(pid, "definitely_not_our_comm"));
     }
 }

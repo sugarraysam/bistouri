@@ -37,4 +37,5 @@ pub mod server;
 pub mod sink;
 
 pub mod error;
+pub mod log_agg;
 pub mod telemetry;
