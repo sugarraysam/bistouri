@@ -14,6 +14,19 @@ use bistouri_api::v1 as proto;
 /// Most processes link <10 DSOs (libc, ld-linux, app binary, a few .so's).
 const INITIAL_MAPPING_CAPACITY: usize = 8;
 
+/// Configuration for creating a new [`CaptureSession`].
+pub(crate) struct SessionConfig {
+    pub pid: u32,
+    pub comm: String,
+    pub source: CaptureSource,
+    pub kernel_meta: Arc<KernelMeta>,
+    pub sample_period_nanos: u64,
+    pub trace_capacity: usize,
+    pub tenant_id: String,
+    pub service_id: String,
+    pub labels: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SessionId(Uuid);
 
@@ -35,6 +48,7 @@ pub(crate) enum CaptureSource {
 }
 
 /// Trigger event requesting stack capture for a single PID.
+#[derive(Clone)]
 pub(crate) struct CaptureRequest {
     pub pid: u32,
     pub comm: String,
@@ -122,34 +136,23 @@ pub(crate) struct CaptureSession {
 }
 
 impl CaptureSession {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        pid: u32,
-        comm: String,
-        source: CaptureSource,
-        kernel_meta: Arc<KernelMeta>,
-        sample_period_nanos: u64,
-        trace_capacity: usize,
-        tenant_id: String,
-        service_id: String,
-        labels: HashMap<String, String>,
-    ) -> Self {
+    pub(crate) fn new(config: SessionConfig) -> Self {
         // Build labels map: start with caller-provided labels,
         // always inject comm and pid.
-        let mut final_labels = labels;
+        let mut final_labels = config.labels;
         final_labels
             .entry("comm".into())
-            .or_insert_with(|| comm.clone());
+            .or_insert_with(|| config.comm.clone());
         final_labels
             .entry("pid".into())
-            .or_insert_with(|| pid.to_string());
+            .or_insert_with(|| config.pid.to_string());
 
         let metadata = proto::Metadata {
-            pid,
+            pid: config.pid,
             kernel_meta: Some(proto::KernelMeta {
-                release: kernel_meta.release.clone(),
-                build_id: kernel_meta.build_id.to_vec(),
-                text_addr: kernel_meta.text_addr,
+                release: config.kernel_meta.release.clone(),
+                build_id: config.kernel_meta.build_id.to_vec(),
+                text_addr: config.kernel_meta.text_addr,
             }),
             labels: final_labels,
         };
@@ -170,25 +173,25 @@ impl CaptureSession {
         let payload = proto::SessionPayload {
             session_id: id.to_string(),
             source: Some(proto::CaptureSource {
-                source: Some(to_proto_source(&source)),
+                source: Some(to_proto_source(&config.source)),
             }),
             metadata: Some(metadata),
-            traces: Vec::with_capacity(trace_capacity),
+            traces: Vec::with_capacity(config.trace_capacity),
             total_samples: 0,
             capture_duration: None,
-            sample_period_nanos,
+            sample_period_nanos: config.sample_period_nanos,
             mappings: Vec::with_capacity(INITIAL_MAPPING_CAPACITY),
-            tenant_id,
-            service_id,
+            tenant_id: config.tenant_id,
+            service_id: config.service_id,
             capture_start_time: Some(capture_start_time),
         };
 
         Self {
             id,
-            pid,
-            source,
+            pid: config.pid,
+            source: config.source,
             started_at: Instant::now(),
-            dedup: HashMap::with_capacity(trace_capacity),
+            dedup: HashMap::with_capacity(config.trace_capacity),
             mapping_index: HashMap::with_capacity(INITIAL_MAPPING_CAPACITY),
             payload,
         }
@@ -310,17 +313,17 @@ mod tests {
     }
 
     fn make_session() -> CaptureSession {
-        CaptureSession::new(
-            42,
-            "test".into(),
-            CaptureSource::Psi(PsiResource::Memory),
-            mock_kernel_meta(),
-            TEST_SAMPLE_PERIOD_NANOS,
-            16, // matches compute_trace_capacity(19, 3)
-            "test-tenant".into(),
-            "test-service".into(),
-            HashMap::new(),
-        )
+        CaptureSession::new(SessionConfig {
+            pid: 42,
+            comm: "test".into(),
+            source: CaptureSource::Psi(PsiResource::Memory),
+            kernel_meta: mock_kernel_meta(),
+            sample_period_nanos: TEST_SAMPLE_PERIOD_NANOS,
+            trace_capacity: 16, // matches compute_trace_capacity(19, 3)
+            tenant_id: "test-tenant".into(),
+            service_id: "test-service".into(),
+            labels: HashMap::new(),
+        })
     }
 
     /// Default sample period for tests (19 Hz).
@@ -546,17 +549,17 @@ mod tests {
 
     #[test]
     fn payload_includes_capture_metadata() {
-        let session = CaptureSession::new(
-            99,
-            "meta-test".into(),
-            CaptureSource::Psi(PsiResource::Io),
-            mock_kernel_meta(),
-            TEST_SAMPLE_PERIOD_NANOS,
-            16,
-            "my-tenant".into(),
-            "my-service".into(),
-            HashMap::new(),
-        );
+        let session = CaptureSession::new(SessionConfig {
+            pid: 99,
+            comm: "meta-test".into(),
+            source: CaptureSource::Psi(PsiResource::Io),
+            kernel_meta: mock_kernel_meta(),
+            sample_period_nanos: TEST_SAMPLE_PERIOD_NANOS,
+            trace_capacity: 16,
+            tenant_id: "my-tenant".into(),
+            service_id: "my-service".into(),
+            labels: HashMap::new(),
+        });
 
         let finalized = session.finalize();
         let payload = &finalized.payload;

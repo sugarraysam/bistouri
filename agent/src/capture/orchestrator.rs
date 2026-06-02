@@ -6,11 +6,11 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::DelayQueue;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::error::Result;
 use super::pid_filter::BpfPidFilter;
-use super::session::{CaptureRequest, CaptureSession, CaptureSource, SessionId};
+use super::session::{CaptureRequest, CaptureSession, CaptureSource, SessionConfig, SessionId};
 use super::trace::StackSample;
 use crate::sys::kernel::KernelMeta;
 use crate::telemetry::{
@@ -139,17 +139,17 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
         *refcount += 1;
 
         let resource_label = source_label(&request.source);
-        let session = CaptureSession::new(
-            request.pid,
-            request.comm,
-            request.source,
-            self.config.kernel_meta.clone(),
-            self.config.sample_period_nanos,
-            self.config.trace_capacity,
-            request.tenant_id,
-            request.service_id,
-            request.labels,
-        );
+        let session = CaptureSession::new(SessionConfig {
+            pid: request.pid,
+            comm: request.comm,
+            source: request.source,
+            kernel_meta: self.config.kernel_meta.clone(),
+            sample_period_nanos: self.config.sample_period_nanos,
+            trace_capacity: self.config.trace_capacity,
+            tenant_id: request.tenant_id,
+            service_id: request.service_id,
+            labels: request.labels,
+        });
         let session_id = session.id();
 
         self.inflight_guard.insert(guard_key);
@@ -159,7 +159,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             .push(session_id);
         self.timers.insert(session_id, self.config.capture_duration);
 
-        info!(
+        debug!(
             session_id = %session_id,
             pid = session.pid(),
             comm = session.comm(),
@@ -240,7 +240,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             .unwrap_or("<unknown>");
         let resource_label = source_label(&finalized.source);
 
-        info!(
+        debug!(
             session_id = %finalized.session_id,
             pid = finalized.pid,
             comm = %comm,

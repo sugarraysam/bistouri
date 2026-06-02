@@ -237,7 +237,12 @@ pub(crate) fn describe_all() {
 
 /// Formats a byte slice as lowercase hex (e.g. `"ab01cd..."`).
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Records the `bistouri_agent_info` gauge with host/config metadata labels.

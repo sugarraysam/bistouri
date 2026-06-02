@@ -23,4 +23,7 @@ pub(crate) type Result<T> = std::result::Result<T, CaptureError>;
 pub(crate) enum ExportError {
     #[error("gRPC call failed: {0}")]
     Grpc(#[from] tonic::Status),
+
+    #[error("invalid endpoint URI: {0}")]
+    InvalidEndpoint(String),
 }

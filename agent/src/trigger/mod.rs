@@ -8,7 +8,7 @@ pub(crate) mod watcher;
 
 use std::collections::HashMap;
 
-use crate::capture::session::CaptureRequest;
+use crate::capture::session::{CaptureRequest, CaptureSource};
 use crate::capture::vdso::VdsoCache;
 use crate::sys::cgroup::{cgroup_path_to_id, find_cgroup2_mount, resolve_cgroup_path};
 use crate::telemetry::{
@@ -149,7 +149,7 @@ impl PreparedTriggerAgent {
         let (psi_registry, watcher_exit_rx) = PsiRegistry::new(capture_tx, request_cooldown);
 
         let sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-            .expect("failed to register SIGUSR1 handler");
+            .map_err(error::TriggerError::SignalRegistration)?;
 
         let mut agent = TriggerAgent {
             config: self.config,
@@ -267,19 +267,21 @@ impl TriggerAgent {
         }
 
         for res_cfg in &target.resources {
-            match self.psi_registry.register(
-                cgroup_id,
-                &cgroup_path,
-                res_cfg.resource,
-                res_cfg.threshold,
-                event.pid,
-                event.comm.clone(),
-                self.tenant_id.clone(),
-                target.service_id.clone(),
-                merged_labels.clone(),
-            ) {
+            let request = CaptureRequest {
+                pid: event.pid,
+                comm: event.comm.clone(),
+                source: CaptureSource::Psi(res_cfg.resource),
+                tenant_id: self.tenant_id.clone(),
+                service_id: target.service_id.clone(),
+                labels: merged_labels.clone(),
+            };
+
+            match self
+                .psi_registry
+                .register(cgroup_id, &cgroup_path, res_cfg.threshold, request)
+            {
                 PsiRegisterResult::Registered => {
-                    info!(
+                    debug!(
                         rule_id = event.rule_id,
                         comm = %event.comm,
                         resource = ?res_cfg.resource,

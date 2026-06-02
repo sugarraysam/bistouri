@@ -77,19 +77,19 @@ impl PsiRegistry {
     }
 
     /// Attempts to register a PSI watcher for the given (cgroup, resource) pair.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The caller pre-builds the `CaptureRequest` that should fire when the PSI
+    /// threshold is exceeded. The watcher clones it on each fire — it never needs
+    /// to know how to construct one.
     pub(crate) fn register(
         &mut self,
         cgroup_id: u64,
         cgroup_path: &Path,
-        resource: PsiResource,
         threshold: f64,
-        pid: u32,
-        comm: String,
-        tenant_id: String,
-        service_id: String,
-        labels: HashMap<String, String>,
+        request: CaptureRequest,
     ) -> PsiRegisterResult {
+        let CaptureSource::Psi(resource) = request.source;
+
         let key = WatcherKey {
             cgroup_id,
             resource,
@@ -105,23 +105,18 @@ impl PsiRegistry {
         };
 
         let meta = WatcherMeta {
-            pid,
-            comm: comm.clone(),
+            pid: request.pid,
+            comm: request.comm.clone(),
             cgroup_path: cgroup_path.to_path_buf(),
         };
 
         let watcher = Self::spawn_watcher(
             async_fd,
             key,
-            pid,
-            comm,
-            resource,
+            request,
             cgroup_path.to_path_buf(),
             self.capture_tx.clone(),
             self.request_cooldown,
-            tenant_id,
-            service_id,
-            labels,
             self.watcher_exit_tx.clone(),
         );
         self.watchers.insert(key, (watcher, meta));
@@ -196,22 +191,21 @@ impl PsiRegistry {
         Ok(async_fd)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Spawns an async task that polls the PSI fd and fires the pre-built
+    /// `CaptureRequest` whenever the threshold is exceeded.
     fn spawn_watcher(
         async_fd: AsyncFd<presutaoru::PsiFd>,
         key: WatcherKey,
-        pid: u32,
-        comm: String,
-        resource: PsiResource,
+        request: CaptureRequest,
         cgroup_path: PathBuf,
         capture_tx: mpsc::Sender<CaptureRequest>,
         request_cooldown: Duration,
-        tenant_id: String,
-        service_id: String,
-        labels: HashMap<String, String>,
         exit_tx: mpsc::UnboundedSender<WatcherKey>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let pid = request.pid;
+            let comm = request.comm.clone();
+            let resource = key.resource;
             let mut last_sent: Option<std::time::Instant> = None;
             let mut liveness = tokio::time::interval(PSI_LIVENESS_CHECK_INTERVAL);
             liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -231,15 +225,7 @@ impl PsiRegistry {
                                     cgroup = %cgroup_path.display(),
                                     "PSI threshold exceeded, requesting capture",
                                 );
-                                let req = CaptureRequest {
-                                    pid,
-                                    comm: comm.clone(),
-                                    source: CaptureSource::Psi(resource),
-                                    tenant_id: tenant_id.clone(),
-                                    service_id: service_id.clone(),
-                                    labels: labels.clone(),
-                                };
-                                if capture_tx.try_send(req).is_err() {
+                                if capture_tx.try_send(request.clone()).is_err() {
                                     error!("capture request channel full, PSI event dropped");
                                     metrics::counter!(
                                         METRIC_CAPTURE_CHANNEL_FULL,

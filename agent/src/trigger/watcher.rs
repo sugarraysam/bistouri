@@ -41,7 +41,7 @@ pub(crate) trait ConfigWatcher: Send + 'static {
 // ---------------------------------------------------------------------------
 
 /// Resolve args into the concrete [`ConfigWatcher`].
-pub(crate) async fn build_watcher(args: &Args) -> Box<dyn ConfigWatcher> {
+pub(crate) async fn build_watcher(args: &Args) -> Result<Box<dyn ConfigWatcher>> {
     let resolved = match args.config_source {
         ConfigSource::File => ConfigSource::File,
         ConfigSource::Kube => ConfigSource::Kube,
@@ -60,7 +60,7 @@ pub(crate) async fn build_watcher(args: &Args) -> Box<dyn ConfigWatcher> {
         ConfigSource::Kube => {
             let client = Client::try_default()
                 .await
-                .expect("failed to build kube client — is the pod running with a ServiceAccount?");
+                .map_err(TriggerError::KubeClient)?;
 
             let namespace = std::fs::read_to_string(KUBE_SA_NAMESPACE_PATH)
                 .map(|s| s.trim().to_owned())
@@ -72,18 +72,18 @@ pub(crate) async fn build_watcher(args: &Args) -> Box<dyn ConfigWatcher> {
                 "kube CR watch mode selected",
             );
 
-            Box::new(KubeConfigWatcher {
+            Ok(Box::new(KubeConfigWatcher {
                 client,
                 namespace,
                 cr_name: args.cr_name.clone(),
                 last_spec_hash: 0,
-            })
+            }))
         }
         ConfigSource::File | ConfigSource::Auto => {
             info!(path = %args.config.display(), "file watch mode selected");
-            Box::new(FileConfigWatcher {
+            Ok(Box::new(FileConfigWatcher {
                 path: args.config.clone(),
-            })
+            }))
         }
     }
 }

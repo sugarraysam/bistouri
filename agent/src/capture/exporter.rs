@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bistouri_api::v1::capture_service_client::CaptureServiceClient;
 use bistouri_api::v1::SessionPayload;
 use tonic::transport::Channel;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Downstream delivery contract for session payloads.
 ///
@@ -26,7 +26,7 @@ pub(crate) struct NullExporter;
 impl SessionExporter for NullExporter {
     async fn export(&self, payload: SessionPayload) -> Result<(), ExportError> {
         let meta = payload.metadata.as_ref();
-        info!(
+        debug!(
             session_id = %payload.session_id,
             pid = meta.map(|m| m.pid).unwrap_or(0),
             comm = %meta.and_then(|m| m.labels.get("comm")).map(|s| s.as_str()).unwrap_or("<unknown>"),
@@ -59,7 +59,7 @@ impl GrpcExporter {
     /// due to a transiently unavailable symbolizer.
     pub(crate) fn connect(endpoint: String) -> Result<Self, ExportError> {
         let channel = Channel::from_shared(endpoint.clone())
-            .expect("invalid endpoint URI")
+            .map_err(|e| ExportError::InvalidEndpoint(e.to_string()))?
             .connect_lazy();
         Ok(Self {
             endpoint,
@@ -86,7 +86,7 @@ impl SessionExporter for GrpcExporter {
         let mut client = self.client.clone();
         match client.report_session(payload).await {
             Ok(_) => {
-                info!(
+                debug!(
                     session_id = %session_id,
                     comm = %comm,
                     total_samples,

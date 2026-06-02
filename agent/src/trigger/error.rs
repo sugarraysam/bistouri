@@ -31,6 +31,12 @@ pub(crate) enum TriggerError {
 
     #[error("cgroup2 is not mounted: {0}")]
     Cgroup2NotMounted(#[source] std::io::Error),
+
+    #[error("failed to register signal handler: {0}")]
+    SignalRegistration(#[source] std::io::Error),
+
+    #[error("failed to build kube client: {0}")]
+    KubeClient(#[source] kube::Error),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, TriggerError>;

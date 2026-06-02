@@ -54,7 +54,7 @@ impl BistouriDaemon {
         // Shared VdsoCache: written by proc_walk, read by profiler ringbuf callback.
         let vdso_cache = Arc::new(Mutex::new(VdsoCache::new()));
 
-        let watcher = trigger::watcher::build_watcher(&args).await;
+        let watcher = trigger::watcher::build_watcher(&args).await?;
         let agent_labels: std::collections::HashMap<String, String> =
             args.label.iter().cloned().collect();
         let prepared = PreparedTriggerAgent::prepare(
