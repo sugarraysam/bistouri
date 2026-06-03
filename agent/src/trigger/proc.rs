@@ -1,3 +1,4 @@
+use crate::capture::runtime::detect_runtime;
 use crate::capture::vdso::{read_vdso_range, VdsoCache};
 use crate::sys::cgroup::resolve_cgroup_path;
 use crate::telemetry::{METRIC_PROC_WALK_DURATION, METRIC_PROC_WALK_MATCHES};
@@ -77,6 +78,10 @@ impl ProcWalker {
                 }
             };
 
+            // Detect runtime once per matched PID — we're already in
+            // spawn_blocking, so the ELF read is free of event-loop impact.
+            let runtime_hint = detect_runtime(pid, &self.proc_path);
+
             for rule_id in &rule_ids {
                 debug!(
                     pid = pid,
@@ -91,6 +96,7 @@ impl ProcWalker {
                     pid,
                     cgroup_path: Some(cgroup_path.clone()),
                     comm: comm.clone(),
+                    runtime_hint,
                 };
                 let _ = tx.blocking_send(event);
             }

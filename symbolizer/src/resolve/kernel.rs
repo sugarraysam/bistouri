@@ -40,7 +40,9 @@ impl KernelResolver {
     /// concurrency bounding, negative caching, and parse-failure sentinels.
     pub(crate) async fn ensure_cached(&self, kernel_build_id: &[u8]) -> Option<Arc<CachedObject>> {
         let bid = build_id::try_from_slice(kernel_build_id)?;
-        self.cache.get_or_fetch(bid).await
+        self.cache
+            .get_or_fetch(bid, bistouri_api::v1::RuntimeHint::Native)
+            .await
     }
 }
 

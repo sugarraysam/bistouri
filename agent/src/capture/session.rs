@@ -9,6 +9,7 @@ use crate::agent::profiler::BUILD_ID_SIZE;
 use crate::sys::kernel::KernelMeta;
 use crate::trigger::config::PsiResource;
 use bistouri_api::v1 as proto;
+use bistouri_api::v1::RuntimeHint;
 
 /// Initial capacity for mapping (build_id dedup) collections.
 /// Most processes link <10 DSOs (libc, ld-linux, app binary, a few .so's).
@@ -25,6 +26,8 @@ pub(crate) struct SessionConfig {
     pub tenant_id: String,
     pub service_id: String,
     pub labels: HashMap<String, String>,
+    /// Runtime hint for DWARF section resolution (Go vs native).
+    pub runtime_hint: RuntimeHint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,6 +60,8 @@ pub(crate) struct CaptureRequest {
     pub service_id: String,
     /// Merged labels: agent-level + target-level (target wins on conflict).
     pub labels: HashMap<String, String>,
+    /// Runtime hint detected once at PSI trigger time.
+    pub runtime_hint: RuntimeHint,
 }
 
 /// Converts a `CaptureSource` into the proto `capture_source::Source`.
@@ -81,6 +86,7 @@ fn to_proto_frame(
     frame: &UserFrame,
     mapping_index: &mut HashMap<[u8; BUILD_ID_SIZE], u32>,
     mappings: &mut Vec<proto::Mapping>,
+    runtime_hint: RuntimeHint,
 ) -> proto::UserFrame {
     match frame {
         UserFrame::Resolved {
@@ -91,6 +97,7 @@ fn to_proto_frame(
                 let idx = mappings.len() as u32;
                 mappings.push(proto::Mapping {
                     build_id: build_id.to_vec(),
+                    runtime_hint: runtime_hint as i32,
                 });
                 idx
             });
@@ -123,6 +130,8 @@ pub(crate) struct CaptureSession {
     pid: u32,
     source: CaptureSource,
     started_at: Instant,
+    /// Runtime hint for this process (Go, Native, etc.).
+    runtime_hint: RuntimeHint,
     /// Maps trace content → index in `payload.traces`.
     /// Proto types don't implement `Hash`, so we keep the Rust `StackTrace`
     /// as the lookup key and discard it at finalize time.
@@ -191,6 +200,7 @@ impl CaptureSession {
             pid: config.pid,
             source: config.source,
             started_at: Instant::now(),
+            runtime_hint: config.runtime_hint,
             dedup: HashMap::with_capacity(config.trace_capacity),
             mapping_index: HashMap::with_capacity(INITIAL_MAPPING_CAPACITY),
             payload,
@@ -231,7 +241,14 @@ impl CaptureSession {
             let user_frames: Vec<proto::UserFrame> = trace
                 .user_frames
                 .iter()
-                .map(|f| to_proto_frame(f, &mut self.mapping_index, &mut self.payload.mappings))
+                .map(|f| {
+                    to_proto_frame(
+                        f,
+                        &mut self.mapping_index,
+                        &mut self.payload.mappings,
+                        self.runtime_hint,
+                    )
+                })
                 .collect();
 
             self.payload.traces.push(proto::CountedTrace {
@@ -323,6 +340,7 @@ mod tests {
             tenant_id: "test-tenant".into(),
             service_id: "test-service".into(),
             labels: HashMap::new(),
+            runtime_hint: RuntimeHint::Native,
         })
     }
 
@@ -559,6 +577,7 @@ mod tests {
             tenant_id: "my-tenant".into(),
             service_id: "my-service".into(),
             labels: HashMap::new(),
+            runtime_hint: RuntimeHint::Native,
         });
 
         let finalized = session.finalize();

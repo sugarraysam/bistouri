@@ -158,6 +158,44 @@ async fn symbolizer_e2e() {
 
     info!("✅ Phase 1 passed: user frames resolved with source locations");
 
+    // ── Phase 1b: Go user-space frame resolution ─────────────────────
+
+    info!("Phase 1b: Go user-space frame resolution");
+
+    let hello_go = manifest
+        .get("hello_go")
+        .expect("hello_go fixture not found");
+    let go_expected = hello_go.expected_symbols();
+
+    let go_payload = fixture::build_user_payload("hello_go", hello_go);
+    info!(session_id = %go_payload.session_id, "sending Go user-frame payload");
+    client
+        .report_session(go_payload)
+        .await
+        .expect("ReportSession RPC failed for Go payload");
+
+    tokio::time::sleep(LOG_FLUSH_DELAY).await;
+
+    let logs = cluster
+        .symbolizer_logs()
+        .expect("failed to read symbolizer logs");
+
+    // Assert Go function names appear in logs (e.g. main.targetGoFunction).
+    assert_all_in_logs(
+        &logs,
+        &go_expected.function_names,
+        "Phase 1b: Go function name resolution",
+    );
+
+    // Assert Go source file appears in logs.
+    assert_all_in_logs(
+        &logs,
+        &go_expected.source_locations,
+        "Phase 1b: Go source location resolution",
+    );
+
+    info!("✅ Phase 1b passed: Go frames resolved with source locations");
+
     // ── Phase 2: Kernel frame resolution ─────────────────────────────
 
     info!("Phase 2: kernel frame resolution");
@@ -272,6 +310,7 @@ async fn symbolizer_e2e() {
                 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ],
+            runtime_hint: bistouri_api::v1::RuntimeHint::Native as i32,
         }],
         tenant_id: "e2e-test-tenant".into(),
         service_id: "e2e-test-service".into(),

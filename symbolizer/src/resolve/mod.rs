@@ -68,6 +68,7 @@ use crate::model::{
     RESOURCE_IO, RESOURCE_MEMORY, RESOURCE_UNKNOWN,
 };
 use bistouri_api::v1 as proto;
+use bistouri_api::v1::RuntimeHint;
 
 /// Orchestrates the full symbolization pipeline for a `SessionPayload`.
 ///
@@ -172,24 +173,25 @@ impl SessionResolver {
         payload: &proto::SessionPayload,
     ) -> HashMap<BuildId, Arc<CachedObject>> {
         let mut seen = HashSet::new();
-        let unique_ids: Vec<BuildId> = payload
+        // Collect unique build IDs with their RuntimeHint.
+        let unique_entries: Vec<(BuildId, RuntimeHint)> = payload
             .mappings
             .iter()
-            .filter_map(|m| <&[u8; BUILD_ID_SIZE]>::try_from(m.build_id.as_slice()).ok())
-            .copied()
-            .filter(|bid| seen.insert(*bid))
+            .filter_map(|m| {
+                let bid = <&[u8; BUILD_ID_SIZE]>::try_from(m.build_id.as_slice()).ok()?;
+                let hint = RuntimeHint::try_from(m.runtime_hint).unwrap_or(RuntimeHint::Native);
+                Some((*bid, hint))
+            })
+            .filter(|(bid, _)| seen.insert(*bid))
             .collect();
 
-        let mut pinned = HashMap::with_capacity(unique_ids.len());
+        let mut pinned = HashMap::with_capacity(unique_entries.len());
         let mut set = tokio::task::JoinSet::new();
 
-        for &bid in &unique_ids {
+        for &(bid, hint) in &unique_entries {
             // Fast path: already in L1 object cache — resolve inline.
-            // `contains()` is a synchronous probe (no task spawn, no mutex).
-            // TOCTOU gap is benign: if the entry is evicted between `contains()`
-            // and `get_or_fetch()`, moka handles the miss via coalesced fetch.
             if self.caches.user_objects.contains(&bid) {
-                if let Some(obj) = self.caches.user_objects.get_or_fetch(&bid).await {
+                if let Some(obj) = self.caches.user_objects.get_or_fetch(&bid, hint).await {
                     pinned.insert(bid, obj);
                 }
                 continue;
@@ -203,7 +205,7 @@ impl SessionResolver {
             // True cache miss — spawn for parallel HTTP fetch.
             let cache = self.caches.user_objects.clone();
             set.spawn(async move {
-                let obj = cache.get_or_fetch(&bid).await;
+                let obj = cache.get_or_fetch(&bid, hint).await;
                 (bid, obj)
             });
         }
@@ -215,7 +217,7 @@ impl SessionResolver {
         }
 
         debug!(
-            unique_build_ids = unique_ids.len(),
+            unique_build_ids = unique_entries.len(),
             pinned_objects = pinned.len(),
             spawned_fetches = set.len(),
             session_id = %payload.session_id,

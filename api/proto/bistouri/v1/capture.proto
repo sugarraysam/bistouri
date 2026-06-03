@@ -143,10 +143,21 @@ message PlaceholderFrame {
 
 // ── Mapping table ────────────────────────────────────────────────────
 
+// Runtime environment of the profiled binary. Drives DWARF section
+// resolution strategy in the symbolizer (e.g. Go uses compressed
+// .zdebug_* sections and non-standard naming).
+enum RuntimeHint {
+  RUNTIME_HINT_UNSPECIFIED = 0;
+  RUNTIME_HINT_NATIVE = 1;   // C/C++/Rust — standard DWARF sections
+  RUNTIME_HINT_GO = 2;       // Go — compressed .zdebug_* sections
+}
+
 // A memory-mapped object (DSO/binary) identified by its ELF build ID.
 // Equivalent to pprof's Mapping message. Stored once per unique build_id
 // in SessionPayload.mappings; frames reference entries by index.
 message Mapping {
   // ELF build ID (20 bytes, SHA-1). Identifies the DSO/binary.
   bytes build_id = 1;
+  // Runtime hint for DWARF resolution strategy.
+  RuntimeHint runtime_hint = 2;
 }

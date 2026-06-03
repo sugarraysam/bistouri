@@ -31,6 +31,7 @@ lru = "0.18"
 tonic = { version = "0.14", features = ["transport"] }
 prost-types = "0.14"
 async-trait = "0.1"
+object = { version = "0.39", default-features = false, features = ["read", "elf", "std"] }
 
 [build-dependencies]
 libbpf-cargo = "0.26"

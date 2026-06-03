@@ -149,6 +149,7 @@ impl<F: PidFilter> CaptureOrchestrator<F> {
             tenant_id: request.tenant_id,
             service_id: request.service_id,
             labels: request.labels,
+            runtime_hint: request.runtime_hint,
         });
         let session_id = session.id();
 
@@ -379,6 +380,7 @@ mod tests {
             tenant_id: "test-tenant".into(),
             service_id: "test-service".into(),
             labels: HashMap::new(),
+            runtime_hint: bistouri_api::v1::RuntimeHint::Native,
         }
     }
 

@@ -70,7 +70,8 @@ impl BistouriDaemon {
             .with_freq(args.freq)
             .with_trigger_tx(prepared.trigger_tx())
             .with_stack_tx(stack_tx)
-            .with_vdso_cache(vdso_cache.clone());
+            .with_vdso_cache(vdso_cache.clone())
+            .with_proc_path(prepared.proc_path().to_path_buf());
         let mut loaded_agent = agent_builder.try_build()?.load_and_attach()?;
         let comm_lpm_trie_handle = loaded_agent.comm_lpm_trie_handle()?;
         let pid_filter_handle = loaded_agent.pid_filter_handle()?;

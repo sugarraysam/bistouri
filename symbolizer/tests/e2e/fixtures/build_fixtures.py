@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build E2E fixture ELF binaries and generate manifest.json.
 
-Compiles C fixtures with gcc, then uses pyelftools to extract:
+Compiles C fixtures with gcc and Go fixtures with go build, then uses
+pyelftools to extract:
   - GNU build ID (from .note.gnu.build-id)
   - Symbol file offsets (vaddr → file_offset via PT_LOAD mapping)
   - Source file/line via addr2line (subprocess)
@@ -10,13 +11,14 @@ Usage:
     python3 build_fixtures.py          # rebuild all fixtures
     python3 build_fixtures.py --check  # verify manifest matches binaries
 
-Dependencies: gcc, pyelftools (pip install pyelftools), addr2line
+Dependencies: gcc, go, pyelftools (pip install pyelftools), addr2line, llvm-addr2line
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -39,6 +41,12 @@ CFLAGS = ["-g", "-O0", "-static", "-fno-omit-frame-pointer", "-Wl,--build-id"]
 FIXTURES = [
     ("hello", "hello.c", ["target_function", "outer_call", "main"]),
     ("multi_dso", "multi_dso.c", ["compute_checksum", "process_packet", "main"]),
+]
+
+# Go fixture definitions: (name, source_file, [symbols_to_extract])
+# Go symbols use package-qualified names (e.g. main.targetGoFunction).
+GO_FIXTURES = [
+    ("hello_go", "hello_go.go", ["main.targetGoFunction", "main.outerGoCall", "main.main"]),
 ]
 
 
@@ -131,6 +139,30 @@ def compile_fixture(name: str, source: str) -> Path:
     return elf_file
 
 
+def compile_go_fixture(name: str, source: str) -> Path:
+    """Compile a Go fixture source to a static binary with GNU build ID."""
+    src_file = SRC_DIR / source
+    elf_file = BIN_DIR / name
+
+    if not src_file.exists():
+        raise FileNotFoundError(f"source not found: {src_file}")
+
+    env = os.environ.copy()
+    env["CGO_ENABLED"] = "0"
+    subprocess.run(
+        [
+            "go", "build",
+            "-gcflags=-l",  # disable inlining for distinct frames
+            "-ldflags=-linkmode internal -compressdwarf=false",
+            "-o", str(elf_file),
+            str(src_file),
+        ],
+        check=True,
+        env=env,
+    )
+    return elf_file
+
+
 def process_fixture(
     name: str, source: str, symbol_names: list[str]
 ) -> dict:
@@ -158,6 +190,61 @@ def process_fixture(
     return {"build_id_hex": build_id, "symbols": symbols}
 
 
+def llvm_addr2line(elf_path: Path, vaddr: int) -> SourceLocation:
+    """Get source file:line using llvm-addr2line (handles Go DWARF correctly)."""
+    result = subprocess.run(
+        ["llvm-addr2line", "-e", str(elf_path), f"0x{vaddr:x}"],
+        capture_output=True,
+        text=True,
+    )
+    loc = result.stdout.strip()
+    if ":" not in loc or loc.startswith("??"):
+        return SourceLocation(file="??", line=0)
+
+    file_path, line_str = loc.rsplit(":", 1)
+    return SourceLocation(
+        file=os.path.basename(file_path),
+        line=int(line_str),
+    )
+
+
+def process_go_fixture(
+    name: str, source: str, symbol_names: list[str]
+) -> dict:
+    """Compile a Go fixture and extract its manifest entry."""
+    print(f"  Compiling Go fixture {name} from {source}...")
+    elf_path = compile_go_fixture(name, source)
+
+    # Derive a stripped variant for runtime-detection tests.
+    # `strip --strip-all` removes .debug_* and .symtab but preserves
+    # .note.go.buildid (PT_NOTE) and .gopclntab (PT_LOAD runtime data).
+    stripped_path = BIN_DIR / f"{name}_stripped"
+    shutil.copy2(elf_path, stripped_path)
+    subprocess.run(["strip", "--strip-all", str(stripped_path)], check=True)
+    print(f"    stripped variant: {stripped_path}")
+
+    with open(elf_path, "rb") as f:
+        elf = ELFFile(f)
+        build_id = extract_build_id(elf)
+        print(f"    build_id: {build_id}")
+
+        symbols = {}
+        for sym_name in symbol_names:
+            vaddr = find_symbol_vaddr(elf, sym_name)
+            offset = vaddr_to_file_offset(elf, vaddr)
+            # Use llvm-addr2line for Go because binutils addr2line
+            # doesn't parse Go's DWARF correctly.
+            loc = llvm_addr2line(elf_path, vaddr)
+            symbols[sym_name] = {
+                "file_offset": offset,
+                "file": loc.file,
+                "line": loc.line,
+            }
+            print(f"    {sym_name}: file_offset={offset} ({loc.file}:{loc.line})")
+
+    return {"build_id_hex": build_id, "runtime_hint": "go", "symbols": symbols}
+
+
 # ── Check mode ───────────────────────────────────────────────────────
 
 
@@ -171,7 +258,9 @@ def check_fixtures() -> bool:
         manifest = json.load(f)
 
     ok = True
-    for name, source, _ in FIXTURES:
+    all_fixtures = [(n, s, syms) for n, s, syms in FIXTURES] + \
+                   [(n, s, syms) for n, s, syms in GO_FIXTURES]
+    for name, source, _ in all_fixtures:
         elf_path = BIN_DIR / name
         if not elf_path.exists():
             print(f"ERROR: binary not found: {elf_path}", file=sys.stderr)
@@ -211,6 +300,8 @@ def main():
     manifest = {}
     for name, source, symbols in FIXTURES:
         manifest[name] = process_fixture(name, source, symbols)
+    for name, source, symbols in GO_FIXTURES:
+        manifest[name] = process_go_fixture(name, source, symbols)
 
     with open(MANIFEST, "w") as f:
         json.dump(manifest, f, indent=2)

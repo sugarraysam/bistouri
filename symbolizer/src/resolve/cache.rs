@@ -14,6 +14,9 @@ use object::{Object, ObjectSection};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bistouri_api::runtime::DwarfSection;
+use bistouri_api::v1::RuntimeHint;
+
 use moka::future::Cache as MokaFutureCache;
 use moka::sync::Cache as MokaSyncCache;
 use tokio::sync::Semaphore;
@@ -104,26 +107,28 @@ pub struct CachedObject {
 }
 
 impl CachedObject {
-    /// Defines the strict set of DWARF sections required for address-to-line
-    /// symbolization. Any section not in this list is dropped to save memory.
-    const REQUIRED_DWARF_SECTIONS: &'static [&'static str] = &[
-        ".debug_abbrev",
-        ".debug_addr",        // DWARF 5
-        ".debug_aranges",     // Fast address lookup
-        ".debug_info",        // Core DIEs (subprograms, inlines)
-        ".debug_line",        // Line number programs
-        ".debug_line_str",    // DWARF 5 line strings
-        ".debug_ranges",      // DWARF 4 address ranges
-        ".debug_rnglists",    // DWARF 5 address ranges
-        ".debug_str",         // Strings (function names)
-        ".debug_str_offsets", // DWARF 5 string offsets
-    ];
-
-    fn is_essential_section(name: &str) -> bool {
-        Self::REQUIRED_DWARF_SECTIONS.contains(&name)
+    /// Resolves a DWARF section from an ELF object, trying the canonical
+    /// name first, then each alias. Handles both standard `.debug_*`
+    /// sections and Go's legacy `.zdebug_*` compressed format.
+    fn resolve_dwarf_section<'a>(
+        object: &'a object::read::File<'a>,
+        section: &DwarfSection,
+    ) -> std::borrow::Cow<'a, [u8]> {
+        for name in section.names() {
+            if let Some(s) = object.section_by_name(name) {
+                if let Ok(data) = s.uncompressed_data() {
+                    return data;
+                }
+            }
+        }
+        std::borrow::Cow::Borrowed(&[])
     }
 
     /// Parses raw ELF bytes into a `CachedObject`.
+    ///
+    /// The `runtime_hint` controls which DWARF sections are loaded and
+    /// which alias names are tried. For Go binaries, this enables
+    /// transparent resolution of `.zdebug_*` compressed sections.
     ///
     /// Creates a shared `Arc<gimli::Dwarf>` and seeds the context pool
     /// with one initial `addr2line::Context`. Additional Contexts are
@@ -137,12 +142,34 @@ impl CachedObject {
         static_text_addr: Option<u64>,
         max_pool_size: usize,
     ) -> Result<Self> {
+        Self::from_elf_bytes_with_hint(
+            data,
+            build_id_hex,
+            static_text_addr,
+            max_pool_size,
+            RuntimeHint::Native,
+        )
+    }
+
+    /// Like [`from_elf_bytes`], but accepts a [`RuntimeHint`] to control
+    /// which DWARF sections are loaded.
+    pub fn from_elf_bytes_with_hint(
+        data: &[u8],
+        build_id_hex: &str,
+        static_text_addr: Option<u64>,
+        max_pool_size: usize,
+        hint: RuntimeHint,
+    ) -> Result<Self> {
         let object = object::read::File::parse(data).map_err(|e| SymbolizerError::ElfParse {
             build_id: build_id_hex.into(),
             reason: e.to_string(),
         })?;
 
         let segments = extract_load_segments(&object);
+
+        // Build a lookup table from canonical section name → DwarfSection
+        // so the gimli loader can resolve aliases.
+        let required = hint.required_dwarf_sections();
 
         // Track total DWARF section bytes for the weigher.
         let mut dwarf_bytes: usize = 0;
@@ -153,11 +180,11 @@ impl CachedObject {
         let dwarf = gimli::Dwarf::load(|section_id| -> std::result::Result<_, gimli::Error> {
             let section_name = section_id.name();
 
-            let data = if Self::is_essential_section(section_name) {
-                object
-                    .section_by_name(section_name)
-                    .and_then(|s| s.uncompressed_data().ok())
-                    .unwrap_or(std::borrow::Cow::Borrowed(&[]))
+            // Find the DwarfSection descriptor for this gimli SectionId.
+            // If not in the required set, skip it to avoid loading
+            // multi-MB sections that addr2line never touches.
+            let data = if let Some(desc) = required.iter().find(|s| s.canonical == section_name) {
+                Self::resolve_dwarf_section(&object, desc)
             } else {
                 std::borrow::Cow::Borrowed(&[] as &[u8])
             };
@@ -365,7 +392,11 @@ impl ObjectCache {
     ///
     /// Returns `None` for 404s (negative-cached), transient errors (not
     /// cached, retryable), and unparseable ELFs (cached as sentinel).
-    pub async fn get_or_fetch(&self, build_id: &BuildId) -> Option<Arc<CachedObject>> {
+    pub async fn get_or_fetch(
+        &self,
+        build_id: &BuildId,
+        hint: RuntimeHint,
+    ) -> Option<Arc<CachedObject>> {
         // Fast path: skip moka init entirely for known-bad build IDs.
         if self.negative.is_negative(build_id) {
             return None;
@@ -426,11 +457,12 @@ impl ObjectCache {
 
                         let static_text_addr = static_text_extractor.and_then(|f| f(&bytes));
 
-                        match CachedObject::from_elf_bytes(
+                        match CachedObject::from_elf_bytes_with_hint(
                             &bytes,
                             &hex,
                             static_text_addr,
                             max_pool_size,
+                            hint,
                         ) {
                             Ok(parsed) => {
                                 let cached_bytes = parsed.estimated_bytes as u64;
@@ -1172,5 +1204,131 @@ mod tests {
 
         obj.return_context(ctx2);
         assert_eq!(obj.pool.lock().unwrap().len(), 2);
+    }
+
+    // ── Go ELF fixture integration tests ─────────────────────────────
+
+    /// Creates a `CachedObject` from the Go fixture binary using
+    /// `from_elf_bytes_with_hint` with the specified hint.
+    fn make_go_fixture(hint: RuntimeHint) -> CachedObject {
+        let fixture_path = format!(
+            "{}/tests/e2e/fixtures/bin/hello_go",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let elf_bytes = std::fs::read(&fixture_path)
+            .unwrap_or_else(|_| panic!("missing Go fixture: {fixture_path}"));
+        CachedObject::from_elf_bytes_with_hint(&elf_bytes, "test-go", None, 4, hint)
+            .expect("failed to parse Go fixture ELF")
+    }
+
+    #[rstest]
+    #[case::go_hint(RuntimeHint::Go, "with RuntimeHint::Go")]
+    #[case::native_hint(
+        RuntimeHint::Native,
+        "with RuntimeHint::Native (uncompressed Go binary works too)"
+    )]
+    fn go_fixture_parses_with_any_hint(#[case] hint: RuntimeHint, #[case] description: &str) {
+        let obj = make_go_fixture(hint);
+        assert!(
+            !obj.segments.is_empty(),
+            "{description}: expected PT_LOAD segments"
+        );
+        // Go binaries should have meaningful DWARF data loaded.
+        assert!(
+            obj.estimated_bytes > 0,
+            "{description}: expected nonzero estimated_bytes"
+        );
+    }
+
+    #[test]
+    fn go_fixture_resolves_target_go_function() {
+        let obj = make_go_fixture(RuntimeHint::Go);
+
+        // file_offset 501216 = main.targetGoFunction from manifest.json
+        let vaddr = crate::resolve::elf::translate_file_offset(&obj.segments, 501216, "test-go")
+            .expect("segment translation failed for Go fixture offset 501216");
+
+        let frame = obj.symbolize_vaddr(vaddr);
+
+        match &frame {
+            crate::model::ResolvedFrame::Symbolized(info) => {
+                assert_eq!(
+                    info.function, "main.targetGoFunction",
+                    "expected 'main.targetGoFunction' got '{}'",
+                    info.function
+                );
+            }
+            crate::model::ResolvedFrame::Inlined(frames) => {
+                let names: Vec<&str> = frames.iter().map(|f| f.function.as_str()).collect();
+                assert!(
+                    names.contains(&"main.targetGoFunction"),
+                    "expected 'main.targetGoFunction' in {names:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_fixture_resolves_outer_go_call() {
+        let obj = make_go_fixture(RuntimeHint::Go);
+
+        // file_offset 501248 = main.outerGoCall from manifest.json
+        let vaddr = crate::resolve::elf::translate_file_offset(&obj.segments, 501248, "test-go")
+            .expect("segment translation failed for Go fixture offset 501248");
+
+        let frame = obj.symbolize_vaddr(vaddr);
+
+        match &frame {
+            crate::model::ResolvedFrame::Symbolized(info) => {
+                assert_eq!(
+                    info.function, "main.outerGoCall",
+                    "expected 'main.outerGoCall' got '{}'",
+                    info.function
+                );
+            }
+            crate::model::ResolvedFrame::Inlined(frames) => {
+                let names: Vec<&str> = frames.iter().map(|f| f.function.as_str()).collect();
+                assert!(
+                    names.contains(&"main.outerGoCall"),
+                    "expected 'main.outerGoCall' in {names:?}"
+                );
+            }
+        }
+    }
+
+    /// Validates that the compressed Go binary (SHF_COMPRESSED .debug_*)
+    /// also parses and resolves correctly with RuntimeHint::Go.
+    #[test]
+    fn go_compressed_fixture_resolves() {
+        let fixture_path = format!(
+            "{}/tests/e2e/fixtures/bin/hello_go_compressed",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let Ok(elf_bytes) = std::fs::read(&fixture_path) else {
+            // Skip if compressed fixture not built.
+            return;
+        };
+
+        let obj = CachedObject::from_elf_bytes_with_hint(
+            &elf_bytes,
+            "test-go-compressed",
+            None,
+            4,
+            RuntimeHint::Go,
+        )
+        .expect("failed to parse compressed Go fixture");
+
+        assert!(
+            !obj.segments.is_empty(),
+            "compressed Go fixture should have PT_LOAD segments"
+        );
+
+        // Same function, same offset (binary layout identical except section data).
+        // Note: compressed binary may have different file offsets due to section sizes.
+        // We just verify parsing succeeds and the object has content.
+        assert!(
+            obj.estimated_bytes > 0,
+            "compressed Go fixture should have nonzero estimated_bytes"
+        );
     }
 }

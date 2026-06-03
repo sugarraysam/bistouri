@@ -36,11 +36,17 @@ const PROC_WALK_INTERVAL: Duration = Duration::from_secs(30);
 const TRIGGER_CHANNEL_SIZE: usize = 1024;
 
 /// A process matched a trigger rule.
+///
+/// `runtime_hint` is populated by the producer (BPF ringbuf callback or
+/// ProcWalker) — both run in blocking contexts so the ELF section scan
+/// never hits the tokio event loop.
 pub(crate) struct ProcessMatchEvent {
     pub rule_id: u32,
     pub pid: u32,
     pub cgroup_path: Option<PathBuf>,
     pub comm: String,
+    /// Runtime hint detected from `/proc/<pid>/exe` at match time.
+    pub runtime_hint: bistouri_api::v1::RuntimeHint,
 }
 
 pub(super) enum TriggerControl {
@@ -111,6 +117,12 @@ impl PreparedTriggerAgent {
 
     pub(crate) fn trigger_tx(&self) -> mpsc::Sender<ProcessMatchEvent> {
         self.walk_ctx.event_tx.clone()
+    }
+
+    /// Exposes the procfs root path so the profiler can use it for
+    /// runtime detection in its BPF ringbuf callback.
+    pub(crate) fn proc_path(&self) -> &std::path::Path {
+        &self.walk_ctx.proc_path
     }
 
     /// Phase 2: Consume self, inject BPF handle + capture channel, start event loop.
@@ -274,6 +286,7 @@ impl TriggerAgent {
                 tenant_id: self.tenant_id.clone(),
                 service_id: target.service_id.clone(),
                 labels: merged_labels.clone(),
+                runtime_hint: event.runtime_hint,
             };
 
             match self

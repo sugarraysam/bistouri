@@ -1,5 +1,6 @@
 use crate::agent::error::{AgentError, Result};
 use crate::agent::ringbuf::AsyncRingBuffer;
+use crate::capture::runtime::detect_runtime;
 use crate::capture::trace::StackSample;
 use crate::capture::vdso::VdsoCache;
 use crate::telemetry::{
@@ -94,6 +95,9 @@ impl From<&ProcessMatchBpfEvent> for ProcessMatchEvent {
             pid: bpf.pid,
             cgroup_path: None,
             comm,
+            // Default to Native here — overridden by setup_ringbuffers
+            // which calls detect_runtime in the blocking callback.
+            runtime_hint: bistouri_api::v1::RuntimeHint::Native,
         }
     }
 }
@@ -298,6 +302,8 @@ pub(crate) struct ProfilerAgent {
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
     stack_tx: Sender<StackSample>,
     vdso_cache: Arc<Mutex<VdsoCache>>,
+    /// Path to procfs root for runtime detection in the BPF callback.
+    proc_path: std::path::PathBuf,
 }
 
 impl ProfilerAgent {
@@ -306,6 +312,7 @@ impl ProfilerAgent {
         trigger_tx: Option<Sender<ProcessMatchEvent>>,
         stack_tx: Sender<StackSample>,
         vdso_cache: Arc<Mutex<VdsoCache>>,
+        proc_path: std::path::PathBuf,
     ) -> Result<Self> {
         let ncpus = libbpf_rs::num_possible_cpus()
             .map_err(|e| AgentError::Bpf("failed to get possible CPUs".into(), e))?;
@@ -315,6 +322,7 @@ impl ProfilerAgent {
             trigger_tx,
             stack_tx,
             vdso_cache,
+            proc_path,
         })
     }
 
@@ -364,7 +372,12 @@ impl ProfilerAgent {
             })?;
         loaded.links.push(link);
 
-        loaded.setup_ringbuffers(self.trigger_tx, self.stack_tx, self.vdso_cache)?;
+        loaded.setup_ringbuffers(
+            self.trigger_tx,
+            self.stack_tx,
+            self.vdso_cache,
+            &self.proc_path,
+        )?;
         loaded.attach_perf_events(self.ncpus, self.freq)?;
 
         // Attach the off-CPU profiler — captures stacks when a monitored PID
@@ -396,6 +409,7 @@ impl LoadedProfilerAgent {
         trigger_tx: Option<Sender<ProcessMatchEvent>>,
         stack_tx: Sender<StackSample>,
         vdso_cache: Arc<Mutex<VdsoCache>>,
+        proc_path: &std::path::Path,
     ) -> Result<()> {
         let mut builder = libbpf_rs::RingBufferBuilder::new();
 
@@ -422,12 +436,15 @@ impl LoadedProfilerAgent {
             .map_err(|e| AgentError::Bpf("failed to add errors ringbuffer".into(), e))?;
 
         if let Some(tx) = trigger_tx {
+            let proc_path = proc_path.to_path_buf();
             builder
                 .add(&self.skel.maps.trigger_events, move |data| {
                     if let Some(bpf_event) = ProcessMatchBpfEvent::from_bytes(data) {
-                        if let Err(mpsc::error::TrySendError::Full(_)) =
-                            tx.try_send(bpf_event.into())
-                        {
+                        let mut event = ProcessMatchEvent::from(bpf_event);
+                        // Detect runtime here — this runs in the libbpf polling
+                        // thread (blocking), never on the tokio event loop.
+                        event.runtime_hint = detect_runtime(event.pid, &proc_path);
+                        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(event) {
                             metrics::counter!(METRIC_TRIGGER_CHANNEL_FULL).increment(1);
                         }
                     }
@@ -513,6 +530,7 @@ pub(crate) struct ProfilerAgentBuilder {
     trigger_tx: Option<Sender<ProcessMatchEvent>>,
     stack_tx: Option<Sender<StackSample>>,
     vdso_cache: Option<Arc<Mutex<VdsoCache>>>,
+    proc_path: std::path::PathBuf,
 }
 
 impl Default for ProfilerAgentBuilder {
@@ -522,6 +540,7 @@ impl Default for ProfilerAgentBuilder {
             trigger_tx: None,
             stack_tx: None,
             vdso_cache: None,
+            proc_path: std::path::PathBuf::from("/proc"),
         }
     }
 }
@@ -551,6 +570,11 @@ impl ProfilerAgentBuilder {
         self
     }
 
+    pub(crate) fn with_proc_path(mut self, path: std::path::PathBuf) -> Self {
+        self.proc_path = path;
+        self
+    }
+
     pub(crate) fn try_build(self) -> Result<ProfilerAgent> {
         let stack_tx = self
             .stack_tx
@@ -558,6 +582,12 @@ impl ProfilerAgentBuilder {
         let vdso_cache = self
             .vdso_cache
             .ok_or_else(|| AgentError::InvalidState("vdso_cache is required".into()))?;
-        ProfilerAgent::try_new(self.freq, self.trigger_tx, stack_tx, vdso_cache)
+        ProfilerAgent::try_new(
+            self.freq,
+            self.trigger_tx,
+            stack_tx,
+            vdso_cache,
+            self.proc_path,
+        )
     }
 }

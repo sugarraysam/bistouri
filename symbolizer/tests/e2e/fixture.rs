@@ -13,6 +13,9 @@ use crate::kernel_meta::HostKernelMeta;
 pub(crate) struct FixtureEntry {
     pub build_id_hex: String,
     pub symbols: HashMap<String, SymbolEntry>,
+    /// Optional runtime hint ("go" for Go fixtures, absent for native).
+    #[serde(default)]
+    pub runtime_hint: Option<String>,
 }
 
 /// A symbol's file offset and expected source location.
@@ -90,8 +93,14 @@ pub(crate) fn build_user_payload(
 ) -> proto::SessionPayload {
     let build_id_bytes = decode_build_id(&entry.build_id_hex);
 
+    let runtime_hint = match entry.runtime_hint.as_deref() {
+        Some("go") => proto::RuntimeHint::Go as i32,
+        _ => proto::RuntimeHint::Native as i32,
+    };
+
     let mappings = vec![proto::Mapping {
         build_id: build_id_bytes,
+        runtime_hint,
     }];
 
     let mut traces: Vec<proto::CountedTrace> = entry

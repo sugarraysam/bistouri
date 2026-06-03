@@ -38,5 +38,26 @@
         "line": 22
       }
     }
+  },
+  "hello_go": {
+    "build_id_hex": "d18eeb4e913372bf5f00a2bf1b762866ba5b2213",
+    "runtime_hint": "go",
+    "symbols": {
+      "main.targetGoFunction": {
+        "file_offset": 501216,
+        "file": "hello_go.go",
+        "line": 23
+      },
+      "main.outerGoCall": {
+        "file_offset": 501248,
+        "file": "hello_go.go",
+        "line": 27
+      },
+      "main.main": {
+        "file_offset": 501280,
+        "file": "hello_go.go",
+        "line": 31
+      }
+    }
   }
 }
