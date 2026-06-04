@@ -6,13 +6,10 @@
 //! Called once per process at trigger time (PSI rule match), not per
 //! `CaptureSession`. The result is cached in the `CaptureRequest`.
 
+use bistouri_api::runtime::GO_SECTION_MARKERS;
 use bistouri_api::v1::RuntimeHint;
 use std::path::Path;
 use tracing::debug;
-
-/// ELF section names that uniquely identify Go binaries.
-/// Presence of any one is sufficient.
-const GO_SECTION_MARKERS: &[&str] = &[".go.buildid", ".gopclntab"];
 
 /// Detects the runtime of a running process by scanning its ELF binary
 /// for Go-specific section headers.

@@ -75,6 +75,23 @@ static GO_SECTIONS: &[DwarfSection] = &[
     dwarf_section!(".debug_str_offsets", ".zdebug_str_offsets"),
 ];
 
+// ── Shared Go constants ─────────────────────────────────────────────
+//
+/// ELF section names that uniquely identify Go binaries.
+/// Presence of any one is sufficient for Go runtime detection.
+///
+/// - `.go.buildid` — Go's own base64-encoded build identifier (PT_NOTE)
+/// - `.gopclntab`  — Go PC-line table (PT_LOAD, used by Go runtime for
+///   stack unwinding and function name resolution at runtime)
+pub const GO_SECTION_MARKERS: &[&str] = &[".go.buildid", ".gopclntab"];
+
+/// Go-specific sections that must survive `strip_debuginfo`.
+///
+/// - `.gopclntab`  — Go runtime reads this at startup for stack unwinding
+///   and goroutine scheduling. Removing it crashes the binary.
+/// - `.go.buildinfo` — Go build metadata (small, useful for diagnostics).
+pub const GO_PRESERVE_ON_STRIP: &[&str] = &[".gopclntab", ".go.buildinfo"];
+
 impl RuntimeHint {
     /// Returns the DWARF sections required for symbolization of binaries
     /// compiled with this runtime.
