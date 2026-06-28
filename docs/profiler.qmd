@@ -56,6 +56,8 @@ However, this kernel-side resolution has a known blind spot: special memory regi
 
 To handle this without resorting to expensive, continuous userspace memory-map walks, Bistouri's `ProcWalker` queries `/proc/<pid>/auxv` during its process scans. It extracts the `AT_SYSINFO_EHDR` (the vDSO base address) and `AT_PAGESZ` entries to compute the process's vDSO boundaries, caching them in a thread-safe LRU `VdsoCache`. When parsing userspace stack events, the symbolization pipeline checks fallback instruction pointers against this cached range. This allows Bistouri to accurately label syscall entry-points as `[vdso]` rather than discarding them as corrupted frames or leaving them as `[unknown]`.
 
+Similarly, Bistouri must determine whether a process is running on the Go runtime or is a native (Rust/C/C++) binary, which dictates how the downstream symbolizer processes DWARF and PC-line tables. Reading `/proc/<pid>/exe` and parsing ELF section headers for markers like `.gopclntab` or `.go.buildid` is an I/O-intensive task. To keep our asynchronous Tokio threads completely non-blocking, we offload this detection to the background libbpf ring buffer polling thread. Because this callback runs inside a dedicated, synchronous polling context, we can safely perform blocking ELF parsing exactly once when a process first triggers, passing the resulting `RuntimeHint` down the pipeline without ever threatening to starve the async I/O reactor.
+
 ## Error Recovery
 
 One of the most overlooked aspects of eBPF design is "telemetry for the profiler itself." If a stack walk fails in the kernel, or if we run out of space in a ring buffer, how does the operator know?
@@ -88,5 +90,5 @@ stateDiagram-v2
 The `LoadedProfilerAgent` struct acts as a guard for the active profiling session. When the struct is dropped, the BPF links and the ring buffer are cleaned up in a specific sequence. This prevents use-after-free-like scenarios where the kernel might try to push data into a ring buffer that userspace has already unmapped.
 
 ---
-_Auto-generated from commit `1f05a74` by Gemini 3.1 Pro.
-Last updated: 2026-05-24_
+_Auto-generated from commit `c440017` by Gemini 3.1 Pro.
+Last updated: 2026-06-28_
