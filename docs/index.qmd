@@ -32,7 +32,7 @@ To prevent off-CPU collection from flooding the system with traces during extrem
 
 Bistouri is built on a "multi-phase" initialization pattern managed by the `BistouriDaemon` to coordinate the complex lifecycles of eBPF programs, kernel maps, and asynchronous user-space actors. This guarantees that we do not load heavy BPF objects or hook kernel events until all validation checks pass.
 
-``` {mermaid}
+```{mermaid}
 flowchart TD
     A["1. Preflight"] -->|"Verify KASLR, release, build-id"| B["2. Preparation"]
     B -->|"Build TriggerAgent & resolve cgroups"| C["3. Loading"]
@@ -49,7 +49,7 @@ flowchart TD
 
 The following diagram illustrates how pressure events flow from the kernel, through our reactive logic, and out to the centralized symbolization infrastructure.
 
-``` {mermaid}
+```{mermaid}
 flowchart TD
     subgraph "Kernel Space"
         PSI["PSI Events (/proc/pressure)"] -->|"Poll/Select"| UA["Trigger Agent"]
@@ -104,10 +104,10 @@ Many frames in a user-space stack trace point to volatile regions like anonymous
 
 ## Key Tradeoffs
 
--   **LPM Trie vs. Hash Maps:** We chose an LPM Trie for the initial match-on-exec logic. While a Hash Map is faster for exact matches, the Trie allows us to define "pressure policies" based on process name prefixes, which is vital in containerized environments where naming conventions are common.
+-   **LPM Trie vs. Hash Maps:** We chose an LPM Trie for the initial match-on-exec logic. While a Hash Map is faster for exact matches, the Trie allows us to define "pressure policies" based on process name prefixes, which is vital in containerized environments where grading/naming conventions are common.
 -   **Eventual Consistency:** There is a tiny window where a process might start experiencing pressure but the user-space agent hasn't yet updated the BPF map. We accept this "lost sample" at the very start of a pressure spike in exchange for keeping the complex decision logic in Rust rather than in the verifier-constrained C environment of BPF.
 -   **User-space Triggering:** One might ask why we don't trigger the profiler entirely in the kernel. The answer is policy. Defining what constitutes "too much pressure" involves complex configuration, threshold percentages, and multi-tenant metadata (like Kubernetes CRDs) that is significantly easier and safer to manage in Rust.
 
 ---
-_Auto-generated from commit `1f05a74` by Gemini 3.1 Pro.
-Last updated: 2026-05-24_
+_Auto-generated from commit `c440017` by Gemini 3.1 Pro.
+Last updated: 2026-06-28_

@@ -35,8 +35,13 @@ The symbolizer implements a two-phase pipeline designed to protect the async run
 1.  **Phase 1: Async Prefetch**: When a `SessionPayload` arrives, the symbolizer first identifies every unique Build ID in the trace. It checks its local caches and, if missing, fetches the required ELF or DWARF artifacts from a `debuginfod` server. This phase is fully asynchronous and handles network I/O.
 2.  **Phase 2: Blocking Resolution**: Once all artifacts are locally available, the payload is moved to a blocking thread pool (`spawn_blocking`). This is where the CPU-intensive DWARF walking occurs.
 
+::: {.callout-tip}
+## Design Detail: Fast-Path Object Probing
+Spawning tasks and scheduling async futures carries a non-trivial runtime cost. In steady-state execution, the vast majority of DWARF artifacts are already parsed and residing in the L1 Object Cache. To maximize throughput, Bistouri's prefetcher probes the L1 cache *inline* before spawning async tasks. True cache hits bypass task allocation completely. Only genuine cache misses are dispatched to a `JoinSet` for parallel HTTP/disk prefetching, preventing scheduler and allocation contention under heavy profiling loads.
+:::
+
 For each IP, the resolution follows a strict hierarchy:
-- **L2 Symbol Cache**: A fast lookup for `(BuildID, IP)` pairs that have been resolved previously, returning an `Arc<ResolvedFrame>` directly for zero-copy cache hits.
+- **L2 Symbol Cache**: A fast lookup for `(BuildID, IP)` pairs that have been resolved previously, returning an `Arc<ResolvedFrame>` directly for zero-copy cache hits. This cache is sized by a strict byte budget. To prevent runtime performance degradation under stress, Bistouri implements a fixed-weight estimation of **256 bytes per entry**—accounting for the `SymbolKey` struct, the heap-allocated string representations, and the internal tracking overhead of the concurrent cache.
 - **L1 Object Cache**: If the IP is new, we locate the parsed ELF object in memory.
 - **Normalization**: For kernel IPs, we adjust using the `text_addr`. For user-space, the agent provides file-relative offsets directly from the eBPF walker. The symbolizer translates this file offset to a virtual address matching the DWARF structures by locating the containing `PT_LOAD` segment of the ELF binary and computing `vaddr = file_offset - p_offset + p_vaddr`. This bypasses the need for `/proc/pid/maps` on the symbolizer side and naturally handles ASLR.
 - **DWARF Walk**: If the object is cached but the IP is new, we perform a DWARF interval tree lookup to find function names and source locations.
@@ -52,13 +57,22 @@ The symbolizer uses a tiered approach to artifact storage. It first checks a **N
 A key aspect of our negative caching strategy is distinguishing permanent failures (like HTTP 404s or corrupted binaries) from transient network errors (such as timeouts). Permanent failures are stored in the negative cache with a configurable TTL, whereas transient errors bypass the negative cache completely. This guarantees that the pipeline automatically retries fetching when temporary infrastructure issues resolve.
 :::
 
-If the binary is valid, it checks a **Tiered Debuginfod Client** which can read from a local filesystem cache (often a shared volume in Kubernetes, typically populated by a sidecar) before falling back to a remote HTTP server.
+If the binary is valid, it checks a **Tiered Debuginfod Client** which can read from a local filesystem cache (often a shared volume in Kubernetes, typically populated by a sidecar) before falling back to a remote HTTP server. Alternatively, the symbolizer can race multiple sources concurrently (such as a fast private indexer and a fallback public mirror) using an asynchronous race pattern, dropping the slower request as soon as a cache hit is secured.
 
 In memory, we use a byte-weighted LRU cache. Because a single `vmlinux` binary can be 500MB, we can't simply cache a fixed number of objects. The cache tracks the actual memory footprint of the parsed DWARF sections.
 
 ::: {.callout-tip}
-## Design Detail: Context Pooling
-Parsing DWARF is expensive, and the resulting `addr2line::Context` is not `Sync`. To allow concurrent symbolization of the same binary across multiple threads without re-parsing, Bistouri uses a **Context Pool** inside each `CachedObject`. We borrow a context, perform the walk, and return it. This maximizes CPU throughput while keeping the memory-heavy DWARF data shared.
+## Design Detail: Context Pooling and Allocation Capping
+Parsing DWARF is expensive, and the resulting `addr2line::Context` is not `Sync`. To allow concurrent symbolization of the same binary across multiple threads without re-parsing, Bistouri uses a **Context Pool** inside each `CachedObject`. We borrow a context, perform the walk, and return it.
+
+However, contexts allocate heap memory lazily as they explore DWARF subtrees. To prevent unbounded memory expansion, returned contexts are dropped rather than pooled once the pool reaches its maximum size limit. This bounds the total resident memory footprint per cached object to a predictable threshold, ensuring memory stability when handling simultaneous sessions across diverse kernel and user-space binaries.
+:::
+
+::: {.callout-warning}
+## Failure Mode: Contention and OOM in High-Volume Logging
+When processing millions of frames under symbol cache pressure, logging every DWARF resolution error or fetch failure individually causes extreme CPU serialization on the standard output mutex lock. Even worse, standard unbounded logging queues can accumulate crossbeam segments faster than stdout can drain, inflating anonymous container memory and triggering the container OOM-killer. 
+
+To solve this, Bistouri routes high-frequency operational events through a lockless **Log Aggregator**. This component uses atomic counters to aggregate event frequencies and sizes over an interval, emitting a single lock-free consolidated summary to the logging pipeline. This guarantees stable, zero-contention logging even under pathological profiling workloads.
 :::
 
 The cache weigher also accounts for the lazy heap allocations made by these contexts (like interval trees and abbreviation tables) by estimating the total footprint as a fraction of the raw DWARF size. This ensures the symbolizer remains stable even when processing sessions from diverse kernel versions simultaneously.
@@ -81,21 +95,21 @@ The symbolizer operates as a reactive service. It remains dormant until a profil
 
 ```{mermaid}
 stateDiagram-v2
-    [*] --> Initializing : Load Local Cache
-    Initializing --> Listening : Start gRPC Server
+    [*] --> Initializing : "Load Local Cache"
+    Initializing --> Listening : "Start gRPC Server"
 
     state Processing {
-        [*] --> Fetching : Async Prefetch
-        Fetching --> Resolving : Blocking Resolve
-        Resolving --> Storing : Sink.store()
+        [*] --> Fetching : "Async Prefetch"
+        Fetching --> Resolving : "Blocking Resolve"
+        Resolving --> Storing : "Sink.store()"
         Storing --> [*]
     }
 
-    Listening --> Processing : New Session
-    Processing --> Listening : Ready for Next
-    Listening --> [*] : Shutdown
+    Listening --> Processing : "New Session"
+    Processing --> Listening : "Ready for Next"
+    Listening --> [*] : "Shutdown"
 ```
 
 ---
-_Auto-generated from commit `1f05a74` by Gemini 3.1 Pro.
-Last updated: 2026-05-24_
+_Auto-generated from commit `c440017` by Gemini 3.1 Pro.
+Last updated: 2026-06-28_
